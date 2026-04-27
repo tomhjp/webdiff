@@ -1,17 +1,29 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
+	"html"
 	"html/template"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
 	terminal "github.com/buildkite/terminal-to-html/v3"
 )
+
+//go:embed style.css
+var styleCSS string
+
+// paletteCSS is the contents of ~/.config/webdiff/palette.css read once
+// at startup. Empty when the user hasn't generated one — that's the
+// common case, not an error. Loaded after styleCSS so any :root
+// custom-properties it defines override the defaults baked into style.css.
+var paletteCSS string
 
 // rootDir is the directory the server was started in. All requests resolve
 // repo paths relative to this.
@@ -278,6 +290,176 @@ func fileDiff(env []string, repo, file string, cols int) string {
 	return string(colored)
 }
 
+// htmlTagRE strips HTML tags so we can read the visible text of a single
+// rendered line (for blank-detection and heading extraction).
+var htmlTagRE = regexp.MustCompile(`<[^>]+>`)
+
+// addedPrefixRE matches a delta-rendered line whose old-side line-number
+// column (term-fgx88) is empty and whose new-side column (term-fgx28)
+// has a number — i.e. an added line, even if its code body is blank.
+//
+// removedPrefixRE is the symmetric pattern for a removed line.
+var (
+	addedPrefixRE   = regexp.MustCompile(`class="term-fgx88">\s*</span>.*?class="term-fgx28">\s*\d`)
+	removedPrefixRE = regexp.MustCompile(`class="term-fgx88">\s*\d.*?class="term-fgx28">\s*</span>`)
+)
+
+// extractHeading peels off delta's per-file leading heading — the
+// "added: foo.go" / "src/foo.go" line and the single `─────` underline
+// directly beneath it — so we can hoist that text into the <summary>
+// instead of repeating it inside the diff body. We deliberately leave
+// the trailing blank, the hunk box top (`────┐`), and everything below
+// in place so the body still gets its visual breathing room and the
+// hunk-header context box is intact. Returns ("", html) if the leading
+// shape doesn't match (binary files, weird configs, etc) so the caller
+// falls back to the path it already had.
+func extractHeading(html string) (heading, rest string) {
+	lines := strings.Split(strings.TrimRight(html, "\n"), "\n")
+	i := 0
+	for i < len(lines) && isVisuallyBlank(lines[i]) {
+		i++
+	}
+	if i >= len(lines) {
+		return "", html
+	}
+	heading = strings.TrimSpace(htmlText(lines[i]))
+	if heading == "" || isSeparatorOnly(heading) {
+		return "", html
+	}
+	j := i + 1
+	if j < len(lines) && isSeparatorOnly(strings.TrimSpace(htmlText(lines[j]))) {
+		j++
+	}
+	return heading, strings.Join(lines[j:], "\n")
+}
+
+// htmlText returns the visible text of an HTML fragment with entities
+// decoded — &nbsp; collapses to a regular space so callers can treat it
+// uniformly.
+func htmlText(s string) string {
+	return strings.ReplaceAll(html.UnescapeString(htmlTagRE.ReplaceAllString(s, "")), "\u00a0", " ")
+}
+
+// isSeparatorOnly reports whether a line is just a delta-style box
+// drawing run (── ─ ┌ ┐ └ ┘ │ ┊ ⋮ etc) with optional whitespace. Used
+// for stripping the heading separator and detecting hunk boxes.
+func isSeparatorOnly(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, r := range text {
+		switch {
+		case r == ' ', r == '\t':
+		case r == '─', r == '━', r == '│', r == '┊', r == '⋮':
+		case r == '┌', r == '┐', r == '└', r == '┘', r == '├', r == '┤', r == '┬', r == '┴', r == '┼':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isVisuallyBlank reports whether a line carries no information content
+// — either a fully empty line or a delta line-number gutter with no
+// code, in which case we can fill it with the surrounding diff bg.
+func isVisuallyBlank(s string) bool {
+	text := strings.TrimSpace(htmlText(s))
+	if text == "" {
+		return true
+	}
+	for _, r := range text {
+		switch {
+		case r == ' ', r >= '0' && r <= '9':
+		case r == '⋮', r == '┊', r == '│':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// wrapDiffLines wraps each line of terminal-to-html output in a
+// <span class="line"> so we can extend diff backgrounds across the full
+// line width — terminal-to-html collapses the trailing bg cells that
+// delta paints with `\x1b[K`, leaving the green/red highlight stopping
+// at the end of the text. We also fill blank lines that sit between two
+// same-state diff lines (a 1-line gap inside an added or removed run)
+// so the highlight stays continuous across the visual paragraph.
+//
+// With delta's line-numbers feature on, each diff line starts with a
+// non-bg gutter prefix (`    ┊ 36 │` etc) and only the code portion gets
+// bg-22/bg-52. We split at the first bg span so the gutter stays
+// uncoloured (matching delta in a real terminal) while the code area
+// extends to the end of the line. Blank added/removed lines have no bg
+// span at all in the HTML — terminal-to-html drops the trailing
+// `\x1b[K` cells — so we additionally classify them by the gutter
+// pattern (term-fgx88 vs term-fgx28 column emptiness).
+func wrapDiffLines(htmlIn string) string {
+	htmlIn = strings.TrimRight(htmlIn, "\n")
+	lines := strings.Split(htmlIn, "\n")
+	classes := make([]string, len(lines))
+	for i, line := range lines {
+		switch {
+		case strings.Contains(line, "term-bgx22"):
+			classes[i] = "add"
+		case strings.Contains(line, "term-bgx52"):
+			classes[i] = "del"
+		case addedPrefixRE.MatchString(line):
+			classes[i] = "add"
+		case removedPrefixRE.MatchString(line):
+			classes[i] = "del"
+		}
+	}
+	for i := 1; i < len(lines)-1; i++ {
+		if classes[i] != "" || !isVisuallyBlank(lines[i]) {
+			continue
+		}
+		if classes[i-1] != "" && classes[i-1] == classes[i+1] {
+			classes[i] = classes[i-1]
+		}
+	}
+	var b strings.Builder
+	for i, line := range lines {
+		if classes[i] == "" {
+			fmt.Fprintf(&b, `<span class="line">%s</span>`, line)
+			continue
+		}
+		bg := "term-bgx22"
+		if classes[i] == "del" {
+			bg = "term-bgx52"
+		}
+		prefix, tail := splitDiffLine(line, bg)
+		fmt.Fprintf(&b,
+			`<span class="line line-%s"><span class="line-prefix">%s</span><span class="line-tail">%s</span></span>`,
+			classes[i], prefix, tail)
+	}
+	return b.String()
+}
+
+// splitDiffLine partitions a single rendered line into the gutter
+// prefix (rendered without a diff bg) and the code tail (rendered with
+// the diff bg, extending to end of line via flex).
+//
+// Three shapes:
+//   - line has bg-22/bg-52 → split at the first such span; prefix is
+//     the gutter, tail is everything from that span onwards
+//   - line has the line-number gutter but no body (blank added/removed
+//     line) → prefix is the whole line, tail is empty
+//   - line has no gutter at all (truly blank line filled by
+//     neighbour-inheritance) → prefix is empty, tail is the whole line
+//     so the bg covers it end-to-end
+func splitDiffLine(line, bg string) (prefix, tail string) {
+	if idx := strings.Index(line, bg); idx >= 0 {
+		if spanStart := strings.LastIndex(line[:idx], "<span"); spanStart >= 0 {
+			return line[:spanStart], line[spanStart:]
+		}
+	}
+	if strings.Contains(line, "│") {
+		return line, ""
+	}
+	return "", line
+}
+
 // parentURL returns the URL pointing to the parent listing of urlPath,
 // or "" if urlPath is already at root.
 func parentURL(urlPath string) string {
@@ -493,15 +675,20 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 		}
 		screen, _ := terminal.NewScreen(terminal.WithMaxSize(cols, 0))
 		screen.Write([]byte(raw))
-		rendered := screen.AsHTML()
+		heading, rest := extractHeading(screen.AsHTML())
+		rendered := wrapDiffLines(rest)
 
 		added, removed, binary := fileDiffStat(env, repo, file)
 
 		slug := strings.ReplaceAll(file, "/", "-")
 		slug = strings.ReplaceAll(slug, ".", "-")
 
-		fmt.Fprintf(&body, `<details id="file-%s"><summary><span class="filename">%s</span><span class="filestats">`,
-			template.HTMLEscapeString(slug), template.HTMLEscapeString(file))
+		display := file
+		if heading != "" {
+			display = heading
+		}
+		fmt.Fprintf(&body, `<details id="file-%s" open><summary><span class="filename">%s</span><span class="filestats">`,
+			template.HTMLEscapeString(slug), template.HTMLEscapeString(display))
 		switch {
 		case binary:
 			body.WriteString(`<span class="stats-files">binary</span>`)
@@ -509,9 +696,9 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 			fmt.Fprintf(&body, `<span class="stats-ins">+%s</span> <span class="stats-del">-%s</span>`,
 				template.HTMLEscapeString(added), template.HTMLEscapeString(removed))
 		}
-		body.WriteString(`</span></summary><div class="term-container">`)
+		body.WriteString(`</span></summary><div class="term-container"><div class="term-inner">`)
 		body.WriteString(rendered)
-		body.WriteString(`</div></details>`)
+		body.WriteString(`</div></div></details>`)
 	}
 
 	writePage(w, body.String())
@@ -521,72 +708,10 @@ func writePage(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html><html><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width">
-<style>
-.term-container {
-  font: 13px/1.4 "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
-  background: #0d1117; color: #e6edf3;
-  padding: 8px; margin: 0;
-  white-space: pre; overflow-x: auto;
-}
-.term-fg1 { font-weight: bold }
-.term-fg2 { opacity: 0.7 }
-.term-fg3 { font-style: italic }
-.term-fg4 { text-decoration: underline }
-.term-fg9 { text-decoration: line-through }
-.term-fg30 { color: #000 }     .term-fg31 { color: #c23621 }
-.term-fg32 { color: #25bc24 }  .term-fg33 { color: #adad27 }
-.term-fg34 { color: #492ee1 }  .term-fg35 { color: #d338d3 }
-.term-fg36 { color: #33bbc8 }  .term-fg37 { color: #cbcccd }
-.term-fgi90,.term-fgi30  { color: #818383 }
-.term-fgi91,.term-fgi31  { color: #fc391f }
-.term-fgi92,.term-fgi32  { color: #31e722 }
-.term-fgi93,.term-fgi33  { color: #eaec23 }
-.term-fgi94,.term-fgi34  { color: #5833ff }
-.term-fgi95,.term-fgi35  { color: #f935f8 }
-.term-fgi96,.term-fgi36  { color: #14f0f0 }
-.term-fgi97,.term-fgi37  { color: #e9ebeb }
-.term-bg40  { background: #000 }     .term-bg41  { background: #c23621 }
-.term-bg42  { background: #25bc24 }  .term-bg43  { background: #adad27 }
-.term-bg44  { background: #492ee1 }  .term-bg45  { background: #d338d3 }
-.term-bg46  { background: #33bbc8 }  .term-bg47  { background: #cbcccd }
-body { margin: 0; background: #0d1117 }
-.header { padding: 12px 8px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 4px }
-.header-left { display: flex; flex-direction: column; gap: 2px }
-.header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap }
-.branch { font: bold 15px sans-serif; color: #a6e3a1 }
-.workdir { font: 12px sans-serif; color: #6c7086; text-decoration: none }
-.workdir-back::before { content: "← "; color: #89b4fa }
-.workdir-back { color: #89b4fa; cursor: pointer }
-.workdir-back:hover { text-decoration: underline }
-.stats { font: 13px sans-serif; color: #6c7086 }
-.stats-files { color: #e6edf3 }
-.stats-ins { color: #3fb950 }
-.stats-del { color: #f85149 }
-.dir-list { display: flex; flex-direction: column }
-.dir-row { display: flex; align-items: baseline; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #21262d; color: #e6edf3; text-decoration: none; font: 14px sans-serif }
-.dir-row:hover { background: #161b22 }
-.dir-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.dir-folder .dir-name::before { content: "📁 "; opacity: 0.6 }
-.dir-branch { font: 12px sans-serif; color: #a6e3a1; padding: 2px 8px; background: #161b22; border-radius: 10px }
-.dir-stats { font: 12px sans-serif; color: #6c7086 }
-.dir-folder-tag { color: #6c7086 }
-.empty { color: #6c7086; padding: 16px; font: 14px sans-serif }
-.toggle { font: 12px sans-serif; background: #30363d; color: #e6edf3; border: none; border-radius: 4px; padding: 4px 8px; cursor: pointer }
-.toggle:hover { background: #484f58 }
-.pillbar { display: flex; gap: 6px; padding: 8px; background: #0d1117; overflow-x: auto; white-space: nowrap; position: sticky; top: 0; z-index: 20; border-bottom: 1px solid #30363d; -webkit-overflow-scrolling: touch; transform: translateZ(0); will-change: transform }
-.pill { font: 12px sans-serif; color: #e6edf3; background: #30363d; padding: 4px 10px; border-radius: 12px; text-decoration: none; flex-shrink: 0 }
-.pill:hover { background: #484f58 }
-.pill-active { background: #89b4fa; color: #0d1117 }
-summary { font: bold 15px sans-serif; padding: 10px 8px; cursor: pointer; color: #89b4fa; background: #161b22; border-bottom: 1px solid #30363d; position: sticky; top: 37px; z-index: 10; display: flex; justify-content: space-between; align-items: center }
-.filename { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis }
-.filestats { font: 12px monospace; margin-left: 8px; white-space: nowrap }
-details { margin-bottom: 2px }
-details .term-container { margin: 0 }
-</style>
-<style>
-%s
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>%s</style>
+<style>%s</style>
+<style>%s</style>
 </head><body>%s
 <script>
 (function(){
@@ -599,7 +724,7 @@ details .term-container { margin: 0 }
   function save(s){try{localStorage.setItem(FILE_KEY,JSON.stringify(s))}catch(e){}}
 
   var state=load()||{};
-  details.forEach(function(d){d.open=state[d.id]===true});
+  details.forEach(function(d){if(state[d.id]===false)d.open=false;});
 
   function anyOpen(){return Array.from(details).some(function(d){return d.open})}
   function refreshBtn(){if(btn)btn.textContent=anyOpen()?'collapse all':'expand all'}
@@ -637,17 +762,18 @@ details .term-container { margin: 0 }
   requestAnimationFrame(function(){requestAnimationFrame(updateActive)});
 })();
 </script>
-</body></html>`, xterm256CSS(), body)
+</body></html>`, styleCSS, xterm256CSS(), paletteCSS, body)
 }
 
+// xterm256CSS emits per-index .term-fgxN / .term-bgxN rules for the
+// 256-colour palette. Indices 0–15 reference --color-N custom properties
+// from style.css (so the user's palette.css override flows through);
+// 16–231 are the 6×6×6 RGB cube and 232–255 are the 24-step grey ramp,
+// both computed once at startup.
 func xterm256CSS() string {
-	base := []string{
-		"#000", "#c23621", "#25bc24", "#adad27", "#492ee1", "#d338d3", "#33bbc8", "#cbcccd",
-		"#818383", "#fc391f", "#31e722", "#eaec23", "#5833ff", "#f935f8", "#14f0f0", "#e9ebeb",
-	}
 	colors := make([]string, 256)
 	for i := 0; i < 16; i++ {
-		colors[i] = base[i]
+		colors[i] = fmt.Sprintf("var(--color-%d)", i)
 	}
 	for i := 16; i < 232; i++ {
 		idx := i - 16
@@ -665,10 +791,20 @@ func xterm256CSS() string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "palette" {
+		if err := runPalette(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	port := "9418"
 	if len(os.Args) > 1 {
 		port = os.Args[1]
 	}
+
+	paletteCSS = loadPalette()
 
 	wd, err := os.Getwd()
 	if err != nil {

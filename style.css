@@ -1,0 +1,155 @@
+/* ─── customisable colours ──────────────────────────────────────────
+ * Override these by capturing your terminal's actual palette:
+ *
+ *   webdiff palette > ~/.config/webdiff/palette.css
+ *
+ * webdiff loads that file (if it exists) after this block, so any
+ * `:root` properties it defines win over the defaults below.
+ * ──────────────────────────────────────────────────────────────────── */
+:root {
+  --color-0:  #000000;  /* black           */
+  --color-1:  #c23621;  /* red             */
+  --color-2:  #25bc24;  /* green           */
+  --color-3:  #adad27;  /* yellow          */
+  --color-4:  #492ee1;  /* blue            */
+  --color-5:  #d338d3;  /* magenta         */
+  --color-6:  #33bbc8;  /* cyan            */
+  --color-7:  #cbcccd;  /* white           */
+  --color-8:  #818383;  /* bright black    */
+  --color-9:  #fc391f;  /* bright red      */
+  --color-10: #31e722;  /* bright green    */
+  --color-11: #eaec23;  /* bright yellow   */
+  --color-12: #5833ff;  /* bright blue     */
+  --color-13: #f935f8;  /* bright magenta  */
+  --color-14: #14f0f0;  /* bright cyan     */
+  --color-15: #e9ebeb;  /* bright white    */
+
+  --fg: #e6edf3;        /* default foreground */
+  --bg: #0d1117;        /* default background */
+
+  --diff-add-bg: #0e2b18;
+  --diff-del-bg: #3a1818;
+
+  /* UI chrome — same design language as the diff body. Override these
+     too if your terminal has a different sense of "raised" / "muted". */
+  --chrome-bg: color-mix(in srgb, var(--bg) 88%, var(--fg));
+  --border:    color-mix(in srgb, var(--bg) 75%, var(--fg));
+  --muted:     var(--color-8);
+  --accent:    var(--color-12);
+  --added:     var(--color-2);
+  --removed:   var(--color-1);
+  --branch:    var(--color-10);
+}
+
+/* ─── shared typography ──────────────────────────────────────────────
+ * Everything (chrome and diff body) uses the same monospace stack so
+ * the page reads like a TUI rather than a web app.
+ *
+ * text-size-adjust: 100% disables iOS / Chrome-Android's auto text
+ * inflation. Without it the mobile browser heuristically scales up
+ * text inside narrow blocks; with our flex line-prefix / line-tail
+ * structure it fires for some spans and not others, so you'd see the
+ * diff alternate between UI-sized and comically large within a single
+ * file. */
+html {
+  font: 13px/1.4 "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+/* ─── diff rendering ─────────────────────────────────────────────── */
+.term-container {
+  font: 13px/1.4 "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  background: var(--bg); color: var(--fg);
+  padding: 8px 0 20px; margin: 0;
+  overflow-x: auto;
+}
+.term-inner { display: block; width: max-content; min-width: 100%; box-sizing: border-box }
+.term-container .line { display: block; white-space: pre; padding: 0 8px }
+.term-container .line-add, .term-container .line-del { display: flex; padding: 0 }
+.term-container .line-prefix { flex: 0 0 auto; padding-left: 8px; white-space: pre }
+.term-container .line-tail { flex: 1 0 auto; padding-right: 8px; white-space: pre }
+.term-container .line-add .line-tail { background: var(--diff-add-bg) }
+.term-container .line-del .line-tail { background: var(--diff-del-bg) }
+.term-container .line-add .line-tail .term-bgx22,
+.term-container .line-del .line-tail .term-bgx52 { background: transparent }
+
+/* ─── ANSI 0-15 (the 256-cube indices 16-255 are emitted by xterm256CSS) ─── */
+.term-fg1 { font-weight: bold }
+.term-fg2 { opacity: 0.7 }
+.term-fg3 { font-style: italic }
+.term-fg4 { text-decoration: underline }
+.term-fg9 { text-decoration: line-through }
+.term-fg30 { color: var(--color-0) }   .term-fg31 { color: var(--color-1) }
+.term-fg32 { color: var(--color-2) }   .term-fg33 { color: var(--color-3) }
+.term-fg34 { color: var(--color-4) }   .term-fg35 { color: var(--color-5) }
+.term-fg36 { color: var(--color-6) }   .term-fg37 { color: var(--color-7) }
+.term-fgi90,.term-fgi30 { color: var(--color-8)  }
+.term-fgi91,.term-fgi31 { color: var(--color-9)  }
+.term-fgi92,.term-fgi32 { color: var(--color-10) }
+.term-fgi93,.term-fgi33 { color: var(--color-11) }
+.term-fgi94,.term-fgi34 { color: var(--color-12) }
+.term-fgi95,.term-fgi35 { color: var(--color-13) }
+.term-fgi96,.term-fgi36 { color: var(--color-14) }
+.term-fgi97,.term-fgi37 { color: var(--color-15) }
+.term-bg40 { background: var(--color-0) }   .term-bg41 { background: var(--color-1) }
+.term-bg42 { background: var(--color-2) }   .term-bg43 { background: var(--color-3) }
+.term-bg44 { background: var(--color-4) }   .term-bg45 { background: var(--color-5) }
+.term-bg46 { background: var(--color-6) }   .term-bg47 { background: var(--color-7) }
+
+/* ─── chrome / layout ──────────────────────────────────────────────
+ * Same monospace stack as the diff body, square corners, hairline
+ * borders, accents pulled straight from the ANSI palette. */
+body { margin: 0; background: var(--bg); color: var(--fg) }
+
+.header { padding: 10px 12px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 4px }
+.header-left { display: flex; flex-direction: column; gap: 2px }
+.header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
+.branch::before { content: "❯ "; color: var(--muted) }
+.branch { color: var(--branch); font-weight: bold }
+.workdir { color: var(--muted); text-decoration: none; font-size: 12px }
+.workdir-back::before { content: "← "; color: var(--accent) }
+.workdir-back { color: var(--accent); cursor: pointer }
+.workdir-back:hover { text-decoration: underline }
+
+.stats { color: var(--muted) }
+.stats-files { color: var(--fg) }
+.stats-ins { color: var(--added) }
+.stats-del { color: var(--removed) }
+
+.dir-list { display: flex; flex-direction: column }
+.dir-row { display: flex; align-items: baseline; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--fg); text-decoration: none }
+.dir-row:hover { background: var(--chrome-bg) }
+.dir-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent) }
+.dir-folder .dir-name { color: var(--fg) }
+.dir-folder .dir-name::before { content: "▸ "; color: var(--muted) }
+.dir-branch { color: var(--branch); font-size: 12px }
+.dir-branch::before { content: "❯ "; color: var(--muted) }
+.dir-stats { color: var(--muted); font-size: 12px }
+.dir-folder-tag { color: var(--muted); font-size: 12px }
+.dir-folder-tag::before { content: none }
+
+/* Narrow viewports: drop the branch chip so the folder name and its
+   in-flight diff stats keep priority. The folder-tag is also a branch-
+   slot element so we hide it too — its only purpose is to balance out
+   the layout on wider screens. */
+@media (max-width: 640px) {
+  .dir-branch { display: none }
+}
+.empty { color: var(--muted); padding: 16px }
+
+.toggle { font: inherit; font-size: 12px; background: transparent; color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 8px; cursor: pointer }
+.toggle:hover { background: var(--chrome-bg) }
+
+.pillbar { display: flex; gap: 4px; padding: 6px 8px; background: var(--chrome-bg); overflow-x: auto; white-space: nowrap; position: sticky; top: 0; z-index: 20; border-bottom: 1px solid var(--border); -webkit-overflow-scrolling: touch; transform: translateZ(0); will-change: transform }
+.pill { font-size: 12px; color: var(--muted); background: transparent; padding: 2px 8px; border: 1px solid transparent; text-decoration: none; flex-shrink: 0 }
+.pill:hover { color: var(--accent); border-color: var(--border) }
+.pill-active { color: var(--accent); border-color: var(--accent) }
+
+summary { padding: 8px 12px; font-size: 14px; cursor: pointer; color: var(--fg); background: var(--chrome-bg); border-top: 1px solid var(--accent); border-bottom: 1px solid var(--border); position: sticky; top: 33px; z-index: 10; display: flex; justify-content: space-between; align-items: center; gap: 12px }
+summary::before { content: "▾"; color: var(--accent); font-weight: bold; margin-right: 8px }
+details:not([open]) > summary::before { content: "▸" }
+.filename { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: bold; color: var(--fg) }
+.filestats { font-size: 12px; color: var(--muted); white-space: nowrap }
+details { margin-bottom: 0 }
+details .term-container { margin: 0 }
