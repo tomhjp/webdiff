@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	terminal "github.com/buildkite/terminal-to-html/v3"
 )
@@ -15,6 +16,37 @@ import (
 // rootDir is the directory the server was started in. All requests resolve
 // repo paths relative to this.
 var rootDir string
+
+// cacheRoot is where per-repo warm git index/object caches live, e.g.
+// ~/.cache/webdiff. Reused across requests and process restarts so the
+// stat cache built by the first `git add -A` is available for subsequent
+// page loads.
+var cacheRoot string
+
+// repoCache holds the warm-path state for one repo: a per-repo mutex (so
+// concurrent requests don't corrupt the shared index file) and the last
+// HEAD we built the index against (for invalidation).
+type repoCache struct {
+	mu   sync.Mutex
+	dir  string
+	head string
+}
+
+var (
+	cachesMu sync.Mutex
+	caches   = map[string]*repoCache{}
+)
+
+func getRepoCache(repo string) *repoCache {
+	cachesMu.Lock()
+	defer cachesMu.Unlock()
+	c, ok := caches[repo]
+	if !ok {
+		c = &repoCache{dir: filepath.Join(cacheRoot, strings.TrimPrefix(repo, string(filepath.Separator)))}
+		caches[repo] = c
+	}
+	return c
+}
 
 // isGitRepo reports whether dir contains a .git entry (file or directory).
 func isGitRepo(dir string) bool {
@@ -42,30 +74,100 @@ func resolvePath(urlPath string) (string, bool) {
 	return abs, true
 }
 
-// diffEnv returns an environment with a per-call temporary index file holding
-// the result of `git add -A` against repo's HEAD.
+// diffEnv returns an environment pointing at a warm, per-repo index and
+// object dir under cacheRoot. The index is rebuilt only when HEAD moves; on
+// unchanged HEAD the existing stat cache makes `git add -A` an order of
+// magnitude faster on large worktrees. The returned cleanup releases the
+// per-repo lock — the cache itself persists across requests and restarts.
 func diffEnv(repo string) (env []string, cleanup func()) {
-	f, err := os.CreateTemp("", "gitdiff-idx-*")
-	if err != nil {
+	c := getRepoCache(repo)
+	c.mu.Lock()
+	unlocked := false
+	bail := func() ([]string, func()) {
+		if !unlocked {
+			c.mu.Unlock()
+			unlocked = true
+		}
 		return os.Environ(), func() {}
 	}
-	tmp := f.Name()
-	f.Close()
-	os.Remove(tmp)
 
-	env = append(os.Environ(), "GIT_INDEX_FILE="+tmp)
+	headOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return bail()
+	}
+	head := strings.TrimSpace(string(headOut))
 
-	cmd := exec.Command("git", "read-tree", "HEAD")
+	objOut, err := exec.Command("git", "-C", repo, "rev-parse", "--git-path", "objects").Output()
+	if err != nil {
+		return bail()
+	}
+	objects := strings.TrimSpace(string(objOut))
+	if !filepath.IsAbs(objects) {
+		objects = filepath.Join(repo, objects)
+	}
+
+	indexFile := filepath.Join(c.dir, "index")
+	objDir := filepath.Join(c.dir, "objects")
+	headFile := filepath.Join(c.dir, "HEAD")
+
+	// Survive process restarts: if in-memory state is empty, fall back to
+	// the HEAD file on disk written by a previous run.
+	if c.head == "" {
+		if b, err := os.ReadFile(headFile); err == nil {
+			c.head = strings.TrimSpace(string(b))
+		}
+	}
+
+	rebuild := head != c.head
+	if !rebuild {
+		if _, err := os.Stat(indexFile); err != nil {
+			rebuild = true
+		}
+	}
+
+	if rebuild {
+		// HEAD moved (or first run) — wipe and start fresh. The previous
+		// HEAD's index entries reference blob OIDs that no longer match
+		// the current tree, and the per-HEAD object dir would just leak.
+		if err := os.RemoveAll(c.dir); err != nil {
+			return bail()
+		}
+		if err := os.MkdirAll(objDir, 0700); err != nil {
+			return bail()
+		}
+	}
+
+	env = append(os.Environ(),
+		"GIT_INDEX_FILE="+indexFile,
+		"GIT_OBJECT_DIRECTORY="+objDir,
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES="+objects,
+	)
+
+	if rebuild {
+		// `read-tree HEAD` discards stat-cache info, so we only run it on
+		// rebuild — otherwise we'd throw away the warm path benefit.
+		cmd := exec.Command("git", "read-tree", "HEAD")
+		cmd.Env = env
+		cmd.Dir = repo
+		if err := cmd.Run(); err != nil {
+			return bail()
+		}
+		if err := os.WriteFile(headFile, []byte(head), 0600); err != nil {
+			return bail()
+		}
+		c.head = head
+	}
+
+	cmd := exec.Command("git", "add", "-A")
 	cmd.Env = env
 	cmd.Dir = repo
 	cmd.Run()
 
-	cmd = exec.Command("git", "add", "-A")
-	cmd.Env = env
-	cmd.Dir = repo
-	cmd.Run()
-
-	return env, func() { os.Remove(tmp) }
+	return env, func() {
+		if !unlocked {
+			c.mu.Unlock()
+		}
+	}
 }
 
 // currentBranch returns the current git branch name for repo.
@@ -215,8 +317,30 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// renderListing renders a directory of subdirectories. No stats — just names
-// and a hint about whether each is a git repo. Clicking drills down.
+// repoSummary is the per-repo info shown on a directory listing.
+type repoSummary struct {
+	branch       string
+	files        int
+	ins, del     int
+}
+
+// summarizeRepo computes the branch + diff-stat tuple shown on the listing
+// row for a single repo.
+func summarizeRepo(repo string) repoSummary {
+	env, cleanup := diffEnv(repo)
+	defer cleanup()
+	files, ins, del := diffStat(env, repo)
+	return repoSummary{
+		branch: currentBranch(repo),
+		files:  files,
+		ins:    ins,
+		del:    del,
+	}
+}
+
+// renderListing renders a directory of subdirectories. For git repos it shows
+// the current branch and short diff stats; summaries are computed in parallel
+// so total time scales with the slowest repo, not the sum.
 func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -228,6 +352,32 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 		urlPath += "/"
 	}
 
+	type row struct {
+		name  string
+		isGit bool
+	}
+	var rows []row
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		rows = append(rows, row{name: e.Name(), isGit: isGitRepo(filepath.Join(dir, e.Name()))})
+	}
+
+	summaries := make([]repoSummary, len(rows))
+	var wg sync.WaitGroup
+	for i, r := range rows {
+		if !r.isGit {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, sub string) {
+			defer wg.Done()
+			summaries[i] = summarizeRepo(sub)
+		}(i, filepath.Join(dir, r.name))
+	}
+	wg.Wait()
+
 	var body strings.Builder
 	body.WriteString(`<div class="header"><div class="header-left">`)
 	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(dir)))
@@ -235,22 +385,38 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 	body.WriteString(`</div></div>`)
 
 	body.WriteString(`<div class="dir-list">`)
-	any := false
-	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-			continue
+	for i, r := range rows {
+		cls := "dir-row"
+		if !r.isGit {
+			cls += " dir-folder"
 		}
-		any = true
-		sub := filepath.Join(dir, e.Name())
-		cls, tagCls, tag := "dir-row dir-folder", "dir-branch dir-folder-tag", "folder"
-		if isGitRepo(sub) {
-			cls, tagCls, tag = "dir-row", "dir-branch", "git"
+		fmt.Fprintf(&body, `<a class="%s" href="%s"><span class="dir-name">%s</span>`,
+			cls, template.HTMLEscapeString(urlPath+r.name+"/"),
+			template.HTMLEscapeString(r.name))
+		if r.isGit {
+			s := summaries[i]
+			if s.files > 0 {
+				body.WriteString(`<span class="dir-stats">`)
+				noun := "files"
+				if s.files == 1 {
+					noun = "file"
+				}
+				fmt.Fprintf(&body, `<span class="stats-files">%d %s</span>`, s.files, noun)
+				if s.ins > 0 {
+					fmt.Fprintf(&body, ` <span class="stats-ins">+%d</span>`, s.ins)
+				}
+				if s.del > 0 {
+					fmt.Fprintf(&body, ` <span class="stats-del">-%d</span>`, s.del)
+				}
+				body.WriteString(`</span>`)
+			}
+			fmt.Fprintf(&body, `<span class="dir-branch">%s</span>`, template.HTMLEscapeString(s.branch))
+		} else {
+			body.WriteString(`<span class="dir-branch dir-folder-tag">folder</span>`)
 		}
-		fmt.Fprintf(&body, `<a class="%s" href="%s"><span class="dir-name">%s</span><span class="%s">%s</span></a>`,
-			cls, template.HTMLEscapeString(urlPath+e.Name()+"/"),
-			template.HTMLEscapeString(e.Name()), tagCls, tag)
+		body.WriteString(`</a>`)
 	}
-	if !any {
+	if len(rows) == 0 {
 		body.WriteString(`<p class="empty">No subdirectories here.</p>`)
 	}
 	body.WriteString(`</div>`)
@@ -403,6 +569,7 @@ body { margin: 0; background: #0d1117 }
 .dir-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .dir-folder .dir-name::before { content: "📁 "; opacity: 0.6 }
 .dir-branch { font: 12px sans-serif; color: #a6e3a1; padding: 2px 8px; background: #161b22; border-radius: 10px }
+.dir-stats { font: 12px sans-serif; color: #6c7086 }
 .dir-folder-tag { color: #6c7086 }
 .empty { color: #6c7086; padding: 16px; font: 14px sans-serif }
 .toggle { font: 12px sans-serif; background: #30363d; color: #e6edf3; border: none; border-radius: 4px; padding: 4px 8px; cursor: pointer }
@@ -516,11 +683,21 @@ func main() {
 		rootDir = wd
 	}
 
+	if ucd, err := os.UserCacheDir(); err == nil {
+		cacheRoot = filepath.Join(ucd, "webdiff")
+	} else {
+		cacheRoot = filepath.Join(os.TempDir(), "webdiff-cache")
+	}
+	if err := os.MkdirAll(cacheRoot, 0700); err != nil {
+		fmt.Fprintln(os.Stderr, "cannot create cache dir:", err)
+		os.Exit(1)
+	}
+
 	mode := "repo"
 	if !isGitRepo(rootDir) {
 		mode = "multi-repo browser"
 	}
-	fmt.Printf("Serving %s on http://0.0.0.0:%s (root: %s)\n", mode, port, rootDir)
+	fmt.Printf("Serving %s on http://0.0.0.0:%s (root: %s, cache: %s)\n", mode, port, rootDir, cacheRoot)
 	http.HandleFunc("/", handler)
 	http.ListenAndServe("0.0.0.0:"+port, nil)
 }
