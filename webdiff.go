@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"html"
 	"html/template"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,10 +17,30 @@ import (
 	"sync"
 
 	terminal "github.com/buildkite/terminal-to-html/v3"
+	"tailscale.com/safeweb"
 )
 
-//go:embed style.css
+//go:embed assets/style.css
 var styleCSS string
+
+//go:embed assets/page.html.tmpl
+var pageTmplSrc string
+
+//go:embed assets/app.js
+var appJS string
+
+// pageTmpl is the HTML wrapper for every rendered view. Parsed once at
+// init time so a malformed template panics on startup rather than on
+// the first request. The CSS blocks are still inlined (each from its
+// own `<style>` tag), but the JavaScript lives at /_/app.js so we can
+// keep `script-src` strict.
+var pageTmpl = template.Must(template.New("page").Parse(pageTmplSrc))
+
+// xterm256 is the per-index .term-fgxN / .term-bgxN ruleset for the
+// 256-colour palette, computed once at init. It depends only on string
+// arithmetic, not runtime config, so caching it is just an optimisation
+// — the result is identical on every call.
+var xterm256 = computeXterm256CSS()
 
 // paletteCSS is the contents of ~/.config/webdiff/palette.css read once
 // at startup. Empty when the user hasn't generated one — that's the
@@ -182,6 +205,21 @@ func diffEnv(repo string) (env []string, cleanup func()) {
 	}
 }
 
+// branchBase returns the merge-base SHA between HEAD and origin/main (or
+// main if origin/main doesn't exist). Falls back to "HEAD" when neither
+// ref is present, giving the original working-copy-only behaviour.
+func branchBase(repo string) (sha, label string) {
+	for _, ref := range []string{"origin/main", "main"} {
+		out, err := exec.Command("git", "-C", repo, "merge-base", "HEAD", ref).Output()
+		if err == nil {
+			if s := strings.TrimSpace(string(out)); s != "" {
+				return s, "main"
+			}
+		}
+	}
+	return "HEAD", ""
+}
+
 // currentBranch returns the current git branch name for repo.
 func currentBranch(repo string) string {
 	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
@@ -194,8 +232,8 @@ func currentBranch(repo string) string {
 }
 
 // diffStat parses git's --shortstat output into file/insertion/deletion counts.
-func diffStat(env []string, repo string) (files, ins, del int) {
-	cmd := exec.Command("git", "diff", "--cached", "--shortstat", "HEAD")
+func diffStat(env []string, repo, base string) (files, ins, del int) {
+	cmd := exec.Command("git", "diff", "--cached", "--shortstat", base)
 	cmd.Env = env
 	cmd.Dir = repo
 	out, err := cmd.Output()
@@ -222,8 +260,8 @@ func diffStat(env []string, repo string) (files, ins, del int) {
 
 // fileDiffStat returns the per-file numstat: added/removed line counts, or
 // binary=true for binary files.
-func fileDiffStat(env []string, repo, file string) (added, removed string, binary bool) {
-	cmd := exec.Command("git", "diff", "--cached", "--numstat", "HEAD", "--", file)
+func fileDiffStat(env []string, repo, base, file string) (added, removed string, binary bool) {
+	cmd := exec.Command("git", "diff", "--cached", "--numstat", base, "--", file)
 	cmd.Env = env
 	cmd.Dir = repo
 	out, err := cmd.Output()
@@ -242,9 +280,9 @@ func fileDiffStat(env []string, repo, file string) (added, removed string, binar
 	return
 }
 
-// changedFiles returns the list of files with uncommitted changes
-func changedFiles(env []string, repo string) []string {
-	cmd := exec.Command("git", "diff", "--cached", "--name-only", "HEAD")
+// changedFiles returns the list of files changed since base.
+func changedFiles(env []string, repo, base string) []string {
+	cmd := exec.Command("git", "diff", "--cached", "--name-only", base)
 	cmd.Env = env
 	cmd.Dir = repo
 	out, err := cmd.Output()
@@ -256,8 +294,8 @@ func changedFiles(env []string, repo string) []string {
 
 // fileDiff gets the diff for a single file and pipes it through the user's
 // configured pager (e.g. delta, diff-so-fancy) if available.
-func fileDiff(env []string, repo, file string, cols int) string {
-	cmd := exec.Command("git", "diff", "--cached", "--color=always", "HEAD", "--", file)
+func fileDiff(env []string, repo, base, file string, cols int) string {
+	cmd := exec.Command("git", "diff", "--cached", "--color=always", base, "--", file)
 	cmd.Env = env
 	cmd.Dir = repo
 	raw, err := cmd.Output()
@@ -394,7 +432,7 @@ func isVisuallyBlank(s string) bool {
 // span at all in the HTML — terminal-to-html drops the trailing
 // `\x1b[K` cells — so we additionally classify them by the gutter
 // pattern (term-fgx88 vs term-fgx28 column emptiness).
-func wrapDiffLines(htmlIn string) string {
+func wrapDiffLines(htmlIn, file string) string {
 	htmlIn = strings.TrimRight(htmlIn, "\n")
 	lines := strings.Split(htmlIn, "\n")
 	classes := make([]string, len(lines))
@@ -418,10 +456,39 @@ func wrapDiffLines(htmlIn string) string {
 			classes[i] = classes[i-1]
 		}
 	}
+	fileAttr := ""
+	if file != "" {
+		fileAttr = fmt.Sprintf(` data-file="%s"`, template.HTMLEscapeString(file))
+	}
 	var b strings.Builder
+	// fileAnchorWritten marks the first visually-quiet line (no diff
+	// class, no line numbers) as the file-comment anchor — clicking it
+	// opens a file-scope composer, replacing the dedicated "+" button
+	// that used to live in the summary. We only stamp non-diff lines
+	// because diff lines already participate in the line-level
+	// drag-select flow and we don't want a click ambiguity.
+	fileAnchorWritten := false
 	for i, line := range lines {
-		if classes[i] == "" {
+		if classes[i] == "" && !lineHasNumbers(line) {
+			if !fileAnchorWritten && file != "" {
+				fmt.Fprintf(&b, `<span class="line line-file-anchor" data-file-comment="%s" title="comment on this whole file">%s</span>`,
+					template.HTMLEscapeString(file), line)
+				fileAnchorWritten = true
+				continue
+			}
 			fmt.Fprintf(&b, `<span class="line">%s</span>`, line)
+			continue
+		}
+		oldNum, newNum := lineNumbers(line)
+		lineAttrs := fileAttr
+		if oldNum != "" {
+			lineAttrs += fmt.Sprintf(` data-old-line="%s"`, oldNum)
+		}
+		if newNum != "" {
+			lineAttrs += fmt.Sprintf(` data-new-line="%s"`, newNum)
+		}
+		if classes[i] == "" {
+			fmt.Fprintf(&b, `<span class="line"%s>%s</span>`, lineAttrs, line)
 			continue
 		}
 		bg := "term-bgx22"
@@ -430,10 +497,79 @@ func wrapDiffLines(htmlIn string) string {
 		}
 		prefix, tail := splitDiffLine(line, bg)
 		fmt.Fprintf(&b,
-			`<span class="line line-%s"><span class="line-prefix">%s</span><span class="line-tail">%s</span></span>`,
-			classes[i], prefix, tail)
+			`<span class="line line-%s"%s><span class="line-prefix">%s</span><span class="line-tail">%s</span></span>`,
+			classes[i], lineAttrs, prefix, tail)
 	}
 	return b.String()
+}
+
+// lineNumbers returns (old, new) line numbers parsed out of the line's
+// gutter prefix. Either side can be empty: added lines have no old
+// number, removed lines have no new number, decoration lines (hunk
+// headers) have neither and we just leave both empty.
+//
+// We parse against the same span shapes the prefix regexes match,
+// peeling digits from inside the term-fgx88 / term-fgx28 / term-fgx238
+// columns. We deliberately don't try to handle delta themes that paint
+// line numbers a different colour — if the user reskins delta the
+// data attributes will simply be missing and the comment lands at the
+// file level.
+func lineNumbers(line string) (oldNum, newNum string) {
+	// Old-side column: term-fgx88 (added/removed columns) or
+	// term-fgx238 (unchanged context). For unchanged context lines
+	// both columns use 238, and we read them in document order.
+	if m := lineNumberRE("term-fgx88").FindStringSubmatch(line); m != nil {
+		oldNum = strings.TrimSpace(m[1])
+	} else if m := lineNumberRE("term-fgx238").FindStringSubmatch(line); m != nil {
+		oldNum = strings.TrimSpace(m[1])
+		// Unchanged-context lines have a second 238 span for the new
+		// number; pull that one too if present.
+		if m2 := lineNumberRESecond("term-fgx238").FindStringSubmatch(line); m2 != nil {
+			newNum = strings.TrimSpace(m2[1])
+			return
+		}
+	}
+	if m := lineNumberRE("term-fgx28").FindStringSubmatch(line); m != nil {
+		newNum = strings.TrimSpace(m[1])
+	}
+	return
+}
+
+func lineHasNumbers(line string) bool {
+	return strings.Contains(line, "term-fgx88") || strings.Contains(line, "term-fgx28") || strings.Contains(line, "term-fgx238")
+}
+
+// lineNumberRE / lineNumberRESecond return regexes that capture the
+// digits inside the first / second occurrence of a span with the given
+// class. Cached at package level (built lazily).
+var lineNumberRECache = struct {
+	mu    sync.Mutex
+	first map[string]*regexp.Regexp
+	scnd  map[string]*regexp.Regexp
+}{first: map[string]*regexp.Regexp{}, scnd: map[string]*regexp.Regexp{}}
+
+func lineNumberRE(class string) *regexp.Regexp {
+	lineNumberRECache.mu.Lock()
+	defer lineNumberRECache.mu.Unlock()
+	if re, ok := lineNumberRECache.first[class]; ok {
+		return re
+	}
+	re := regexp.MustCompile(`class="` + class + `">\s*(\d+)\s*</span>`)
+	lineNumberRECache.first[class] = re
+	return re
+}
+
+func lineNumberRESecond(class string) *regexp.Regexp {
+	lineNumberRECache.mu.Lock()
+	defer lineNumberRECache.mu.Unlock()
+	if re, ok := lineNumberRECache.scnd[class]; ok {
+		return re
+	}
+	// Match the SECOND span of this class: skip the first via .*?, then
+	// capture digits in the next.
+	re := regexp.MustCompile(`class="` + class + `">[^<]*</span>.*?class="` + class + `">\s*(\d+)\s*</span>`)
+	lineNumberRECache.scnd[class] = re
+	return re
 }
 
 // splitDiffLine partitions a single rendered line into the gutter
@@ -511,7 +647,8 @@ type repoSummary struct {
 func summarizeRepo(repo string) repoSummary {
 	env, cleanup := diffEnv(repo)
 	defer cleanup()
-	files, ins, del := diffStat(env, repo)
+	base, _ := branchBase(repo)
+	files, ins, del := diffStat(env, repo, base)
 	return repoSummary{
 		branch: currentBranch(repo),
 		files:  files,
@@ -603,7 +740,48 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 	}
 	body.WriteString(`</div>`)
 
+	// Only the actual root listing gets the tmux section — deeper
+	// non-git folders are project subdirectories where surfacing
+	// host-wide tmux state would be noise.
+	if dir == rootDir {
+		writeTmuxSection(&body, r.Context())
+	}
+
 	writePage(w, body.String())
+}
+
+// writeTmuxSection appends a "tmux sessions" block to the root listing
+// listing every pane on the host. Each row links to the streaming page
+// for that pane so the reviewer can peek at session state without
+// having to be the one who kicked off a review-comment send. Hidden
+// entirely when there are no panes (or when tmux isn't running) so the
+// page stays clean on hosts that don't use tmux.
+func writeTmuxSection(b *strings.Builder, ctx context.Context) {
+	panes, err := listAllPanes(ctx)
+	if err != nil || len(panes) == 0 {
+		return
+	}
+	b.WriteString(`<h2 class="section-title">tmux sessions</h2>`)
+	b.WriteString(`<div class="dir-list">`)
+	for _, p := range panes {
+		label := p.Session + ":" + p.Index
+		desc := p.Command
+		if p.Title != "" && p.Title != p.Command {
+			desc += " · " + p.Title
+		}
+		// No `back=` here: opening a tmux pane from the listing isn't a
+		// post-send flow, so the stream page shouldn't show a "back to
+		// diff" button — there's no diff to return to.
+		href := "/_/stream?paneID=" + url.QueryEscape(p.PaneID) +
+			"&label=" + url.QueryEscape(label)
+		fmt.Fprintf(b, `<a class="dir-row tmux-row" href="%s"><span class="dir-name">%s</span><span class="dir-stats">%s</span><span class="dir-branch">%s</span></a>`,
+			template.HTMLEscapeString(href),
+			template.HTMLEscapeString(label),
+			template.HTMLEscapeString(desc),
+			template.HTMLEscapeString(p.PaneID),
+		)
+	}
+	b.WriteString(`</div>`)
 }
 
 // renderRepo renders the diff view for a single git repo.
@@ -611,7 +789,8 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	env, cleanup := diffEnv(repo)
 	defer cleanup()
 
-	files := changedFiles(env, repo)
+	base, baseLabel := branchBase(repo)
+	files := changedFiles(env, repo, base)
 
 	cols := 120
 	if c := r.URL.Query().Get("cols"); c != "" {
@@ -629,14 +808,41 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	writeWorkdir(&body, repo, urlPath)
 	body.WriteString(`</div><div class="header-right">`)
 
+	// "claude" header button — always visible. When the repo's
+	// webdiff-<base> session is already running it short-circuits
+	// straight to /_/stream; otherwise it points at /_/claude, which
+	// spawns the session and 303-redirects to the same place. The
+	// dashed-border "to-be-created" treatment (via add-comment-btn)
+	// signals the click will spend ~5 s spawning a new pane rather
+	// than instantly attaching to a live one.
+	paneID, label := repoStreamPane(r.Context(), repo)
+	var btnHref, btnClass, btnTitle string
+	if paneID != "" {
+		btnHref = "/_/stream?paneID=" + url.QueryEscape(paneID) +
+			"&label=" + url.QueryEscape(label) +
+			"&repo=" + url.QueryEscape(urlPath)
+		btnClass = "toggle"
+		btnTitle = "open the running claude session for this repo"
+	} else {
+		btnHref = "/_/claude?repo=" + url.QueryEscape(urlPath)
+		btnClass = "toggle add-comment-btn"
+		btnTitle = "start a claude session for this repo"
+	}
+	fmt.Fprintf(&body, `<a class="%s" href="%s" title="%s">claude</a>`,
+		btnClass, template.HTMLEscapeString(btnHref), template.HTMLEscapeString(btnTitle))
+
 	if len(files) == 0 {
 		body.WriteString(`</div></div>`)
-		body.WriteString(`<p style="color:#6c7086;padding:16px">No uncommitted changes.</p>`)
+		msg := "No uncommitted changes."
+		if baseLabel != "" {
+			msg = "No changes since " + baseLabel + "."
+		}
+		fmt.Fprintf(&body, `<p style="color:#6c7086;padding:16px">%s</p>`, msg)
 		writePage(w, body.String())
 		return
 	}
 
-	nfiles, ins, del := diffStat(env, repo)
+	nfiles, ins, del := diffStat(env, repo, base)
 	if nfiles > 0 {
 		noun := "files"
 		if nfiles == 1 {
@@ -652,8 +858,20 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 		}
 		body.WriteString(`</span>`)
 	}
-	body.WriteString(`<button class="toggle" type="button" onclick="toggleAll()">expand all</button>`)
+	body.WriteString(`<button class="toggle" type="button" id="toggle-all">expand all</button>`)
 	body.WriteString(`</div></div>`)
+	// send-comments lives outside the header so it can be position:fixed
+	// in the bottom-right corner and stay visible while the user scrolls
+	// through long diffs adding more comments. Clicking it pops the
+	// review modal (a pre-flight checklist of every queued comment); the
+	// modal carries the actual confirm-send button so a stray tap on
+	// the floating chip can't fire-and-forget the whole batch.
+	body.WriteString(`<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments" hidden>send to claude (<span class="send-count">0</span>)</button></div>`)
+	// review-level comments live in their own bar at the top of the
+	// page. The button is the anchor JS uses for new-comment composers
+	// and bubbles, so it must stay in the DOM even when there are no
+	// review comments yet.
+	body.WriteString(`<div class="review-comments"><button class="toggle add-comment-btn" type="button" id="add-review-comment">+ overall review comment</button></div>`)
 
 	body.WriteString(`<nav class="pillbar">`)
 	for _, file := range files {
@@ -669,16 +887,16 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	body.WriteString(`</nav>`)
 
 	for _, file := range files {
-		raw := fileDiff(env, repo, file, cols)
+		raw := fileDiff(env, repo, base, file, cols)
 		if raw == "" {
 			continue
 		}
 		screen, _ := terminal.NewScreen(terminal.WithMaxSize(cols, 0))
 		screen.Write([]byte(raw))
 		heading, rest := extractHeading(screen.AsHTML())
-		rendered := wrapDiffLines(rest)
+		rendered := wrapDiffLines(rest, file)
 
-		added, removed, binary := fileDiffStat(env, repo, file)
+		added, removed, binary := fileDiffStat(env, repo, base, file)
 
 		slug := strings.ReplaceAll(file, "/", "-")
 		slug = strings.ReplaceAll(slug, ".", "-")
@@ -687,8 +905,14 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 		if heading != "" {
 			display = heading
 		}
-		fmt.Fprintf(&body, `<details id="file-%s" open><summary><span class="filename">%s</span><span class="filestats">`,
-			template.HTMLEscapeString(slug), template.HTMLEscapeString(display))
+		// data-file on <details> lets the JS look up the file's section
+		// (and its <summary>) from a stored Comment without recomputing
+		// the slug — important because the slug is lossy (slashes and
+		// dots both collapse to dashes) and can't be inverted.
+		fmt.Fprintf(&body, `<details id="file-%s" data-file="%s" open><summary><span class="filename">%s</span><span class="filestats">`,
+			template.HTMLEscapeString(slug),
+			template.HTMLEscapeString(file),
+			template.HTMLEscapeString(display))
 		switch {
 		case binary:
 			body.WriteString(`<span class="stats-files">binary</span>`)
@@ -706,71 +930,97 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 
 func writePage(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!DOCTYPE html><html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>%s</style>
-<style>%s</style>
-<style>%s</style>
-</head><body>%s
-<script>
-(function(){
-  var FILE_KEY='webdiff:fileState';
-  var details=document.querySelectorAll('details[id]');
-  var btn=document.querySelector('.toggle');
-  if(details.length===0)return;
-
-  function load(){try{return JSON.parse(localStorage.getItem(FILE_KEY)||'null')}catch(e){return null}}
-  function save(s){try{localStorage.setItem(FILE_KEY,JSON.stringify(s))}catch(e){}}
-
-  var state=load()||{};
-  details.forEach(function(d){if(state[d.id]===false)d.open=false;});
-
-  function anyOpen(){return Array.from(details).some(function(d){return d.open})}
-  function refreshBtn(){if(btn)btn.textContent=anyOpen()?'collapse all':'expand all'}
-  details.forEach(function(d){
-    d.addEventListener('toggle',function(){
-      state[d.id]=d.open;save(state);refreshBtn();
-    });
-  });
-  refreshBtn();
-
-  window.toggleAll=function(){
-    var any=anyOpen();
-    details.forEach(function(d){d.open=!any});
-  };
-
-  document.querySelectorAll('.pill').forEach(function(p){
-    p.addEventListener('click',function(){
-      var id=p.getAttribute('href').slice(1);
-      var el=document.getElementById(id);
-      if(el&&!el.open)el.open=true;
-    });
-  });
-
-  var pills=document.querySelectorAll('.pill');
-  function updateActive(){
-    var scrollY=window.scrollY+60;var active=null;
-    details.forEach(function(d,i){if(d.offsetTop<=scrollY)active=i});
-    pills.forEach(function(p,i){p.classList.toggle('pill-active',i===active)});
-    if(active!==null){
-      var ap=pills[active];var bar=ap.parentElement;
-      bar.scrollTo({left:ap.offsetLeft-bar.offsetLeft-8,behavior:'smooth'});
-    }
-  }
-  window.addEventListener('scroll',updateActive,{passive:true});
-  requestAnimationFrame(function(){requestAnimationFrame(updateActive)});
-})();
-</script>
-</body></html>`, styleCSS, xterm256CSS(), paletteCSS, body)
+	data := struct {
+		StyleCSS    template.CSS
+		Xterm256CSS template.CSS
+		PaletteCSS  template.CSS
+		Body        template.HTML
+	}{
+		StyleCSS:    template.CSS(styleCSS),
+		Xterm256CSS: template.CSS(xterm256),
+		PaletteCSS:  template.CSS(paletteCSS),
+		Body:        template.HTML(body),
+	}
+	if err := pageTmpl.Execute(w, data); err != nil {
+		// Header is already written; logging is the best we can do.
+		fmt.Fprintln(os.Stderr, "page template:", err)
+	}
 }
 
-// xterm256CSS emits per-index .term-fgxN / .term-bgxN rules for the
-// 256-colour palette. Indices 0–15 reference --color-N custom properties
-// from style.css (so the user's palette.css override flows through);
-// 16–231 are the 6×6×6 RGB cube and 232–255 are the 24-step grey ramp,
-// both computed once at startup.
-func xterm256CSS() string {
+// serveAppJS hands out the embedded application JavaScript at
+// /_/app.js. Cached briefly client-side — the source only changes when
+// the binary is rebuilt and the user reloads.
+func serveAppJS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	_, _ = w.Write([]byte(appJS))
+}
+
+// renderStreamPage renders the full-page live tail of one tmux pane.
+// The diff page navigates here after a successful send; on mobile it's
+// the only sane way to show the streaming output (a docked sub-panel
+// over a long diff doesn't fit), and we use the same page on desktop
+// so the flow is consistent across viewports.
+//
+// Query params:
+//
+//	paneID — required; the tmux pane to capture
+//	label  — optional; human-readable name shown in the header
+//	repo   — optional; URL path of the repo diff page (e.g. "/webdiff/").
+//	         When present a "← diff" link is shown in the sticky header.
+//
+// Layout: sticky header with nav links, streaming term tail in the
+// middle, and a bottom-fixed toolbar with ↑ / ↓ / enter keys plus a
+// growing textarea. Navigation lives in the sticky header so it's
+// always reachable without scrolling.
+//
+// The actual SSE consumption and auto-follow behaviour live in app.js;
+// this handler just serves the chrome and the empty container the JS
+// fills in.
+func renderStreamPage(w http.ResponseWriter, r *http.Request) {
+	paneID := r.URL.Query().Get("paneID")
+	if paneID == "" {
+		http.Error(w, "paneID required", http.StatusBadRequest)
+		return
+	}
+	label := r.URL.Query().Get("label")
+	if label == "" {
+		label = paneID
+	}
+	repo := r.URL.Query().Get("repo")
+
+	var body strings.Builder
+	body.WriteString(`<div class="header stream-header"><div class="header-left">`)
+	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(label))
+	body.WriteString(`</div><div class="header-right">`)
+	body.WriteString(`<button class="toggle" type="button" id="jump-bottom" hidden>jump to bottom</button>`)
+	body.WriteString(`<a class="toggle" href="/">home</a>`)
+	if repo != "" {
+		fmt.Fprintf(&body, `<a class="toggle" href="%s">← diff</a>`, template.HTMLEscapeString(repo))
+	}
+	body.WriteString(`</div></div>`)
+	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" class="term-container"><div class="term-inner"></div></div>`,
+		template.HTMLEscapeString(paneID))
+	body.WriteString(`<div class="stream-toolbar">`)
+	body.WriteString(`<div class="stream-toolbar-row">`)
+	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Up" title="send up arrow">↑</button>`)
+	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Down" title="send down arrow">↓</button>`)
+	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Enter" title="send Enter">enter</button>`)
+	body.WriteString(`</div>`)
+	body.WriteString(`<div class="stream-toolbar-row">`)
+	body.WriteString(`<textarea id="pane-msg" class="stream-msg" rows="1" placeholder="message…" autocomplete="off"></textarea>`)
+	body.WriteString(`<button class="toggle stream-send" type="button" id="pane-send">send</button>`)
+	body.WriteString(`</div>`)
+	body.WriteString(`</div>`)
+	writePage(w, body.String())
+}
+
+// computeXterm256CSS emits per-index .term-fgxN / .term-bgxN rules for
+// the 256-colour palette. Indices 0–15 reference --color-N custom
+// properties from style.css (so the user's palette.css override flows
+// through); 16–231 are the 6×6×6 RGB cube and 232–255 are the 24-step
+// grey ramp. Used once at init via the xterm256 package var.
+func computeXterm256CSS() string {
 	colors := make([]string, 256)
 	for i := 0; i < 16; i++ {
 		colors[i] = fmt.Sprintf("var(--color-%d)", i)
@@ -789,6 +1039,7 @@ func xterm256CSS() string {
 	}
 	return b.String()
 }
+
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "palette" {
@@ -829,11 +1080,75 @@ func main() {
 		os.Exit(1)
 	}
 
+	auth, err := newOwnerAuth(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tailscale identity check failed:", err)
+		os.Exit(1)
+	}
+
 	mode := "repo"
 	if !isGitRepo(rootDir) {
 		mode = "multi-repo browser"
 	}
-	fmt.Printf("Serving %s on http://0.0.0.0:%s (root: %s, cache: %s)\n", mode, port, rootDir, cacheRoot)
-	http.HandleFunc("/", handler)
-	http.ListenAndServe("0.0.0.0:"+port, nil)
+
+	browserMux := http.NewServeMux()
+	browserMux.HandleFunc("/_/app.js", serveAppJS)
+	browserMux.HandleFunc("/_/stream", renderStreamPage)
+	browserMux.HandleFunc("/_/claude", handleStartSession)
+	browserMux.HandleFunc("/", handler)
+
+	apiMux := http.NewServeMux()
+	registerClaudeRoutes(apiMux)
+
+	// safeweb's DefaultCSP is strict-by-default; everything except
+	// same-origin URLs is blocked. The application JavaScript is now
+	// served from /_/app.js so script-src can stay strict ('self' only
+	// — no 'unsafe-inline' needed). The three CSS blocks are still
+	// inlined into the page, so style-src allows inline via the
+	// CSPAllowInlineStyles config flag below.
+	csp := safeweb.DefaultCSP()
+	srv, err := safeweb.NewServer(safeweb.Config{
+		BrowserMux:           browserMux,
+		APIMux:               apiMux,
+		CSP:                  csp,
+		CSPAllowInlineStyles: true,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "safeweb:", err)
+		os.Exit(1)
+	}
+
+	// Bind to each Tailscale IP rather than 0.0.0.0. The auth
+	// middleware already gates by Tailscale identity, but binding
+	// only to the Tailscale interface means non-Tailscale traffic
+	// (other LAN interfaces, public addresses if any, processes on
+	// localhost run by other Unix users) never reaches us in the
+	// first place — defence in depth. Tailscale typically assigns
+	// one IPv4 in 100.64.0.0/10 plus one IPv6 in fd7a::/8; we listen
+	// on each so peers can reach us over either family.
+	listeners := make([]net.Listener, 0, len(auth.ips))
+	addrs := make([]string, 0, len(auth.ips))
+	for _, ip := range auth.ips {
+		addr := net.JoinHostPort(ip.String(), port)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "listen %s: %v\n", addr, err)
+			os.Exit(1)
+		}
+		listeners = append(listeners, ln)
+		addrs = append(addrs, addr)
+	}
+	fmt.Printf("Serving %s on %s (root: %s, cache: %s, owner: %d)\n",
+		mode, strings.Join(addrs, ", "), rootDir, cacheRoot, auth.ownerID)
+	// Wrap safeweb's handler with the owner check so the auth gate runs
+	// before any security-headers / CSRF / mux dispatch logic.
+	httpSrv := &http.Server{Handler: auth.middleware(srv)}
+	errCh := make(chan error, len(listeners))
+	for _, ln := range listeners {
+		go func(l net.Listener) { errCh <- httpSrv.Serve(l) }(ln)
+	}
+	if err := <-errCh; err != nil {
+		fmt.Fprintln(os.Stderr, "serve:", err)
+		os.Exit(1)
+	}
 }

@@ -1,0 +1,320 @@
+/* ─── customisable colours ──────────────────────────────────────────
+ * Override these by capturing your terminal's actual palette:
+ *
+ *   webdiff palette > ~/.config/webdiff/palette.css
+ *
+ * webdiff loads that file (if it exists) after this block, so any
+ * `:root` properties it defines win over the defaults below.
+ * ──────────────────────────────────────────────────────────────────── */
+:root {
+  --color-0:  #000000;  /* black           */
+  --color-1:  #c23621;  /* red             */
+  --color-2:  #25bc24;  /* green           */
+  --color-3:  #adad27;  /* yellow          */
+  --color-4:  #492ee1;  /* blue            */
+  --color-5:  #d338d3;  /* magenta         */
+  --color-6:  #33bbc8;  /* cyan            */
+  --color-7:  #cbcccd;  /* white           */
+  --color-8:  #818383;  /* bright black    */
+  --color-9:  #fc391f;  /* bright red      */
+  --color-10: #31e722;  /* bright green    */
+  --color-11: #eaec23;  /* bright yellow   */
+  --color-12: #5833ff;  /* bright blue     */
+  --color-13: #f935f8;  /* bright magenta  */
+  --color-14: #14f0f0;  /* bright cyan     */
+  --color-15: #e9ebeb;  /* bright white    */
+
+  --fg: #e6edf3;        /* default foreground */
+  --bg: #0d1117;        /* default background */
+
+  --diff-add-bg: #0e2b18;
+  --diff-del-bg: #3a1818;
+
+  /* UI chrome — same design language as the diff body. Override these
+     too if your terminal has a different sense of "raised" / "muted". */
+  --chrome-bg: color-mix(in srgb, var(--bg) 88%, var(--fg));
+  --border:    color-mix(in srgb, var(--bg) 75%, var(--fg));
+  --muted:     var(--color-8);
+  --accent:    var(--color-12);
+  --added:     var(--color-2);
+  --removed:   var(--color-1);
+  --branch:    var(--color-10);
+}
+
+/* ─── shared typography ──────────────────────────────────────────────
+ * Everything (chrome and diff body) uses the same monospace stack so
+ * the page reads like a TUI rather than a web app.
+ *
+ * text-size-adjust: 100% disables iOS / Chrome-Android's auto text
+ * inflation. Without it the mobile browser heuristically scales up
+ * text inside narrow blocks; with our flex line-prefix / line-tail
+ * structure it fires for some spans and not others, so you'd see the
+ * diff alternate between UI-sized and comically large within a single
+ * file. */
+html {
+  font: 13px/1.4 "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+/* ─── diff rendering ─────────────────────────────────────────────── */
+.term-container {
+  font: 13px/1.4 "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  background: var(--bg); color: var(--fg);
+  padding: 8px 0 20px; margin: 0;
+  overflow-x: auto;
+  /* `container-type: inline-size` lets the sticky composer/bubble
+     pinned at left:0 (which lives inside `.term-inner` and therefore
+     can't reference body width directly) size itself with `100cqi` —
+     i.e. against this element's inline size, which is body-width on
+     desktop. `100vw` was wrong because it includes the vertical
+     scrollbar gutter, leaving the composer ~15px too wide and
+     triggering an extra horizontal scroll. */
+  container-type: inline-size;
+}
+.term-inner { display: block; width: max-content; min-width: 100%; box-sizing: border-box }
+.term-container .line { display: block; white-space: pre; padding: 0 8px }
+.term-container .line-add, .term-container .line-del { display: flex; padding: 0 }
+.term-container .line-prefix { flex: 0 0 auto; padding-left: 8px; white-space: pre }
+.term-container .line-tail { flex: 1 0 auto; padding-right: 8px; white-space: pre }
+.term-container .line-add .line-tail { background: var(--diff-add-bg) }
+.term-container .line-del .line-tail { background: var(--diff-del-bg) }
+.term-container .line-add .line-tail .term-bgx22,
+.term-container .line-del .line-tail .term-bgx52 { background: transparent }
+
+/* ─── ANSI 0-15 (the 256-cube indices 16-255 are emitted by xterm256CSS) ─── */
+.term-fg1 { font-weight: bold }
+.term-fg2 { opacity: 0.7 }
+.term-fg3 { font-style: italic }
+.term-fg4 { text-decoration: underline }
+.term-fg9 { text-decoration: line-through }
+.term-fg30 { color: var(--color-0) }   .term-fg31 { color: var(--color-1) }
+.term-fg32 { color: var(--color-2) }   .term-fg33 { color: var(--color-3) }
+.term-fg34 { color: var(--color-4) }   .term-fg35 { color: var(--color-5) }
+.term-fg36 { color: var(--color-6) }   .term-fg37 { color: var(--color-7) }
+.term-fgi90,.term-fgi30 { color: var(--color-8)  }
+.term-fgi91,.term-fgi31 { color: var(--color-9)  }
+.term-fgi92,.term-fgi32 { color: var(--color-10) }
+.term-fgi93,.term-fgi33 { color: var(--color-11) }
+.term-fgi94,.term-fgi34 { color: var(--color-12) }
+.term-fgi95,.term-fgi35 { color: var(--color-13) }
+.term-fgi96,.term-fgi36 { color: var(--color-14) }
+.term-fgi97,.term-fgi37 { color: var(--color-15) }
+.term-bg40 { background: var(--color-0) }   .term-bg41 { background: var(--color-1) }
+.term-bg42 { background: var(--color-2) }   .term-bg43 { background: var(--color-3) }
+.term-bg44 { background: var(--color-4) }   .term-bg45 { background: var(--color-5) }
+.term-bg46 { background: var(--color-6) }   .term-bg47 { background: var(--color-7) }
+
+/* ─── chrome / layout ──────────────────────────────────────────────
+ * Same monospace stack as the diff body, square corners, hairline
+ * borders, accents pulled straight from the ANSI palette. */
+/* `overflow-x: hidden` keeps the document from ever being wider than
+   the viewport even if some descendant briefly miscomputes its
+   width. The legitimate horizontal scrollers — `.term-container`,
+   `.pillbar` — have their own `overflow-x: auto` and aren't affected.
+   Without this, the page's intrinsic width was leaking past the
+   viewport on mobile, which made `.comment-composer`'s sticky-left:0
+   anchor land off-screen when the user had scrolled the page right. */
+body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
+
+.header { padding: 10px 12px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 4px }
+.header-left { display: flex; flex-direction: column; gap: 2px }
+.header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
+.branch::before { content: "❯ "; color: var(--muted) }
+.branch { color: var(--branch); font-weight: bold }
+.workdir { color: var(--muted); text-decoration: none; font-size: 12px }
+.workdir-back::before { content: "← "; color: var(--accent) }
+.workdir-back { color: var(--accent); cursor: pointer }
+.workdir-back:hover { text-decoration: underline }
+
+.stats { color: var(--muted) }
+.stats-files { color: var(--fg) }
+.stats-ins { color: var(--added) }
+.stats-del { color: var(--removed) }
+
+.dir-list { display: flex; flex-direction: column }
+.dir-row { display: flex; align-items: baseline; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--fg); text-decoration: none }
+.dir-row:hover { background: var(--chrome-bg) }
+.dir-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent) }
+.dir-folder .dir-name { color: var(--fg) }
+.dir-folder .dir-name::before { content: "▸ "; color: var(--muted) }
+.dir-branch { color: var(--branch); font-size: 12px }
+.dir-branch::before { content: "❯ "; color: var(--muted) }
+.dir-stats { color: var(--muted); font-size: 12px }
+.dir-folder-tag { color: var(--muted); font-size: 12px }
+.dir-folder-tag::before { content: none }
+
+/* Narrow viewports: drop the branch chip so the folder name and its
+   in-flight diff stats keep priority. The folder-tag is also a branch-
+   slot element so we hide it too — its only purpose is to balance out
+   the layout on wider screens. */
+@media (max-width: 640px) {
+  .dir-branch { display: none }
+}
+.empty { color: var(--muted); padding: 16px }
+.section-title { margin: 24px 0 0; padding: 8px 12px; color: var(--muted); font-size: 11px; font-weight: normal; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--border) }
+
+/* Repo rows ellipsis the dir-name because folder paths can be long
+   and the right-hand stats are short. Tmux rows are the inverse: the
+   "session:window.pane" label is short and the identifying piece, and
+   the command/title summary is the part that can grow unboundedly.
+   Keep the label at its natural size, and let the summary be the one
+   that shrinks and ellipses when the viewport gets narrow. */
+.tmux-row .dir-name { flex: 0 0 auto; overflow: visible; text-overflow: clip }
+.tmux-row .dir-stats { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+
+.toggle { font: inherit; font-size: 12px; background: transparent; color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 8px; cursor: pointer }
+.toggle:hover { background: var(--chrome-bg) }
+
+.pillbar { display: flex; gap: 4px; padding: 6px 8px; background: var(--chrome-bg); overflow-x: auto; white-space: nowrap; position: sticky; top: 0; z-index: 20; border-bottom: 1px solid var(--border); -webkit-overflow-scrolling: touch; transform: translateZ(0); will-change: transform }
+.pill { font-size: 12px; color: var(--muted); background: transparent; padding: 2px 8px; border: 1px solid transparent; text-decoration: none; flex-shrink: 0 }
+.pill:hover { color: var(--accent); border-color: var(--border) }
+.pill-active { color: var(--accent); border-color: var(--accent) }
+
+summary { padding: 8px 12px; font-size: 14px; cursor: pointer; color: var(--fg); background: var(--chrome-bg); border-top: 1px solid var(--accent); border-bottom: 1px solid var(--border); position: sticky; top: 33px; z-index: 10; display: flex; justify-content: space-between; align-items: center; gap: 12px }
+summary::before { content: "▾"; color: var(--accent); font-weight: bold; margin-right: 8px }
+details:not([open]) > summary::before { content: "▸" }
+.filename { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: bold; color: var(--fg) }
+.filestats { font-size: 12px; color: var(--muted); white-space: nowrap }
+details { margin-bottom: 0 }
+details .term-container { margin: 0 }
+
+/* ─── review comments ────────────────────────────────────────────── */
+.term-container .line[data-file],
+.term-container .line-file-anchor { cursor: pointer }
+.term-container .line[data-file]:hover,
+.term-container .line-file-anchor:hover { outline: 1px dashed var(--border); outline-offset: -1px }
+.term-container .line-drag-selected { background: color-mix(in srgb, var(--accent) 18%, transparent); outline: 1px solid var(--accent); outline-offset: -1px }
+.term-container .line-add.line-drag-selected .line-tail,
+.term-container .line-del.line-drag-selected .line-tail { background: transparent }
+
+/* The viewport-clamping treatment (`position: sticky; left: 0;
+   width: 100vw; max-width: 100%`) only matters when the composer is
+   inside `.term-inner` — that's the `width: max-content` container
+   that can be wider than the viewport. File-level and review-level
+   composers live outside `.term-inner`, in body-width parents, so
+   they don't need the sticky pin and the width clamp would just be a
+   no-op. */
+.comment-composer { display: flex; flex-direction: column; gap: 8px; padding: 8px 12px; background: var(--chrome-bg); border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); box-sizing: border-box }
+.term-inner > .comment-composer { position: sticky; left: 0; width: 100cqi; max-width: 100% }
+.comment-composer textarea { width: 100%; min-height: 40px; resize: vertical; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 4px 6px; box-sizing: border-box }
+.comment-composer textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
+.comment-actions { display: flex; flex-direction: row; gap: 4px }
+
+/* Same scoping as the composer above: only line-level bubbles (which
+   live inside `.term-inner`) need the sticky pin + viewport-width
+   clamp; file/review bubbles are in body-width parents already. */
+.comment-bubble { display: flex; gap: 8px; padding: 6px 12px; background: var(--chrome-bg); border-left: 2px solid var(--accent); align-items: flex-start; white-space: pre-wrap; font-size: 12px; box-sizing: border-box }
+.term-inner > .comment-bubble { position: sticky; left: 0; width: 100cqi; max-width: 100% }
+.comment-body { flex: 1; color: var(--fg) }
+.comment-body::before { content: "💬 "; color: var(--accent); margin-right: 4px }
+.comment-edit, .comment-del { background: transparent; border: none; color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; padding: 0 4px }
+.comment-edit:hover { color: var(--accent) }
+.comment-del:hover { color: var(--removed) }
+
+/* Review-level comment bar at the very top of the page. Always
+   visible; its "+" button is the anchor JS uses for the new-comment
+   composer and any saved review-level bubbles (which stack between
+   the button and the pillbar below). */
+.review-comments { padding: 8px 12px; background: var(--chrome-bg); border-bottom: 1px solid var(--border) }
+.review-comments .comment-bubble { margin-top: 8px }
+.review-comments .comment-composer { margin-top: 8px }
+
+/* "+ overall review comment" / per-file "+" triggers. Muted so they
+   don't compete with the file's own chrome until the reviewer goes
+   looking for them. */
+.add-comment-btn { color: var(--muted); border-style: dashed }
+.add-comment-btn:hover { color: var(--accent); border-style: solid }
+
+.send-btn { color: var(--branch); border-color: var(--branch) }
+.send-btn:hover { background: var(--chrome-bg); color: var(--branch) }
+/* Floating send chip pinned to the bottom-right corner. The wrapper
+   stays in the DOM even when the inner button is `[hidden]` so that
+   transient `.send-status` siblings (inserted by flashStatus) have a
+   stable, fixed-positioned anchor; the empty wrapper has zero size
+   and is invisible until something is in it.
+
+   Filled-green styling (background + inverted text + glow ring + scale-
+   in animation on appear) so the button is unmistakable when a
+   reviewer drops their first comment — the previous outlined chip read
+   as "passive UI" and was easy to scroll past on long diffs. */
+.send-bar { position: fixed; bottom: 12px; right: 12px; z-index: 30; display: flex; align-items: center; gap: 8px }
+.send-bar .send-btn { background: var(--branch); color: var(--bg); font-weight: bold; padding: 6px 14px; border: 1px solid var(--branch); box-shadow: 0 2px 10px rgba(0,0,0,0.5), 0 0 0 4px color-mix(in srgb, var(--branch) 25%, transparent); animation: send-btn-appear 0.35s ease-out }
+.send-bar .send-btn:hover { background: color-mix(in srgb, var(--branch) 80%, white); color: var(--bg) }
+@keyframes send-btn-appear {
+  0%   { transform: scale(0.5); opacity: 0 }
+  60%  { transform: scale(1.15); opacity: 1 }
+  100% { transform: scale(1) }
+}
+.send-status { font-size: 12px; margin-left: 8px }
+.send-status-ok { color: var(--added) }
+.send-status-err { color: var(--removed) }
+.send-status-info { color: var(--muted) }
+
+/* Comments modal — pre-flight summary triggered by the "view" button
+   in the send-bar. Backdrop dims the page; clicking outside the panel
+   (or pressing Escape) closes it. Rows are clickable to jump back to
+   their bubble in the diff. */
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 50; display: flex; align-items: center; justify-content: center; padding: 16px; box-sizing: border-box }
+.modal { background: var(--chrome-bg); border: 1px solid var(--border); max-width: 720px; width: 100%; max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 4px 20px rgba(0,0,0,0.5) }
+.modal-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--fg); font-size: 13px }
+.modal-body { padding: 4px 12px; overflow-y: auto }
+.modal-row { display: flex; gap: 8px; padding: 6px 0; border-bottom: 1px dashed var(--border); align-items: flex-start; cursor: pointer }
+.modal-row:last-child { border-bottom: none }
+.modal-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent) }
+.modal-loc { color: var(--accent); font-size: 12px; flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.modal-text { flex: 1; color: var(--fg); font-size: 12px; white-space: pre-wrap; min-width: 0 }
+.modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--border) }
+.modal-footer .send-btn { background: var(--branch); color: var(--bg); font-weight: bold; padding: 6px 14px; border-color: var(--branch) }
+.modal-footer .send-btn:hover { background: color-mix(in srgb, var(--branch) 80%, white); color: var(--bg) }
+
+/* Stream-page sticky header. Sits at top:0 so nav is always reachable
+   without scrolling, even after the user has followed the tail far down. */
+.stream-header { position: sticky; top: 0; z-index: 30 }
+
+/* Stream-page footer toolbar. Two flex rows so the key buttons and
+   the message input never have to compete for space on a narrow
+   viewport; `#pane-tail`'s extra bottom padding keeps the live tail
+   from scrolling under the toolbar when auto-following. JS updates
+   padding-bottom dynamically as the textarea grows. */
+.stream-toolbar { position: fixed; bottom: 0; left: 0; right: 0; z-index: 30; display: flex; flex-direction: column; gap: 4px; padding: 8px; background: var(--chrome-bg); border-top: 1px solid var(--border); box-sizing: border-box }
+.stream-toolbar-row { display: flex; gap: 4px; align-items: flex-end }
+.stream-toolbar .toggle { flex-shrink: 0; align-self: flex-end }
+.stream-key { min-width: 36px; text-align: center }
+.stream-msg { flex: 1; min-width: 0; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box; resize: none; overflow-y: auto; max-height: 120px; line-height: 1.4 }
+.stream-msg:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
+
+/* iOS Safari auto-zooms the viewport whenever a focused input has a
+   font-size below 16px. Bump back to 16px only where the primary input
+   is touch — desktop browsers don't have the zoom behaviour, so on
+   desktop the composer/input stays at the page's 13px and matches
+   everything around it. */
+@media (pointer: coarse) {
+  .comment-composer textarea { font-size: 16px }
+  .stream-msg { font-size: 16px }
+}
+.stream-send { font-weight: bold; color: var(--branch); border-color: var(--branch) }
+#pane-tail { padding-bottom: 100px }
+
+/* Diff-coloured stream rows get their bg painted on the .line block
+   instead of the inline `term-bgxN` spans, so it fills the entire
+   line box rather than just the inline glyph extent (ascent+descent).
+   Two problems fall out of the inline-bg approach we used to have:
+   (1) a thin dark band shows between adjacent same-colour rows
+   (the line-height leading wasn't covered by inline bg); and
+   (2) descenders like g/q/p/y/j on the line above get clipped by the
+   following diff row's bg, because at tight line-heights they
+   overflow their own line box. The block-level bg avoids both: the
+   bg paints the full line-height, and JetBrains Mono's natural ~1.32
+   em ascent+descent fits inside the inherited 1.4 line-height with
+   no clipping. The inner term-bgxN spans are made transparent so
+   they don't double-paint. JS in setupStreamPage adds the right
+   class by inspecting which colour spans the rendered line carries.
+   bgx22 / bg42 = ANSI green (added); bgx52 / bg41 = ANSI red. */
+#pane-tail .line-bg-add { background: var(--diff-add-bg) }
+#pane-tail .line-bg-del { background: var(--diff-del-bg) }
+#pane-tail .line-bg-add .term-bgx22,
+#pane-tail .line-bg-add .term-bg42,
+#pane-tail .line-bg-del .term-bgx52,
+#pane-tail .line-bg-del .term-bg41 { background: transparent }
+
