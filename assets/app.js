@@ -1,7 +1,7 @@
 (function(){
   // Stream page: a dedicated full-window tail of one tmux pane. We
   // detect it by the presence of #pane-tail (rendered server-side by
-  // renderStreamPage) and run a self-contained handler. The diff/listing
+  // writeStreamPage) and run a self-contained handler. The diff/listing
   // logic below shouldn't run here — there are no <details> on this
   // page anyway, but bailing early keeps the two flows independent.
   var streamRoot=document.getElementById('pane-tail');
@@ -66,12 +66,58 @@
       if(msg.reset){
         paneLines=msg.append?msg.append.slice():[];
       }else{
-        if(msg.drop>0)paneLines.splice(0,msg.drop);
-        if(msg.append&&msg.append.length)paneLines.push.apply(paneLines,msg.append);
+        var drop=msg.drop||0;
+        var append=msg.append||[];
+        if(drop>0){
+          paneLines.splice(0,drop);
+          // streamDelta on the server falls back to drop=oldLen,
+          // append=newLen whenever it can't align old to new — i.e.
+          // any time a row in the existing buffer changed in place
+          // (cursor blink, spinner, status redraw). Ripping out every
+          // child and regenerating would nuke the user's text
+          // selection on every blink. Instead, only physically remove
+          // children when this is a genuine top shift (drop strictly
+          // less than what's on screen); otherwise leave the DOM
+          // alone and let syncDOM swap only the rows that really
+          // differ.
+          if(drop<inner.children.length){
+            for(var k=0;k<drop;k++){
+              if(inner.firstChild)inner.firstChild.remove();
+            }
+          }
+        }
+        if(append.length)paneLines.push.apply(paneLines,append);
       }
-      inner.innerHTML=paneLines.join('');
+      syncDOM();
       tagDiffBgLines();
       if(follow)scrollToBottom();
+    }
+    // Reconcile DOM children against paneLines: rows whose HTML hasn't
+    // changed keep their existing DOM node (and therefore any active
+    // text selection inside them); rows that differ get swapped in
+    // place; trailing extras are dropped. _lineHTML caches the string
+    // we built each child from so the comparison stays cheap and isn't
+    // affected by any browser-side HTML normalisation of outerHTML.
+    function syncDOM(){
+      var children=inner.children;
+      for(var i=0;i<paneLines.length;i++){
+        var html=paneLines[i];
+        var existing=children[i];
+        if(existing&&existing._lineHTML===html)continue;
+        var tpl=document.createElement('div');
+        tpl.innerHTML=html;
+        var node=tpl.firstChild;
+        if(!node)continue;
+        node._lineHTML=html;
+        if(existing){
+          inner.replaceChild(node,existing);
+        }else{
+          inner.appendChild(node);
+        }
+      }
+      while(inner.children.length>paneLines.length){
+        inner.lastChild.remove();
+      }
     }
     // Reconnect with capped exponential backoff. The server's first
     // message on every fresh connection is {reset:true, append:[…]},
@@ -164,6 +210,29 @@
         msgInput.style.height=msgInput.scrollHeight+'px';
       });
     }
+    // Restart wires through to /api/pane/restart, which kills the
+    // current tmux session. After the kill we navigate to the same
+    // /_/claude<repoURL> the diff page's claude button hits — that
+    // handler spawns a fresh session and 303s back to the stream view.
+    var restartBtn=document.getElementById('restart-session');
+    if(restartBtn){
+      restartBtn.addEventListener('click',function(){
+        if(!window.confirm('Kill the tmux session and start a fresh one? Scrollback will be lost.'))return;
+        var repoURL=restartBtn.dataset.repoUrl||'/';
+        restartBtn.disabled=true;
+        fetch('/api/pane/restart',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({paneID:paneID})
+        }).then(function(r){
+          if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+          window.location.href='/_/claude'+repoURL;
+        }).catch(function(e){
+          restartBtn.disabled=false;
+          window.alert('restart failed: '+e.message);
+        });
+      });
+    }
     // Keep #pane-tail padding-bottom in sync with the toolbar height so
     // auto-follow never hides the last line under the fixed toolbar.
     var toolbar=document.querySelector('.stream-toolbar');
@@ -173,6 +242,98 @@
     }
     syncPad();
   }
+
+  // Listing page: poll for spinning *-wd sessions and reflect that
+  // state on the tmux rows with a CSS spinner via .session-spinning.
+  var tmuxRows=document.querySelectorAll('.tmux-row[data-session]');
+  if(tmuxRows.length>0){
+    function pollSpinning(){
+      fetch('/api/sessions/spinning')
+        .then(function(r){return r.json()})
+        .then(function(spinning){
+          tmuxRows.forEach(function(row){
+            row.classList.toggle('session-spinning',!!spinning[row.dataset.session]);
+          });
+        }).catch(function(){});
+    }
+    pollSpinning();
+    setInterval(pollSpinning,2000);
+  }
+
+  // Diff-mode persistence lives entirely client-side: localStorage
+  // remembers the user's last pick, and we redirect-on-load when the URL
+  // doesn't already have a `?mode=…` so the rendered page matches.
+  // Server defaults to HEAD (working) when the URL has no mode, which
+  // means a fresh URL paste / external link sees the simple default.
+  var MODE_KEY='webdiff:diffMode';
+  function loadStoredMode(){try{return localStorage.getItem(MODE_KEY)||''}catch(e){return ''}}
+  function saveStoredMode(m){
+    try{
+      if(!m||m==='working')localStorage.removeItem(MODE_KEY);
+      else localStorage.setItem(MODE_KEY,m);
+    }catch(e){}
+  }
+  var pageURL=new URL(location.href);
+  var urlMode=pageURL.searchParams.get('mode');
+  var storedMode=loadStoredMode();
+  if(!urlMode&&storedMode&&storedMode!=='working'){
+    pageURL.searchParams.set('mode',storedMode);
+    location.replace(pageURL.toString());
+    return;
+  }
+  if(urlMode)saveStoredMode(urlMode);
+  var modeSelect=document.getElementById('diff-mode-select');
+  if(modeSelect){
+    modeSelect.addEventListener('change',function(){
+      saveStoredMode(modeSelect.value);
+      var u=new URL(location.href);
+      if(modeSelect.value==='working')u.searchParams.delete('mode');
+      else u.searchParams.set('mode',modeSelect.value);
+      // Switching modes resets the per-view "full context" toggle —
+      // most users picking a different base want to see the default
+      // 3-line diff, not whatever expanded view they had open before.
+      u.searchParams.delete('context');
+      location.href=u.toString();
+    });
+  }
+
+  // "full context" toggle: re-renders the current diff page with
+  // git's -U99999 flag (server side) so each file shows its full
+  // contents with hunks inlined. State lives in the URL; not
+  // threaded into outgoing nav links because full context only makes
+  // sense for the current view.
+  var ctxBtn=document.getElementById('toggle-context');
+  if(ctxBtn){
+    ctxBtn.addEventListener('click',function(){
+      var u=new URL(location.href);
+      if(ctxBtn.dataset.full==='true')u.searchParams.delete('context');
+      else u.searchParams.set('context','full');
+      location.href=u.toString();
+    });
+  }
+
+  // Sticky stack: the page heading is pinned at top:0; the pillbar
+  // sticks under it; each <details>' summary sticks under the pillbar.
+  // CSS reads --page-heading-h and --pillbar-h to compute the offsets.
+  // We set them from measured rendered heights so the stack still lines
+  // up if the heading wraps onto extra rows on a narrow viewport or
+  // someone bumps the font-size.
+  function syncStickyOffsets(){
+    var h=document.querySelector('.page-heading');
+    var p=document.querySelector('.pillbar');
+    var root=document.documentElement;
+    if(h)root.style.setProperty('--page-heading-h',h.offsetHeight+'px');
+    if(p)root.style.setProperty('--pillbar-h',p.offsetHeight+'px');
+  }
+  syncStickyOffsets();
+  if(typeof ResizeObserver!=='undefined'){
+    var stickyRO=new ResizeObserver(syncStickyOffsets);
+    var heading=document.querySelector('.page-heading');
+    var pillbar=document.querySelector('.pillbar');
+    if(heading)stickyRO.observe(heading);
+    if(pillbar)stickyRO.observe(pillbar);
+  }
+  window.addEventListener('resize',syncStickyOffsets);
 
   var FILE_KEY='webdiff:fileState';
   var details=document.querySelectorAll('details[id]');
@@ -234,7 +395,8 @@
   function refreshSendBtn(){
     var n=loadComments().length;
     if(sendCount)sendCount.textContent=String(n);
-    if(sendBtn)sendBtn.hidden=n===0;
+    // sendBtn stays visible at all times now — it's the only entry
+    // point to the modal, which owns the "+ overall review" composer.
   }
 
   function commentKey(c){return c.file+'\u0001'+(c.newLine||'')+'\u0001'+(c.oldLine||'')+'\u0001'+c.ts}
@@ -257,14 +419,15 @@
   }
 
   // findAnchor returns the DOM node the bubble (or its replacement
-  // composer when editing) should be inserted after. Three scopes:
-  //   review  — the "+ overall review comment" button at the top
+  // composer when editing) should be inserted after. Two scopes are
+  // anchored on the page; review-level (no file) lives only in the
+  // modal now and has no on-page anchor.
   //   file    — the line-file-anchor span (first quiet line under the
   //             summary); bubbles stack directly below it inside the
   //             term-inner, the same way line-level bubbles do
   //   line    — the diff line itself (existing line-comment behaviour)
   function findAnchor(c){
-    if(!c.file)return document.getElementById('add-review-comment');
+    if(!c.file)return null;
     if(!c.oldLine&&!c.newLine){
       var anchor=document.querySelector('.line-file-anchor[data-file-comment="'+CSS.escape(c.file)+'"]');
       if(anchor)return anchor;
@@ -321,16 +484,17 @@
   }
 
   // openComposer renders the inline textarea+save/cancel UI for any
-  // of the three comment scopes. Two ways to call it:
+  // of the on-page comment scopes. Two ways to call it:
   //
   //   openComposer(spec, null)       — new comment. spec is one of:
   //     { kind:'line',   range:[lineEl, …] }
   //     { kind:'file',   file:'path/to/x.go', anchor: <summary> }
-  //     { kind:'review', anchor: <button#add-review-comment> }
   //
   //   openComposer(null, existing)   — edit. The bubble must have
   //     already been removed by the caller; abort() restores it. The
-  //     anchor is derived from `existing` via findAnchor().
+  //     anchor is derived from `existing` via findAnchor(). Editing a
+  //     review-level comment hits this path with no anchor — handled
+  //     at the call site (modal row's edit affordance).
   function openComposer(spec,existing){
     var anchor,file,placeholder='leave a review comment…';
     var newNums=[],oldNums=[];
@@ -351,10 +515,9 @@
         if(spec.range.length>1)placeholder='comment on '+spec.range.length+' lines…';
       }else if(spec.kind==='file'){
         anchor=spec.anchor;file=spec.file;placeholder='comment on '+file+'…';
-      }else if(spec.kind==='review'){
-        anchor=spec.anchor;file='';placeholder='overall comment on this review…';
       }
     }
+    if(!anchor)return;
     if(!anchor)return;
     if(anchor.nextElementSibling&&anchor.nextElementSibling.classList.contains('comment-composer'))return;
     var comp=document.createElement('span');comp.className='comment-composer';
@@ -452,15 +615,6 @@
     if(range.length>0)openComposer({kind:'line',range:range});
   });
 
-  // Top-of-page "+ overall review comment" — anchors a review-level
-  // composer right below itself, so saved bubbles stack between this
-  // button and the pillbar.
-  var addReviewBtn=document.getElementById('add-review-comment');
-  if(addReviewBtn){
-    addReviewBtn.addEventListener('click',function(){
-      openComposer({kind:'review',anchor:addReviewBtn},null);
-    });
-  }
   // Per-file comment trigger: the first quiet line under the file's
   // <summary> carries `data-file-comment`. Clicking it opens a
   // file-scope composer — same UX shape as a line-level click, just
@@ -499,19 +653,16 @@
         clearComments();
         document.querySelectorAll('.comment-bubble').forEach(function(b){b.remove()});
         refreshSendBtn();
-        if(res.body.paneID){navigateToStream(res.body.paneID,res.body.label);return}
-        flashStatus('sent to '+(res.body.label||'claude'),'ok');
+        // Each repo maps 1-1 to its tmux pane, so the stream URL is
+        // just /_/stream<repoPath> — no paneID or label to thread
+        // through.
+        var path=window.location.pathname;
+        if(path.slice(-1)!=='/')path+='/';
+        window.location.href='/_/stream'+path;
         return;
       }
       flashStatus(res.body.error||('error '+res.status),'err');
     }).catch(function(e){flashStatus(String(e),'err')});
-  }
-
-  function navigateToStream(paneID,label){
-    var qs='?paneID='+encodeURIComponent(paneID);
-    if(label)qs+='&label='+encodeURIComponent(label);
-    qs+='&repo='+encodeURIComponent(window.location.pathname);
-    window.location.href='/_/stream'+qs;
   }
 
   // Comments modal — a pre-flight summary of everything queued for
@@ -528,29 +679,42 @@
     return c.file;
   }
   function openCommentsModal(){
-    var arr=loadComments();
-    if(arr.length===0)return;
     var existing=document.querySelector('.modal-backdrop');
     if(existing){existing.remove();return}
     var backdrop=document.createElement('div');backdrop.className='modal-backdrop';
     var modal=document.createElement('div');modal.className='modal';
     var header=document.createElement('div');header.className='modal-header';
-    var title=document.createElement('span');title.textContent='review comments ('+arr.length+')';
+    var title=document.createElement('span');
     var close=document.createElement('button');close.type='button';close.className='toggle';close.textContent='close';
     close.addEventListener('click',function(){backdrop.remove()});
     header.appendChild(title);header.appendChild(close);
     var bodyEl=document.createElement('div');bodyEl.className='modal-body';
+
+    // Overall-review composer: replaces the page-level "+ overall
+    // review comment" bar. Always present in the modal so review-level
+    // remarks have a permanent home.
+    var overall=document.createElement('div');overall.className='modal-overall';
+    var overallTa=document.createElement('textarea');overallTa.placeholder='overall comment on this review…';overallTa.rows=2;
+    var overallActions=document.createElement('div');overallActions.className='modal-overall-actions';
+    var addBtn=document.createElement('button');addBtn.type='button';addBtn.className='toggle';addBtn.textContent='add';
+    overallActions.appendChild(addBtn);
+    overall.appendChild(overallTa);overall.appendChild(overallActions);
+
     var footer=document.createElement('div');footer.className='modal-footer';
     var confirm=document.createElement('button');confirm.type='button';confirm.className='toggle send-btn';
-    confirm.textContent='send to claude ('+arr.length+')';
-    confirm.addEventListener('click',function(){backdrop.remove();trySend()});
+    confirm.addEventListener('click',function(){
+      if(loadComments().length===0)return;
+      backdrop.remove();trySend();
+    });
     footer.appendChild(confirm);
-    function refreshCount(){
+
+    function refreshState(){
       var n=loadComments().length;
       title.textContent='review comments ('+n+')';
       confirm.textContent='send to claude ('+n+')';
+      confirm.disabled=n===0;
     }
-    arr.forEach(function(c){
+    function appendRow(c){
       var row=document.createElement('div');row.className='modal-row';
       var loc=document.createElement('span');loc.className='modal-loc';loc.textContent=commentLoc(c);
       var text=document.createElement('span');text.className='modal-text';text.textContent=c.text;
@@ -559,22 +723,38 @@
         ev.stopPropagation();ev.preventDefault();
         var k=commentKey(c);
         saveComments(loadComments().filter(function(x){return commentKey(x)!==k}));
-        row.remove();renderAllBubbles();refreshSendBtn();refreshCount();
-        if(loadComments().length===0)backdrop.remove();
+        row.remove();renderAllBubbles();refreshSendBtn();refreshState();
       });
       row.addEventListener('click',function(){
+        // Review-level rows have nowhere to jump to — leave the modal
+        // open so the user can keep editing.
+        if(!c.file)return;
         backdrop.remove();
-        if(c.file){
-          var details=document.querySelector('details[data-file="'+CSS.escape(c.file)+'"]');
-          if(details&&!details.open)details.open=true;
-        }
+        var details=document.querySelector('details[data-file="'+CSS.escape(c.file)+'"]');
+        if(details&&!details.open)details.open=true;
         var anchor=findAnchor(c);
         if(anchor)anchor.scrollIntoView({behavior:'smooth',block:'center'});
       });
       row.appendChild(loc);row.appendChild(text);row.appendChild(del);
       bodyEl.appendChild(row);
+    }
+    function commitOverall(){
+      var t=overallTa.value.trim();
+      if(!t)return;
+      var c={file:'',oldLine:'',newLine:'',text:t,ts:Date.now()};
+      var arr=loadComments();arr.push(c);saveComments(arr);
+      overallTa.value='';
+      appendRow(c);refreshSendBtn();refreshState();
+    }
+    addBtn.addEventListener('click',commitOverall);
+    overallTa.addEventListener('keydown',function(ev){
+      if((ev.metaKey||ev.ctrlKey)&&ev.key==='Enter'){ev.preventDefault();commitOverall()}
     });
-    modal.appendChild(header);modal.appendChild(bodyEl);modal.appendChild(footer);
+
+    loadComments().forEach(appendRow);
+    refreshState();
+
+    modal.appendChild(header);modal.appendChild(bodyEl);modal.appendChild(overall);modal.appendChild(footer);
     backdrop.appendChild(modal);
     backdrop.addEventListener('click',function(ev){if(ev.target===backdrop)backdrop.remove()});
     document.body.appendChild(backdrop);
@@ -583,6 +763,37 @@
     if(ev.key==='Escape'){
       var b=document.querySelector('.modal-backdrop');
       if(b)b.remove();
+      return;
+    }
+    // Cmd/Ctrl+Enter (anywhere outside a textarea) and plain Enter
+    // (only when nothing's focused — i.e. target is <body>) are the
+    // "submit comments" shortcut: first press opens the review modal,
+    // second press fires the send.
+    //
+    // We check ev.target rather than document.activeElement because
+    // the composer's save handler removes the textarea from the DOM
+    // synchronously; by the time the event bubbles up activeElement
+    // is <body>, and the modal would then pop every time the user
+    // saved a comment.
+    //
+    // Plain Enter is gated to target===body so we don't hijack
+    // <details> summaries, pill links, expand-all/toggle-context
+    // buttons, etc. — anything focusable already has Enter wired up.
+    if(ev.key==='Enter'){
+      var t=ev.target;
+      if(t&&(t.tagName==='TEXTAREA'||t.tagName==='INPUT'))return;
+      var modifier=ev.metaKey||ev.ctrlKey;
+      if(!modifier&&t!==document.body)return;
+      var modal=document.querySelector('.modal-backdrop');
+      if(modal){
+        var confirm=modal.querySelector('.send-btn');
+        if(confirm){ev.preventDefault();confirm.click()}
+        return;
+      }
+      if(sendBtn&&!sendBtn.hidden){
+        ev.preventDefault();
+        openCommentsModal();
+      }
     }
   });
   if(sendBtn)sendBtn.addEventListener('click',openCommentsModal);

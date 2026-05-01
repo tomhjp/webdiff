@@ -117,10 +117,29 @@ html {
    anchor land off-screen when the user had scrolled the page right. */
 body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
 
+/* Sticky page heading: stays pinned at the top while everything else
+   scrolls. Used by the diff page (title "<repo> diff") and the stream
+   page (title "<repo> agent"). The non-sticky info bar with git/diff
+   controls or the streaming chrome lives in `.header` immediately
+   below. */
+.page-heading { position: sticky; top: 0; z-index: 30; background: var(--chrome-bg); border-bottom: 1px solid var(--border); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px }
+.page-heading-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-width: 0 }
+/* Row 1 holds the title + meta. The title (page-heading-row > .branch)
+   never shrinks; the head-meta block can, and its branch chip
+   ellipsises when the viewport gets narrow so stats stay legible. */
+.page-heading-row > .branch { flex-shrink: 0 }
+.head-meta { display: flex; align-items: baseline; gap: 8px; font-size: 12px; min-width: 0 }
+.head-branch { color: var(--branch); font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0 }
+.head-meta .stats { flex-shrink: 0 }
+/* Row 2 is the controls strip. Horizontal scroll instead of wrapping
+   on narrow viewports — buttons always sit on a single line. */
+.page-heading-row-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch }
+.page-heading-row-scroll > * { flex-shrink: 0 }
 .header { padding: 10px 12px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 4px }
-.header-left { display: flex; flex-direction: column; gap: 2px }
+.header-left { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0 }
 .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
-.branch::before { content: "❯ "; color: var(--muted) }
+.header-buttons { display: flex; gap: 4px; flex-wrap: wrap }
+.header-buttons-right { display: flex; gap: 4px; margin-left: auto }
 .branch { color: var(--branch); font-weight: bold }
 .workdir { color: var(--muted); text-decoration: none; font-size: 12px }
 .workdir-back::before { content: "← "; color: var(--accent) }
@@ -138,19 +157,10 @@ body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
 .dir-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent) }
 .dir-folder .dir-name { color: var(--fg) }
 .dir-folder .dir-name::before { content: "▸ "; color: var(--muted) }
-.dir-branch { color: var(--branch); font-size: 12px }
-.dir-branch::before { content: "❯ "; color: var(--muted) }
-.dir-stats { color: var(--muted); font-size: 12px }
+.dir-branch { color: var(--branch); font-size: 12px; min-width: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.dir-stats { color: var(--muted); font-size: 12px; flex-shrink: 0 }
 .dir-folder-tag { color: var(--muted); font-size: 12px }
 .dir-folder-tag::before { content: none }
-
-/* Narrow viewports: drop the branch chip so the folder name and its
-   in-flight diff stats keep priority. The folder-tag is also a branch-
-   slot element so we hide it too — its only purpose is to balance out
-   the layout on wider screens. */
-@media (max-width: 640px) {
-  .dir-branch { display: none }
-}
 .empty { color: var(--muted); padding: 16px }
 .section-title { margin: 24px 0 0; padding: 8px 12px; color: var(--muted); font-size: 11px; font-weight: normal; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--border) }
 
@@ -162,16 +172,27 @@ body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
    that shrinks and ellipses when the viewport gets narrow. */
 .tmux-row .dir-name { flex: 0 0 auto; overflow: visible; text-overflow: clip }
 .tmux-row .dir-stats { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+@keyframes wd-spin { to { transform: rotate(360deg) } }
+.session-spinning::after { content: ''; flex: 0 0 auto; align-self: center; width: 8px; height: 8px; border: 1.5px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: wd-spin 0.6s linear infinite }
 
 .toggle { font: inherit; font-size: 12px; background: transparent; color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 8px; cursor: pointer }
 .toggle:hover { background: var(--chrome-bg) }
+.toggle.danger { color: var(--removed); border-color: var(--removed) }
+.toggle.danger:hover { background: var(--removed); color: var(--bg) }
 
-.pillbar { display: flex; gap: 4px; padding: 6px 8px; background: var(--chrome-bg); overflow-x: auto; white-space: nowrap; position: sticky; top: 0; z-index: 20; border-bottom: 1px solid var(--border); -webkit-overflow-scrolling: touch; transform: translateZ(0); will-change: transform }
+#diff-mode-select { font: inherit; font-size: 12px; background: var(--chrome-bg); color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 4px; cursor: pointer }
+
+/* Pillbar and summary stickies stack below the sticky page heading.
+   The offsets come from --page-heading-h and --pillbar-h, set by
+   app.js after measuring the actual rendered heights — fallback
+   pixel values are a reasonable approximation for the default font
+   and a single-line title. */
+.pillbar { display: flex; gap: 4px; padding: 6px 8px; background: var(--chrome-bg); overflow-x: auto; white-space: nowrap; position: sticky; top: var(--page-heading-h, 68px); z-index: 20; border-bottom: 1px solid var(--border); -webkit-overflow-scrolling: touch; transform: translateZ(0); will-change: transform }
 .pill { font-size: 12px; color: var(--muted); background: transparent; padding: 2px 8px; border: 1px solid transparent; text-decoration: none; flex-shrink: 0 }
 .pill:hover { color: var(--accent); border-color: var(--border) }
 .pill-active { color: var(--accent); border-color: var(--accent) }
 
-summary { padding: 8px 12px; font-size: 14px; cursor: pointer; color: var(--fg); background: var(--chrome-bg); border-top: 1px solid var(--accent); border-bottom: 1px solid var(--border); position: sticky; top: 33px; z-index: 10; display: flex; justify-content: space-between; align-items: center; gap: 12px }
+summary { padding: 8px 12px; font-size: 14px; cursor: pointer; color: var(--fg); background: var(--chrome-bg); border-top: 1px solid var(--accent); border-bottom: 1px solid var(--border); position: sticky; top: calc(var(--page-heading-h, 68px) + var(--pillbar-h, 34px)); z-index: 10; display: flex; justify-content: space-between; align-items: center; gap: 12px }
 summary::before { content: "▾"; color: var(--accent); font-weight: bold; margin-right: 8px }
 details:not([open]) > summary::before { content: "▸" }
 .filename { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: bold; color: var(--fg) }
@@ -211,14 +232,6 @@ details .term-container { margin: 0 }
 .comment-edit, .comment-del { background: transparent; border: none; color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; padding: 0 4px }
 .comment-edit:hover { color: var(--accent) }
 .comment-del:hover { color: var(--removed) }
-
-/* Review-level comment bar at the very top of the page. Always
-   visible; its "+" button is the anchor JS uses for the new-comment
-   composer and any saved review-level bubbles (which stack between
-   the button and the pillbar below). */
-.review-comments { padding: 8px 12px; background: var(--chrome-bg); border-bottom: 1px solid var(--border) }
-.review-comments .comment-bubble { margin-top: 8px }
-.review-comments .comment-composer { margin-top: 8px }
 
 /* "+ overall review comment" / per-file "+" triggers. Muted so they
    don't compete with the file's own chrome until the reviewer goes
@@ -267,10 +280,20 @@ details .term-container { margin: 0 }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--border) }
 .modal-footer .send-btn { background: var(--branch); color: var(--bg); font-weight: bold; padding: 6px 14px; border-color: var(--branch) }
 .modal-footer .send-btn:hover { background: color-mix(in srgb, var(--branch) 80%, white); color: var(--bg) }
+.modal-footer .send-btn:disabled { background: transparent; color: var(--muted); border-color: var(--border); cursor: not-allowed }
+.modal-footer .send-btn:disabled:hover { background: transparent; color: var(--muted) }
 
-/* Stream-page sticky header. Sits at top:0 so nav is always reachable
-   without scrolling, even after the user has followed the tail far down. */
-.stream-header { position: sticky; top: 0; z-index: 30 }
+/* Overall-review composer pinned above the modal footer. Always
+   present (regardless of how many line/file comments are queued) so
+   review-level remarks have a permanent home now that the page-level
+   "+ overall review comment" bar is gone. */
+.modal-overall { display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; border-top: 1px dashed var(--border); background: var(--chrome-bg) }
+.modal-overall textarea { width: 100%; min-height: 40px; resize: vertical; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 4px 6px; box-sizing: border-box }
+.modal-overall textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
+.modal-overall-actions { display: flex; justify-content: flex-end }
+@media (pointer: coarse) {
+  .modal-overall textarea { font-size: 16px }
+}
 
 /* Stream-page footer toolbar. Two flex rows so the key buttons and
    the message input never have to compete for space on a narrow

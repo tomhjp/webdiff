@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	terminal "github.com/buildkite/terminal-to-html/v3"
@@ -46,10 +46,103 @@ type sendRequest struct {
 	Comments []Comment `json:"comments"`
 }
 
+// wdSession* tracks live pane-change state for all *-wd tmux sessions,
+// updated by the background watcher and consumed by the listing page.
+var (
+	wdSessionsMu  sync.RWMutex
+	wdSpinning    = map[string]bool{}
+	wdLastRaw     = map[string]string{}
+	wdLastChange  = map[string]time.Time{}
+)
+
+const wdSpinTimeout = 3 * time.Second
+
+// startSessionWatcher polls all *-wd tmux sessions once per second and
+// marks each as spinning when its pane content has changed within the
+// last wdSpinTimeout — a reliable proxy for "the agent is iterating."
+func startSessionWatcher(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				pollWdSessions(ctx)
+			}
+		}
+	}()
+}
+
+func pollWdSessions(ctx context.Context) {
+	out, err := tmuxOut(ctx, "list-sessions", "-F", "#{session_name}")
+	if err != nil {
+		if isTmuxDown(err) {
+			wdSessionsMu.Lock()
+			wdSpinning = map[string]bool{}
+			wdLastRaw = map[string]string{}
+			wdLastChange = map[string]time.Time{}
+			wdSessionsMu.Unlock()
+		}
+		return
+	}
+	type snap struct{ name, raw string }
+	var snaps []snap
+	active := map[string]bool{}
+	for _, name := range strings.Fields(out) {
+		if !strings.HasSuffix(name, "-wd") {
+			continue
+		}
+		active[name] = true
+		raw, err := tmuxOut(ctx, "capture-pane", "-p", "-t", name+":0.0")
+		if err != nil {
+			continue
+		}
+		snaps = append(snaps, snap{name, raw})
+	}
+	now := time.Now()
+	wdSessionsMu.Lock()
+	defer wdSessionsMu.Unlock()
+	for _, s := range snaps {
+		prev, seen := wdLastRaw[s.name]
+		wdLastRaw[s.name] = s.raw
+		if seen && s.raw != prev {
+			wdLastChange[s.name] = now
+		}
+		lc := wdLastChange[s.name]
+		wdSpinning[s.name] = !lc.IsZero() && now.Sub(lc) < wdSpinTimeout
+	}
+	for name := range wdSpinning {
+		if !active[name] {
+			delete(wdSpinning, name)
+			delete(wdLastRaw, name)
+			delete(wdLastChange, name)
+		}
+	}
+}
+
+// handleSessionsSpinning returns a JSON object of session-name → true
+// for every *-wd session currently spinning, for the listing page's
+// live spinner indicators.
+func handleSessionsSpinning(w http.ResponseWriter, r *http.Request) {
+	wdSessionsMu.RLock()
+	result := make(map[string]bool)
+	for name, spinning := range wdSpinning {
+		if spinning {
+			result[name] = true
+		}
+	}
+	wdSessionsMu.RUnlock()
+	writeJSON(w, http.StatusOK, result)
+}
+
 func registerClaudeRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/comments/send", handleCommentsSend)
 	mux.HandleFunc("/api/pane/stream", handlePaneStream)
 	mux.HandleFunc("/api/pane/input", handlePaneInput)
+	mux.HandleFunc("/api/pane/restart", handlePaneRestart)
+	mux.HandleFunc("/api/sessions/spinning", handleSessionsSpinning)
 }
 
 // allowedPaneKeys is the whitelist for /api/pane/input's `key` field.
@@ -59,9 +152,10 @@ func registerClaudeRoutes(mux *http.ServeMux) {
 // to send freeform input. The set is small on purpose: extend it only
 // when there's a concrete UI need.
 var allowedPaneKeys = map[string]bool{
-	"Up":    true,
-	"Down":  true,
-	"Enter": true,
+	"Up":     true,
+	"Down":   true,
+	"Escape": true,
+	"Enter":  true,
 }
 
 type paneInputRequest struct {
@@ -112,6 +206,52 @@ func handlePaneInput(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handlePaneRestart kills the webdiff-managed tmux session that owns
+// paneID. The client navigates to /_/claude<repoURL> after this returns,
+// which respawns a fresh session with a clean scrollback. Used by the
+// stream page's "restart session" button when accumulated history has
+// made the live tail sluggish to render.
+func handlePaneRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		PaneID string `json:"paneID"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.PaneID == "" {
+		http.Error(w, "paneID required", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	out, err := tmuxOut(ctx, "display-message", "-t", req.PaneID, "-p", "#{session_name}")
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "tmux display-message failed: "+err.Error(), nil)
+		return
+	}
+	name := strings.TrimSpace(out)
+	if name == "" {
+		writeJSONError(w, http.StatusBadGateway, "no session for pane", nil)
+		return
+	}
+	// Refuse to kill anything we didn't spawn ourselves: the `-wd`
+	// suffix is webdiff's marker, and arbitrary user sessions shouldn't
+	// be killable from a browser request.
+	if !strings.HasSuffix(name, "-wd") {
+		http.Error(w, "session is not webdiff-managed", http.StatusForbidden)
+		return
+	}
+	if _, err := tmuxOut(ctx, "kill-session", "-t", name); err != nil {
+		writeJSONError(w, http.StatusBadGateway, "tmux kill-session failed: "+err.Error(), nil)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func handleCommentsSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -149,12 +289,7 @@ func handleCommentsSend(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, "tmux send failed: "+err.Error(), nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"sent":   len(req.Comments),
-		"paneID": pane.ID,
-		"label":  pane.Label,
-		"prompt": prompt,
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"sent": len(req.Comments)})
 }
 
 // handlePaneStream serves a Server-Sent Events stream of `tmux
@@ -347,8 +482,8 @@ func streamDelta(old, new []string) (drop int, appendLines []string) {
 
 // ensureRepoSession returns the claude pane in the tmux session
 // dedicated to repoPath, creating both session and claude process on
-// first call. The session is named `webdiff-<basename>` so it's easy
-// to spot in `tmux list-sessions` output and won't collide with the
+// first call. The session is named `<basename>-wd` so it's easy to
+// spot in `tmux list-sessions` output and won't collide with the
 // user's own sessions. When the session already exists we just look
 // up its initial pane (window 0, pane 0) — webdiff always puts claude
 // there, and ignoring later splits the user might have made keeps the
@@ -367,19 +502,47 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 	// new pane picks up the user's login PATH — claude typically lives
 	// in ~/.local/bin which isn't on the systemd unit's inherited PATH.
 	// `-c repoPath` so claude starts already cd'd to the repo.
-	out, err := tmuxOut(ctx, "new-session", "-d", "-s", name, "-c", repoPath, "-P", "-F", "#{pane_id}", "bash", "-lc", "claude")
-	if err != nil {
+	//
+	// history-limit is fixed per-window at window creation time, so we
+	// spawn a throwaway bash window 0 just to anchor the session, bump
+	// the session's history-limit, then open the real claude window
+	// (which inherits the new limit). kill-window + move-window
+	// relocates claude back to :0.0 so everything downstream can keep
+	// assuming that target.
+	if _, err := tmuxOut(ctx, "new-session", "-d", "-s", name, "-c", repoPath, "bash"); err != nil {
 		return Pane{}, fmt.Errorf("tmux new-session: %w", err)
+	}
+	if _, err := tmuxOut(ctx, "set-option", "-t", name, "history-limit", "100000"); err != nil {
+		return Pane{}, fmt.Errorf("tmux set-option history-limit: %w", err)
+	}
+	out, err := tmuxOut(ctx, "new-window", "-t", name, "-c", repoPath, "-P", "-F", "#{pane_id}", "bash", "-lc", "claude")
+	if err != nil {
+		return Pane{}, fmt.Errorf("tmux new-window: %w", err)
 	}
 	paneID := strings.TrimSpace(out)
 	if paneID == "" {
 		return Pane{}, errors.New("tmux didn't return a pane id")
 	}
+	if _, err := tmuxOut(ctx, "kill-window", "-t", name+":0"); err != nil {
+		return Pane{}, fmt.Errorf("tmux kill-window: %w", err)
+	}
+	if _, err := tmuxOut(ctx, "move-window", "-s", name+":1", "-t", name+":0"); err != nil {
+		return Pane{}, fmt.Errorf("tmux move-window: %w", err)
+	}
 
-	// Wait for the bash → claude exec so paste arrives at the TUI's
-	// prompt, not at bash's command line. Same 5 s budget the old
-	// spawnClaudePane used.
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait until pane_current_command is "claude" AND the pane content
+	// has been visually stable for stableFor. The TUI plays an animated
+	// banner while initialising; the static input prompt that follows is
+	// the reliable signal that it's ready to receive bracketed paste.
+	// Polling at 50 ms gives us ~6 checks per stable window without
+	// hammering tmux.
+	const (
+		pollInterval = 50 * time.Millisecond
+		stableFor    = 300 * time.Millisecond
+	)
+	deadline := time.Now().Add(15 * time.Second)
+	var lastPane string
+	var stableAt time.Time
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -387,44 +550,51 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 		default:
 		}
 		cmd, err := tmuxOut(ctx, "display", "-t", paneID, "-p", "#{pane_current_command}")
-		if err == nil && strings.TrimSpace(cmd) == "claude" {
-			// Claude prints its banner before showing the prompt; a
-			// short pause avoids racing with the splash output and
-			// having our paste land mid-redraw.
-			time.Sleep(300 * time.Millisecond)
+		if err != nil || strings.TrimSpace(cmd) != "claude" {
+			time.Sleep(pollInterval)
+			continue
+		}
+		content, err := tmuxOut(ctx, "capture-pane", "-p", "-t", paneID)
+		if err != nil {
+			time.Sleep(pollInterval)
+			continue
+		}
+		if content != lastPane {
+			lastPane = content
+			stableAt = time.Now()
+		} else if !stableAt.IsZero() && time.Since(stableAt) >= stableFor {
 			return Pane{ID: paneID, Label: name + " (just spawned)"}, nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
-	return Pane{}, errors.New("claude didn't start within 5 s")
+	return Pane{}, errors.New("claude didn't start within 15 s")
 }
 
 // handleStartSession ensures the repo's webdiff-<base> tmux session
-// exists, then 303-redirects to /_/stream pointed at the resulting
-// pane. The diff page's "claude" header button uses this so a single
-// button works whether the session is already running (fast lookup) or
-// needs to be spawned (~5 s for the bash → claude exec to settle).
+// exists, then 303-redirects to /_/stream<repoUrl>. Mounted at
+// /_/claude/ as a prefix handler so the URL suffix is the repo's diff
+// URL path (e.g. /_/claude/foo/ → /foo/), mirroring /_/stream/. The
+// diff page's "claude" header button uses this so a single button
+// works whether the session is already running (fast lookup) or needs
+// to be spawned (~5 s for the bash → claude exec to settle).
 func handleStartSession(w http.ResponseWriter, r *http.Request) {
-	repo := r.URL.Query().Get("repo")
-	if repo == "" {
-		http.Error(w, "repo required", http.StatusBadRequest)
-		return
+	repoURL := strings.TrimPrefix(r.URL.Path, "/_/claude")
+	if repoURL == "" {
+		repoURL = "/"
 	}
-	abs, ok := resolvePath(repo)
+	if !strings.HasSuffix(repoURL, "/") {
+		repoURL += "/"
+	}
+	abs, ok := resolvePath(repoURL)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	pane, err := ensureRepoSession(r.Context(), abs)
-	if err != nil {
+	if _, err := ensureRepoSession(r.Context(), abs); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	qs := "paneID=" + url.QueryEscape(pane.ID) + "&label=" + url.QueryEscape(pane.Label)
-	if repo := r.URL.Query().Get("repo"); repo != "" {
-		qs += "&repo=" + url.QueryEscape(repo)
-	}
-	http.Redirect(w, r, "/_/stream?"+qs, http.StatusSeeOther)
+	http.Redirect(w, r, "/_/stream"+repoURL, http.StatusSeeOther)
 }
 
 // repoStreamPane returns the pane id and session label for the repo's
@@ -446,17 +616,18 @@ func repoStreamPane(ctx context.Context, repoPath string) (paneID, label string)
 	return strings.TrimSpace(out), name
 }
 
-// repoSessionName derives the tmux session name for a repo path. The
-// basename gives us something readable in `tmux list-sessions`; the
-// `webdiff-` prefix scopes it to this tool. Characters tmux disallows
-// in session names (`.`, `:`) are squashed to dashes.
+// repoSessionName derives the tmux session name for a repo path.
+// The basename gives something readable in `tmux list-sessions` and
+// the `-wd` suffix scopes it to this tool without burying the repo
+// name at the end of a long prefix. Characters tmux disallows in
+// session names (`.`, `:`) are squashed to dashes.
 func repoSessionName(repoPath string) string {
 	base := filepath.Base(filepath.Clean(repoPath))
 	if base == "" || base == "." || base == "/" {
 		base = "default"
 	}
 	base = strings.NewReplacer(".", "-", ":", "-", " ", "-").Replace(base)
-	return "webdiff-" + base
+	return base + "-wd"
 }
 
 // sessionExists reports whether the named tmux session is currently
@@ -547,21 +718,36 @@ func isTmuxDown(err error) bool {
 // treat newlines as content rather than submits, so multiline reviews
 // land as one user turn.
 //
-// We pause between the paste-close and the submit Enter: Claude's TUI
+// Routes through a tmux paste buffer rather than send-keys -l: tmux
+// reads the prompt from stdin (no argv limit) and `paste-buffer -p`
+// emits the start/end markers atomically. The earlier three-call
+// send-keys path could leave the pane locked in paste mode if the
+// prompt argv exceeded the kernel's MAX_ARG_STRLEN (~128 KB) — exec
+// would fail between the start marker and the end marker and Claude's
+// TUI would silently swallow every subsequent keystroke into the
+// half-open paste buffer.
+//
+// We pause between the paste and the submit Enter: Claude's TUI
 // re-renders after a paste, and an Enter that lands during the redraw
 // is sometimes consumed as "insert newline" rather than "submit". The
 // 100 ms wait is well below human-perceptible latency and avoids the
 // race in practice.
 func sendToPane(ctx context.Context, paneID, prompt string) error {
-	pasteSteps := [][]string{
-		{"send-keys", "-t", paneID, "-l", "--", "\x1b[200~"},
-		{"send-keys", "-t", paneID, "-l", "--", prompt},
-		{"send-keys", "-t", paneID, "-l", "--", "\x1b[201~"},
-	}
-	for _, args := range pasteSteps {
-		if _, err := tmuxOut(ctx, args...); err != nil {
-			return err
+	bufName := "webdiff-paste-" + strings.TrimPrefix(paneID, "%")
+	cmd := exec.CommandContext(ctx, "tmux", "load-buffer", "-b", bufName, "-")
+	cmd.Stdin = strings.NewReader(prompt)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			return fmt.Errorf("tmux load-buffer: %w", err)
 		}
+		return fmt.Errorf("tmux load-buffer: %s: %w", msg, err)
+	}
+	defer tmuxOut(context.Background(), "delete-buffer", "-b", bufName)
+	if _, err := tmuxOut(ctx, "paste-buffer", "-p", "-b", bufName, "-t", paneID); err != nil {
+		return err
 	}
 	time.Sleep(100 * time.Millisecond)
 	if _, err := tmuxOut(ctx, "send-keys", "-t", paneID, "Enter"); err != nil {

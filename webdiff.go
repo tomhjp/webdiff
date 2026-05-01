@@ -220,6 +220,68 @@ func branchBase(repo string) (sha, label string) {
 	return "HEAD", ""
 }
 
+// modeQuery returns the "?mode=<mode>" suffix for non-default diff
+// modes, used when emitting in-app navigation links so a user's
+// selected mode survives switching between the home and diff pages.
+// Returns "" for the default ("working") mode so plain URLs stay clean.
+func modeQuery(mode string) string {
+	if mode == "" || mode == "working" {
+		return ""
+	}
+	return "?mode=" + url.QueryEscape(mode)
+}
+
+// upstreamRef returns the symbolic name of the upstream tracking branch
+// (e.g. "origin/feature") if one is configured for HEAD, or if there is
+// exactly one remote and the current branch exists on it.
+func upstreamRef(repo string) (ref string, ok bool) {
+	out, err := exec.Command("git", "-C", repo, "rev-parse",
+		"--abbrev-ref", "--symbolic-full-name", "@{u}").Output()
+	if err == nil {
+		ref = strings.TrimSpace(string(out))
+		if ref != "" && ref != "@{u}" {
+			return ref, true
+		}
+	}
+	// No configured upstream: if there is exactly one remote and the
+	// current branch exists on it, use <remote>/<branch>.
+	remoteOut, err := exec.Command("git", "-C", repo, "remote").Output()
+	if err != nil {
+		return "", false
+	}
+	remotes := strings.Fields(strings.TrimSpace(string(remoteOut)))
+	if len(remotes) != 1 {
+		return "", false
+	}
+	branch := currentBranch(repo)
+	if branch == "" || branch == "HEAD" {
+		return "", false
+	}
+	candidate := remotes[0] + "/" + branch
+	if _, err := exec.Command("git", "-C", repo, "rev-parse", "--verify", candidate).Output(); err != nil {
+		return "", false
+	}
+	return candidate, true
+}
+
+// diffBase returns the git ref and display label to diff against for the
+// given mode. "working" diffs against HEAD (all uncommitted changes),
+// "branch" against the merge-base with main (full branch diff), and
+// "remote" against the upstream tracking branch (what a push would add).
+func diffBase(repo, mode string) (sha, label string) {
+	switch mode {
+	case "working":
+		return "HEAD", ""
+	case "remote":
+		if ref, ok := upstreamRef(repo); ok {
+			return ref, ref
+		}
+		return branchBase(repo)
+	default:
+		return branchBase(repo)
+	}
+}
+
 // currentBranch returns the current git branch name for repo.
 func currentBranch(repo string) string {
 	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
@@ -293,9 +355,16 @@ func changedFiles(env []string, repo, base string) []string {
 }
 
 // fileDiff gets the diff for a single file and pipes it through the user's
-// configured pager (e.g. delta, diff-so-fancy) if available.
-func fileDiff(env []string, repo, base, file string, cols int) string {
-	cmd := exec.Command("git", "diff", "--cached", "--color=always", base, "--", file)
+// configured pager (e.g. delta, diff-so-fancy) if available. fullContext
+// asks git for unlimited unchanged context (effectively the whole file
+// with hunks inlined) — driven by the diff page's "full context" toggle.
+func fileDiff(env []string, repo, base, file string, cols int, fullContext bool) string {
+	args := []string{"diff", "--cached", "--color=always"}
+	if fullContext {
+		args = append(args, "-U99999")
+	}
+	args = append(args, base, "--", file)
+	cmd := exec.Command("git", args...)
 	cmd.Env = env
 	cmd.Dir = repo
 	raw, err := cmd.Output()
@@ -643,11 +712,13 @@ type repoSummary struct {
 }
 
 // summarizeRepo computes the branch + diff-stat tuple shown on the listing
-// row for a single repo.
-func summarizeRepo(repo string) repoSummary {
+// row for a single repo. The mode arg is the user's chosen diff base
+// ("working", "branch", "remote") so the row stats reflect what the
+// diff page would show for the same repo.
+func summarizeRepo(repo, mode string) repoSummary {
 	env, cleanup := diffEnv(repo)
 	defer cleanup()
-	base, _ := branchBase(repo)
+	base, _ := diffBase(repo, mode)
 	files, ins, del := diffStat(env, repo, base)
 	return repoSummary{
 		branch: currentBranch(repo),
@@ -671,6 +742,12 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 		urlPath += "/"
 	}
 
+	mode := r.URL.Query().Get("mode")
+	if mode != "working" && mode != "branch" && mode != "remote" {
+		mode = "working"
+	}
+	modeQS := modeQuery(mode)
+
 	type row struct {
 		name  string
 		isGit bool
@@ -692,7 +769,7 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 		wg.Add(1)
 		go func(i int, sub string) {
 			defer wg.Done()
-			summaries[i] = summarizeRepo(sub)
+			summaries[i] = summarizeRepo(sub, mode)
 		}(i, filepath.Join(dir, r.name))
 	}
 	wg.Wait()
@@ -701,7 +778,20 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 	body.WriteString(`<div class="header"><div class="header-left">`)
 	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(dir)))
 	writeWorkdir(&body, dir, urlPath)
-	body.WriteString(`</div></div>`)
+	body.WriteString(`</div><div class="header-right">`)
+	body.WriteString(`<select id="diff-mode-select">`)
+	for _, opt := range []struct{ val, label string }{
+		{"working", "uncommitted"},
+		{"branch", "branch"},
+		{"remote", "remote"},
+	} {
+		sel := ""
+		if opt.val == mode {
+			sel = ` selected`
+		}
+		fmt.Fprintf(&body, `<option value="%s"%s>%s</option>`, opt.val, sel, opt.label)
+	}
+	body.WriteString(`</select></div></div>`)
 
 	body.WriteString(`<div class="dir-list">`)
 	for i, r := range rows {
@@ -710,7 +800,7 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 			cls += " dir-folder"
 		}
 		fmt.Fprintf(&body, `<a class="%s" href="%s"><span class="dir-name">%s</span>`,
-			cls, template.HTMLEscapeString(urlPath+r.name+"/"),
+			cls, template.HTMLEscapeString(urlPath+r.name+"/"+modeQS),
 			template.HTMLEscapeString(r.name))
 		if r.isGit {
 			s := summaries[i]
@@ -769,13 +859,13 @@ func writeTmuxSection(b *strings.Builder, ctx context.Context) {
 		if p.Title != "" && p.Title != p.Command {
 			desc += " · " + p.Title
 		}
-		// No `back=` here: opening a tmux pane from the listing isn't a
-		// post-send flow, so the stream page shouldn't show a "back to
-		// diff" button — there's no diff to return to.
-		href := "/_/stream?paneID=" + url.QueryEscape(p.PaneID) +
-			"&label=" + url.QueryEscape(label)
-		fmt.Fprintf(b, `<a class="dir-row tmux-row" href="%s"><span class="dir-name">%s</span><span class="dir-stats">%s</span><span class="dir-branch">%s</span></a>`,
+		// /_/pane is the arbitrary-pane viewer; the handler looks up the
+		// session name from the paneID at request time so we don't need
+		// to pass it as a query param.
+		href := "/_/pane?paneID=" + url.QueryEscape(p.PaneID)
+		fmt.Fprintf(b, `<a class="dir-row tmux-row" href="%s" data-session="%s"><span class="dir-name">%s</span><span class="dir-stats">%s</span><span class="dir-branch">%s</span></a>`,
 			template.HTMLEscapeString(href),
+			template.HTMLEscapeString(p.Session),
 			template.HTMLEscapeString(label),
 			template.HTMLEscapeString(desc),
 			template.HTMLEscapeString(p.PaneID),
@@ -786,10 +876,32 @@ func writeTmuxSection(b *strings.Builder, ctx context.Context) {
 
 // renderRepo renders the diff view for a single git repo.
 func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
+	_, hasUpstream := upstreamRef(repo)
+
+	// The chosen diff mode lives in the URL (?mode=working|branch|remote).
+	// Default is HEAD (working). app.js handles persistence via
+	// localStorage + redirect-on-load when no mode is set in the URL but
+	// one is stored — so within an in-app navigation flow the URL always
+	// carries the user's choice without us needing a server-side state file.
+	mode := r.URL.Query().Get("mode")
+	if mode == "remote" && !hasUpstream {
+		mode = "branch"
+	}
+	if mode != "working" && mode != "branch" && mode != "remote" {
+		mode = "working"
+	}
+
+	// `context=full` switches git diff to -U<MAX> so each file diff shows
+	// the entire file with hunks inlined. Per-view toggle, not threaded
+	// through other links — full context is rarely what you want when
+	// navigating somewhere else.
+	fullContext := r.URL.Query().Get("context") == "full"
+
+	base, baseLabel := diffBase(repo, mode)
+
 	env, cleanup := diffEnv(repo)
 	defer cleanup()
 
-	base, baseLabel := branchBase(repo)
 	files := changedFiles(env, repo, base)
 
 	cols := 120
@@ -801,38 +913,113 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	if !strings.HasSuffix(urlPath, "/") {
 		urlPath += "/"
 	}
-
-	var body strings.Builder
-	body.WriteString(`<div class="header"><div class="header-left">`)
-	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(currentBranch(repo)))
-	writeWorkdir(&body, repo, urlPath)
-	body.WriteString(`</div><div class="header-right">`)
+	modeQS := modeQuery(mode)
 
 	// "claude" header button — always visible. When the repo's
 	// webdiff-<base> session is already running it short-circuits
-	// straight to /_/stream; otherwise it points at /_/claude, which
-	// spawns the session and 303-redirects to the same place. The
-	// dashed-border "to-be-created" treatment (via add-comment-btn)
-	// signals the click will spend ~5 s spawning a new pane rather
-	// than instantly attaching to a live one.
-	paneID, label := repoStreamPane(r.Context(), repo)
-	var btnHref, btnClass, btnTitle string
+	// straight to /_/stream<repoUrl>; otherwise it points at
+	// /_/claude<repoUrl>, which spawns the session and 303-redirects to
+	// the same place. The dashed-border "to-be-created" treatment (via
+	// add-comment-btn) signals the click will spend ~5 s spawning a new
+	// pane rather than instantly attaching to a live one. Both URLs are
+	// path-based: each repo maps 1-1 to its tmux session, so neither
+	// side needs to thread a paneID through the URL.
+	paneID, _ := repoStreamPane(r.Context(), repo)
+	var claudeHref, claudeClass, claudeTitle string
 	if paneID != "" {
-		btnHref = "/_/stream?paneID=" + url.QueryEscape(paneID) +
-			"&label=" + url.QueryEscape(label) +
-			"&repo=" + url.QueryEscape(urlPath)
-		btnClass = "toggle"
-		btnTitle = "open the running claude session for this repo"
+		claudeHref = "/_/stream" + urlPath
+		claudeClass = "toggle"
+		claudeTitle = "open the running claude session for this repo"
 	} else {
-		btnHref = "/_/claude?repo=" + url.QueryEscape(urlPath)
-		btnClass = "toggle add-comment-btn"
-		btnTitle = "start a claude session for this repo"
+		claudeHref = "/_/claude" + urlPath
+		claudeClass = "toggle add-comment-btn"
+		claudeTitle = "start a claude session for this repo"
 	}
+
+	var stats string
+	if len(files) > 0 {
+		nfiles, ins, del := diffStat(env, repo, base)
+		if nfiles > 0 {
+			noun := "files"
+			if nfiles == 1 {
+				noun = "file"
+			}
+			var sb strings.Builder
+			sb.WriteString(`<span class="stats">`)
+			fmt.Fprintf(&sb, `<span class="stats-files">%d %s</span>`, nfiles, noun)
+			if ins > 0 {
+				fmt.Fprintf(&sb, ` <span class="stats-ins">+%d</span>`, ins)
+			}
+			if del > 0 {
+				fmt.Fprintf(&sb, ` <span class="stats-del">-%d</span>`, del)
+			}
+			sb.WriteString(`</span>`)
+			stats = sb.String()
+		}
+	}
+
+	var body strings.Builder
+	// Sticky page heading: row 1 is title (left) + branch/stats meta
+	// (right, smaller font); row 2 is the home/claude nav (left) +
+	// mode/context/expand controls (right). Everything that used to
+	// live in a separate info bar is folded in here so only the
+	// streaming diff body scrolls.
+	body.WriteString(`<div class="page-heading"><div class="page-heading-row">`)
+	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(repo)))
+	body.WriteString(`<span class="head-meta">`)
+	fmt.Fprintf(&body, `<span class="head-branch">%s</span>`, template.HTMLEscapeString(currentBranch(repo)))
+	body.WriteString(stats)
+	body.WriteString(`</span></div>`)
+
+	// Row 2 scrolls horizontally on narrow viewports rather than
+	// wrapping. Order on the right side puts mode-select first
+	// (most-used), then expand-all, then full-context — full-context is
+	// the rare button so it's the one that drops off-screen first when
+	// space runs out.
+	body.WriteString(`<div class="page-heading-row page-heading-row-scroll">`)
+	body.WriteString(`<div class="header-buttons">`)
+	fmt.Fprintf(&body, `<a class="toggle" href="/%s">home</a>`, modeQS)
 	fmt.Fprintf(&body, `<a class="%s" href="%s" title="%s">claude</a>`,
-		btnClass, template.HTMLEscapeString(btnHref), template.HTMLEscapeString(btnTitle))
+		claudeClass, template.HTMLEscapeString(claudeHref), template.HTMLEscapeString(claudeTitle))
+	body.WriteString(`</div>`)
+
+	body.WriteString(`<div class="header-buttons">`)
+	body.WriteString(`<select id="diff-mode-select">`)
+	for _, opt := range []struct{ val, label string }{
+		{"working", "uncommitted"},
+		{"branch", "branch"},
+		{"remote", "remote"},
+	} {
+		sel, dis := "", ""
+		if opt.val == mode {
+			sel = ` selected`
+		}
+		if opt.val == "remote" && !hasUpstream {
+			dis = ` disabled`
+		}
+		fmt.Fprintf(&body, `<option value="%s"%s%s>%s</option>`, opt.val, sel, dis, opt.label)
+	}
+	body.WriteString(`</select>`)
+	if len(files) > 0 {
+		body.WriteString(`<button class="toggle" type="button" id="toggle-all">expand all</button>`)
+		ctxLabel := "full context"
+		if fullContext {
+			ctxLabel = "diff only"
+		}
+		fmt.Fprintf(&body, `<button class="toggle" type="button" id="toggle-context" data-full="%t">%s</button>`,
+			fullContext, ctxLabel)
+	}
+	body.WriteString(`</div></div></div>`)
+
+	// send-comments is always visible (no `hidden`) so the modal — which
+	// owns the "+ overall review comment" composer in the new layout —
+	// is reachable even before any line/file comments are queued. The
+	// floating bottom-right chip just opens the modal; the modal's
+	// footer button does the actual send and is the one that
+	// disables/enables based on comment count.
+	body.WriteString(`<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments">send to claude (<span class="send-count">0</span>)</button></div>`)
 
 	if len(files) == 0 {
-		body.WriteString(`</div></div>`)
 		msg := "No uncommitted changes."
 		if baseLabel != "" {
 			msg = "No changes since " + baseLabel + "."
@@ -841,37 +1028,6 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 		writePage(w, body.String())
 		return
 	}
-
-	nfiles, ins, del := diffStat(env, repo, base)
-	if nfiles > 0 {
-		noun := "files"
-		if nfiles == 1 {
-			noun = "file"
-		}
-		body.WriteString(`<span class="stats">`)
-		fmt.Fprintf(&body, `<span class="stats-files">%d %s</span>`, nfiles, noun)
-		if ins > 0 {
-			fmt.Fprintf(&body, `, <span class="stats-ins">+%d</span>`, ins)
-		}
-		if del > 0 {
-			fmt.Fprintf(&body, `, <span class="stats-del">-%d</span>`, del)
-		}
-		body.WriteString(`</span>`)
-	}
-	body.WriteString(`<button class="toggle" type="button" id="toggle-all">expand all</button>`)
-	body.WriteString(`</div></div>`)
-	// send-comments lives outside the header so it can be position:fixed
-	// in the bottom-right corner and stay visible while the user scrolls
-	// through long diffs adding more comments. Clicking it pops the
-	// review modal (a pre-flight checklist of every queued comment); the
-	// modal carries the actual confirm-send button so a stray tap on
-	// the floating chip can't fire-and-forget the whole batch.
-	body.WriteString(`<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments" hidden>send to claude (<span class="send-count">0</span>)</button></div>`)
-	// review-level comments live in their own bar at the top of the
-	// page. The button is the anchor JS uses for new-comment composers
-	// and bubbles, so it must stay in the DOM even when there are no
-	// review comments yet.
-	body.WriteString(`<div class="review-comments"><button class="toggle add-comment-btn" type="button" id="add-review-comment">+ overall review comment</button></div>`)
 
 	body.WriteString(`<nav class="pillbar">`)
 	for _, file := range files {
@@ -887,7 +1043,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	body.WriteString(`</nav>`)
 
 	for _, file := range files {
-		raw := fileDiff(env, repo, base, file, cols)
+		raw := fileDiff(env, repo, base, file, cols, fullContext)
 		if raw == "" {
 			continue
 		}
@@ -956,53 +1112,122 @@ func serveAppJS(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(appJS))
 }
 
-// renderStreamPage renders the full-page live tail of one tmux pane.
-// The diff page navigates here after a successful send; on mobile it's
-// the only sane way to show the streaming output (a docked sub-panel
-// over a long diff doesn't fit), and we use the same page on desktop
-// so the flow is consistent across viewports.
+// paneRepoURL derives the diff page URL from a tmux session label of the
+// form "<basename>-wd" or "<basename>-wd:<window>" by scanning rootDir's
+// subdirectories for the one whose repoSessionName matches (which also
+// handles repos with "." or ":" in their name). Returns "" when the
+// label doesn't resolve to a known repo.
+func paneRepoURL(label string) string {
+	session := strings.SplitN(label, ":", 2)[0]
+	if !strings.HasSuffix(session, "-wd") {
+		return ""
+	}
+	entries, err := os.ReadDir(rootDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		sub := filepath.Join(rootDir, e.Name())
+		if isGitRepo(sub) && repoSessionName(sub) == session {
+			return "/" + e.Name() + "/"
+		}
+	}
+	return ""
+}
+
+// renderRepoStreamPage renders the live tail of the tmux pane paired
+// with one repo. Mounted at /_/stream/ as a prefix handler so the URL
+// suffix is the repo's diff URL path: /_/stream/ → root repo,
+// /_/stream/foo/ → /foo/. Each repo maps 1-1 to its `<base>-wd` tmux
+// session, so the server resolves the paneID from the repo path
+// instead of accepting it as a query param. If the session hasn't been
+// spawned yet the request 303-redirects to /_/claude<repoUrl>, which
+// spawns it and bounces back here.
 //
-// Query params:
-//
-//	paneID — required; the tmux pane to capture
-//	label  — optional; human-readable name shown in the header
-//	repo   — optional; URL path of the repo diff page (e.g. "/webdiff/").
-//	         When present a "← diff" link is shown in the sticky header.
-//
-// Layout: sticky header with nav links, streaming term tail in the
-// middle, and a bottom-fixed toolbar with ↑ / ↓ / enter keys plus a
-// growing textarea. Navigation lives in the sticky header so it's
-// always reachable without scrolling.
-//
-// The actual SSE consumption and auto-follow behaviour live in app.js;
-// this handler just serves the chrome and the empty container the JS
-// fills in.
-func renderStreamPage(w http.ResponseWriter, r *http.Request) {
+// Layout: sticky page heading with nav links, streaming term tail in
+// the middle, and a bottom-fixed toolbar with esc / ↑ / ↓ / enter keys
+// plus a growing textarea. The actual SSE consumption and auto-follow
+// behaviour live in app.js; this handler just serves the chrome and
+// the empty container the JS fills in.
+func renderRepoStreamPage(w http.ResponseWriter, r *http.Request) {
+	repoURL := strings.TrimPrefix(r.URL.Path, "/_/stream")
+	if repoURL == "" {
+		repoURL = "/"
+	}
+	if !strings.HasSuffix(repoURL, "/") {
+		repoURL += "/"
+	}
+	abs, ok := resolvePath(repoURL)
+	if !ok || !isGitRepo(abs) {
+		http.NotFound(w, r)
+		return
+	}
+	paneID, _ := repoStreamPane(r.Context(), abs)
+	if paneID == "" {
+		http.Redirect(w, r, "/_/claude"+repoURL, http.StatusSeeOther)
+		return
+	}
+	writeStreamPage(w, paneID, repoURL, "")
+}
+
+// renderArbitraryPanePage is the streaming view for tmux panes that
+// aren't paired with a repo — opened from the home page's "tmux
+// sessions" listing. The session name is looked up from paneID via
+// tmux so the URL stays at just /_/pane?paneID=... (no label query
+// param). The "diff" back-link is still shown when the pane's session
+// matches a known webdiff repo (paneRepoURL), so clicking a
+// `<base>-wd` row from the listing still gets the same chrome as the
+// repo-paired view.
+func renderArbitraryPanePage(w http.ResponseWriter, r *http.Request) {
 	paneID := r.URL.Query().Get("paneID")
 	if paneID == "" {
 		http.Error(w, "paneID required", http.StatusBadRequest)
 		return
 	}
-	label := r.URL.Query().Get("label")
-	if label == "" {
-		label = paneID
+	out, err := tmuxOut(r.Context(), "display-message", "-t", paneID, "-p", "#{session_name}")
+	session := strings.TrimSpace(out)
+	if err != nil || session == "" {
+		writeStreamPage(w, paneID, "", paneID)
+		return
 	}
-	repo := r.URL.Query().Get("repo")
+	writeStreamPage(w, paneID, paneRepoURL(session), session)
+}
 
-	var body strings.Builder
-	body.WriteString(`<div class="header stream-header"><div class="header-left">`)
-	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(label))
-	body.WriteString(`</div><div class="header-right">`)
-	body.WriteString(`<button class="toggle" type="button" id="jump-bottom" hidden>jump to bottom</button>`)
-	body.WriteString(`<a class="toggle" href="/">home</a>`)
-	if repo != "" {
-		fmt.Fprintf(&body, `<a class="toggle" href="%s">← diff</a>`, template.HTMLEscapeString(repo))
+// writeStreamPage derives the heading from repoURL (so the title is the
+// repo basename, matching the diff page) regardless of which entry
+// point routed us here. fallbackTitle is only used for arbitrary panes
+// that don't resolve to a known repo.
+func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle string) {
+	title := strings.Trim(repoURL, "/")
+	if title == "" {
+		title = fallbackTitle
 	}
-	body.WriteString(`</div></div>`)
+	var body strings.Builder
+	body.WriteString(`<div class="page-heading"><div class="page-heading-row">`)
+	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(title))
+	body.WriteString(`</div><div class="header-buttons">`)
+	body.WriteString(`<a class="toggle" href="/">home</a>`)
+	if repoURL != "" {
+		fmt.Fprintf(&body, `<a class="toggle" href="%s">diff</a>`, template.HTMLEscapeString(repoURL))
+	}
+	body.WriteString(`<div class="header-buttons-right">`)
+	body.WriteString(`<button class="toggle" type="button" id="jump-bottom" hidden>jump to bottom</button>`)
+	if repoURL != "" {
+		// Restart is webdiff-managed-only: server gates on the `-wd`
+		// session suffix, and we hide the button when there's no repo
+		// URL to navigate to after the kill.
+		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="restart-session" data-repo-url="%s">restart session</button>`,
+			template.HTMLEscapeString(repoURL))
+	}
+	body.WriteString(`</div></div></div>`)
 	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" class="term-container"><div class="term-inner"></div></div>`,
 		template.HTMLEscapeString(paneID))
 	body.WriteString(`<div class="stream-toolbar">`)
 	body.WriteString(`<div class="stream-toolbar-row">`)
+	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Escape" title="send Escape">esc</button>`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Up" title="send up arrow">↑</button>`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Down" title="send down arrow">↓</button>`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Enter" title="send Enter">enter</button>`)
@@ -1062,12 +1287,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "cannot determine working directory:", err)
 		os.Exit(1)
 	}
-	if isGitRepo(wd) {
-		rootDir = wd
-	} else if top, err := exec.Command("git", "-C", wd, "rev-parse", "--show-toplevel").Output(); err == nil {
-		rootDir = strings.TrimSpace(string(top))
-	} else {
-		rootDir = wd
+	rootDir = wd
+	if isGitRepo(rootDir) {
+		fmt.Fprintln(os.Stderr, "webdiff must be run from a directory containing git repos, not from inside a git repo itself")
+		os.Exit(1)
 	}
 
 	if ucd, err := os.UserCacheDir(); err == nil {
@@ -1086,16 +1309,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	mode := "repo"
-	if !isGitRepo(rootDir) {
-		mode = "multi-repo browser"
-	}
-
 	browserMux := http.NewServeMux()
 	browserMux.HandleFunc("/_/app.js", serveAppJS)
-	browserMux.HandleFunc("/_/stream", renderStreamPage)
-	browserMux.HandleFunc("/_/claude", handleStartSession)
+	browserMux.HandleFunc("/_/stream/", renderRepoStreamPage)
+	browserMux.HandleFunc("/_/pane", renderArbitraryPanePage)
+	browserMux.HandleFunc("/_/claude/", handleStartSession)
 	browserMux.HandleFunc("/", handler)
+
+	startSessionWatcher(context.Background())
 
 	apiMux := http.NewServeMux()
 	registerClaudeRoutes(apiMux)
@@ -1138,8 +1359,8 @@ func main() {
 		listeners = append(listeners, ln)
 		addrs = append(addrs, addr)
 	}
-	fmt.Printf("Serving %s on %s (root: %s, cache: %s, owner: %d)\n",
-		mode, strings.Join(addrs, ", "), rootDir, cacheRoot, auth.ownerID)
+	fmt.Printf("Serving on %s (root: %s, cache: %s, owner: %d)\n",
+		strings.Join(addrs, ", "), rootDir, cacheRoot, auth.ownerID)
 	// Wrap safeweb's handler with the owner check so the auth gate runs
 	// before any security-headers / CSRF / mux dispatch logic.
 	httpSrv := &http.Server{Handler: auth.middleware(srv)}
