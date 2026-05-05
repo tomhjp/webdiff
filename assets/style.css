@@ -172,6 +172,7 @@ body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
    that shrinks and ellipses when the viewport gets narrow. */
 .tmux-row .dir-name { flex: 0 0 auto; overflow: visible; text-overflow: clip }
 .tmux-row .dir-stats { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.tmux-row .dir-branch { flex: 0 0 auto; max-width: none; overflow: visible }
 @keyframes wd-spin { to { transform: rotate(360deg) } }
 .session-spinning::after { content: ''; flex: 0 0 auto; align-self: center; width: 8px; height: 8px; border: 1.5px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: wd-spin 0.6s linear infinite }
 

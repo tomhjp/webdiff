@@ -19,8 +19,10 @@ go install github.com/tomhjp/webdiff@latest
 Then run from a directory containing your git repos:
 
 ```
-webdiff [port]
+webdiff [-agent="<command>"] [port]
 ```
+
+`-agent` accepts a full command line (e.g. `-agent="opencode --foo"`); the first whitespace-separated token is used as the display name on the diff page's agent button. Defaults to `claude`.
 
 ## Terminal colour palette
 

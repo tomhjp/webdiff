@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"html"
 	"html/template"
@@ -15,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	terminal "github.com/buildkite/terminal-to-html/v3"
 	"tailscale.com/safeweb"
@@ -51,6 +54,16 @@ var paletteCSS string
 // rootDir is the directory the server was started in. All requests resolve
 // repo paths relative to this.
 var rootDir string
+
+// agentCmd is the full shell command spawned in each repo's tmux pane
+// (e.g. "claude" or "opencode --foo --bar"); set from the -agent flag in
+// main. agentName is the first whitespace-separated token, used for the
+// header button label, status messages, and matched against tmux's
+// pane_current_command for readiness detection.
+var (
+	agentCmd  = "claude"
+	agentName = "claude"
+)
 
 // cacheRoot is where per-repo warm git index/object caches live, e.g.
 // ~/.cache/webdiff. Reused across requests and process restarts so the
@@ -728,9 +741,11 @@ func summarizeRepo(repo, mode string) repoSummary {
 	}
 }
 
-// renderListing renders a directory of subdirectories. For git repos it shows
-// the current branch and short diff stats; summaries are computed in parallel
-// so total time scales with the slowest repo, not the sum.
+// renderListing renders a directory of subdirectories. Per-repo branch
+// and diff stats are NOT computed server-side — they're filled in by
+// the client via /_/repo-stats so the page itself renders instantly
+// even when one repo's `git diff` is slow. The diff page (renderRepo)
+// keeps blocking on its own data; this lazy-loading is listing-only.
 func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -760,20 +775,6 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 		rows = append(rows, row{name: e.Name(), isGit: isGitRepo(filepath.Join(dir, e.Name()))})
 	}
 
-	summaries := make([]repoSummary, len(rows))
-	var wg sync.WaitGroup
-	for i, r := range rows {
-		if !r.isGit {
-			continue
-		}
-		wg.Add(1)
-		go func(i int, sub string) {
-			defer wg.Done()
-			summaries[i] = summarizeRepo(sub, mode)
-		}(i, filepath.Join(dir, r.name))
-	}
-	wg.Wait()
-
 	var body strings.Builder
 	body.WriteString(`<div class="header"><div class="header-left">`)
 	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(dir)))
@@ -793,33 +794,29 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 	}
 	body.WriteString(`</select></div></div>`)
 
+	body.WriteString(`<h2 class="section-title">repos</h2>`)
 	body.WriteString(`<div class="dir-list">`)
-	for i, r := range rows {
+	for _, r := range rows {
 		cls := "dir-row"
 		if !r.isGit {
 			cls += " dir-folder"
 		}
-		fmt.Fprintf(&body, `<a class="%s" href="%s"><span class="dir-name">%s</span>`,
+		// Git rows leave dir-stats and dir-branch empty server-side; the
+		// `data-stats-url` attribute is the cue for app.js to fetch and
+		// fill them. Non-git folders have no stats to load, so they
+		// render fully here. The empty spans are present from the start
+		// so layout doesn't shift when stats arrive.
+		statsAttr := ""
+		if r.isGit {
+			statsAttr = fmt.Sprintf(` data-stats-url="%s"`,
+				template.HTMLEscapeString("/_/repo-stats"+urlPath+r.name+"/"+modeQS))
+		}
+		fmt.Fprintf(&body, `<a class="%s" href="%s"%s><span class="dir-name">%s</span>`,
 			cls, template.HTMLEscapeString(urlPath+r.name+"/"+modeQS),
+			statsAttr,
 			template.HTMLEscapeString(r.name))
 		if r.isGit {
-			s := summaries[i]
-			if s.files > 0 {
-				body.WriteString(`<span class="dir-stats">`)
-				noun := "files"
-				if s.files == 1 {
-					noun = "file"
-				}
-				fmt.Fprintf(&body, `<span class="stats-files">%d %s</span>`, s.files, noun)
-				if s.ins > 0 {
-					fmt.Fprintf(&body, ` <span class="stats-ins">+%d</span>`, s.ins)
-				}
-				if s.del > 0 {
-					fmt.Fprintf(&body, ` <span class="stats-del">-%d</span>`, s.del)
-				}
-				body.WriteString(`</span>`)
-			}
-			fmt.Fprintf(&body, `<span class="dir-branch">%s</span>`, template.HTMLEscapeString(s.branch))
+			body.WriteString(`<span class="dir-stats"></span><span class="dir-branch"></span>`)
 		} else {
 			body.WriteString(`<span class="dir-branch dir-folder-tag">folder</span>`)
 		}
@@ -840,6 +837,32 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 	writePage(w, body.String())
 }
 
+// handleRepoStats returns JSON {branch, files, ins, del} for one repo,
+// computed via summarizeRepo. The path to the repo comes from the URL
+// path after /_/repo-stats (matching the listing routing), and the
+// diff base is selected via ?mode=. This is the lazy-load endpoint
+// behind the listing's per-row stats; the diff page does not use it.
+func handleRepoStats(w http.ResponseWriter, r *http.Request) {
+	repoPath := strings.TrimPrefix(r.URL.Path, "/_/repo-stats")
+	target, ok := resolvePath(repoPath)
+	if !ok || !isGitRepo(target) {
+		http.NotFound(w, r)
+		return
+	}
+	mode := r.URL.Query().Get("mode")
+	if mode != "working" && mode != "branch" && mode != "remote" {
+		mode = "working"
+	}
+	s := summarizeRepo(target, mode)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Branch string `json:"branch"`
+		Files  int    `json:"files"`
+		Ins    int    `json:"ins"`
+		Del    int    `json:"del"`
+	}{s.branch, s.files, s.ins, s.del})
+}
+
 // writeTmuxSection appends a "tmux sessions" block to the root listing
 // listing every pane on the host. Each row links to the streaming page
 // for that pane so the reviewer can peek at session state without
@@ -853,6 +876,7 @@ func writeTmuxSection(b *strings.Builder, ctx context.Context) {
 	}
 	b.WriteString(`<h2 class="section-title">tmux sessions</h2>`)
 	b.WriteString(`<div class="dir-list">`)
+	now := time.Now()
 	for _, p := range panes {
 		label := p.Session + ":" + p.Index
 		desc := p.Command
@@ -868,10 +892,31 @@ func writeTmuxSection(b *strings.Builder, ctx context.Context) {
 			template.HTMLEscapeString(p.Session),
 			template.HTMLEscapeString(label),
 			template.HTMLEscapeString(desc),
-			template.HTMLEscapeString(p.PaneID),
+			template.HTMLEscapeString(formatLastUsed(p.LastUsed, now)),
 		)
 	}
 	b.WriteString(`</div>`)
+}
+
+// formatLastUsed renders a tmux activity timestamp as a short relative
+// string for the listing's right column. Empty when ts is zero so the
+// "no data" case (older tmux, or unparseable field) doesn't show a
+// misleading "55y" relative to the unix epoch.
+func formatLastUsed(ts int64, now time.Time) string {
+	if ts == 0 {
+		return ""
+	}
+	d := now.Sub(time.Unix(ts, 0))
+	switch {
+	case d < time.Minute:
+		return "now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
 }
 
 // renderRepo renders the diff view for a single git repo.
@@ -915,25 +960,25 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	}
 	modeQS := modeQuery(mode)
 
-	// "claude" header button — always visible. When the repo's
+	// Agent header button — always visible. When the repo's
 	// webdiff-<base> session is already running it short-circuits
 	// straight to /_/stream<repoUrl>; otherwise it points at
-	// /_/claude<repoUrl>, which spawns the session and 303-redirects to
+	// /_/agent<repoUrl>, which spawns the session and 303-redirects to
 	// the same place. The dashed-border "to-be-created" treatment (via
 	// add-comment-btn) signals the click will spend ~5 s spawning a new
 	// pane rather than instantly attaching to a live one. Both URLs are
 	// path-based: each repo maps 1-1 to its tmux session, so neither
 	// side needs to thread a paneID through the URL.
 	paneID, _ := repoStreamPane(r.Context(), repo)
-	var claudeHref, claudeClass, claudeTitle string
+	var agentHref, agentClass, agentTitle string
 	if paneID != "" {
-		claudeHref = "/_/stream" + urlPath
-		claudeClass = "toggle"
-		claudeTitle = "open the running claude session for this repo"
+		agentHref = "/_/stream" + urlPath
+		agentClass = "toggle"
+		agentTitle = "open the running " + agentName + " session for this repo"
 	} else {
-		claudeHref = "/_/claude" + urlPath
-		claudeClass = "toggle add-comment-btn"
-		claudeTitle = "start a claude session for this repo"
+		agentHref = "/_/agent" + urlPath
+		agentClass = "toggle add-comment-btn"
+		agentTitle = "start a " + agentName + " session for this repo"
 	}
 
 	var stats string
@@ -960,7 +1005,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 
 	var body strings.Builder
 	// Sticky page heading: row 1 is title (left) + branch/stats meta
-	// (right, smaller font); row 2 is the home/claude nav (left) +
+	// (right, smaller font); row 2 is the home/agent nav (left) +
 	// mode/context/expand controls (right). Everything that used to
 	// live in a separate info bar is folded in here so only the
 	// streaming diff body scrolls.
@@ -979,8 +1024,8 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	body.WriteString(`<div class="page-heading-row page-heading-row-scroll">`)
 	body.WriteString(`<div class="header-buttons">`)
 	fmt.Fprintf(&body, `<a class="toggle" href="/%s">home</a>`, modeQS)
-	fmt.Fprintf(&body, `<a class="%s" href="%s" title="%s">claude</a>`,
-		claudeClass, template.HTMLEscapeString(claudeHref), template.HTMLEscapeString(claudeTitle))
+	fmt.Fprintf(&body, `<a class="%s" href="%s" title="%s">%s</a>`,
+		agentClass, template.HTMLEscapeString(agentHref), template.HTMLEscapeString(agentTitle), template.HTMLEscapeString(agentName))
 	body.WriteString(`</div>`)
 
 	body.WriteString(`<div class="header-buttons">`)
@@ -1017,7 +1062,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	// floating bottom-right chip just opens the modal; the modal's
 	// footer button does the actual send and is the one that
 	// disables/enables based on comment count.
-	body.WriteString(`<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments">send to claude (<span class="send-count">0</span>)</button></div>`)
+	fmt.Fprintf(&body, `<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments">send to %s (<span class="send-count">0</span>)</button></div>`, template.HTMLEscapeString(agentName))
 
 	if len(files) == 0 {
 		msg := "No uncommitted changes."
@@ -1091,11 +1136,13 @@ func writePage(w http.ResponseWriter, body string) {
 		Xterm256CSS template.CSS
 		PaletteCSS  template.CSS
 		Body        template.HTML
+		AgentName   string
 	}{
 		StyleCSS:    template.CSS(styleCSS),
 		Xterm256CSS: template.CSS(xterm256),
 		PaletteCSS:  template.CSS(paletteCSS),
 		Body:        template.HTML(body),
+		AgentName:   agentName,
 	}
 	if err := pageTmpl.Execute(w, data); err != nil {
 		// Header is already written; logging is the best we can do.
@@ -1144,7 +1191,7 @@ func paneRepoURL(label string) string {
 // /_/stream/foo/ → /foo/. Each repo maps 1-1 to its `<base>-wd` tmux
 // session, so the server resolves the paneID from the repo path
 // instead of accepting it as a query param. If the session hasn't been
-// spawned yet the request 303-redirects to /_/claude<repoUrl>, which
+// spawned yet the request 303-redirects to /_/agent<repoUrl>, which
 // spawns it and bounces back here.
 //
 // Layout: sticky page heading with nav links, streaming term tail in
@@ -1167,7 +1214,7 @@ func renderRepoStreamPage(w http.ResponseWriter, r *http.Request) {
 	}
 	paneID, _ := repoStreamPane(r.Context(), abs)
 	if paneID == "" {
-		http.Redirect(w, r, "/_/claude"+repoURL, http.StatusSeeOther)
+		http.Redirect(w, r, "/_/agent"+repoURL, http.StatusSeeOther)
 		return
 	}
 	writeStreamPage(w, paneID, repoURL, "")
@@ -1267,7 +1314,11 @@ func computeXterm256CSS() string {
 
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "palette" {
+	agentFlag := flag.String("agent", "claude", "agent command spawned in each repo's tmux pane; the first whitespace-separated token is used as the display name")
+	flag.Parse()
+	args := flag.Args()
+
+	if len(args) > 0 && args[0] == "palette" {
 		if err := runPalette(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -1275,9 +1326,19 @@ func main() {
 		return
 	}
 
+	agentCmd = strings.TrimSpace(*agentFlag)
+	if agentCmd == "" {
+		agentCmd = "claude"
+	}
+	if i := strings.IndexAny(agentCmd, " \t"); i > 0 {
+		agentName = agentCmd[:i]
+	} else {
+		agentName = agentCmd
+	}
+
 	port := "9418"
-	if len(os.Args) > 1 {
-		port = os.Args[1]
+	if len(args) > 0 {
+		port = args[0]
 	}
 
 	paletteCSS = loadPalette()
@@ -1313,13 +1374,14 @@ func main() {
 	browserMux.HandleFunc("/_/app.js", serveAppJS)
 	browserMux.HandleFunc("/_/stream/", renderRepoStreamPage)
 	browserMux.HandleFunc("/_/pane", renderArbitraryPanePage)
-	browserMux.HandleFunc("/_/claude/", handleStartSession)
+	browserMux.HandleFunc("/_/agent/", handleStartSession)
+	browserMux.HandleFunc("/_/repo-stats/", handleRepoStats)
 	browserMux.HandleFunc("/", handler)
 
 	startSessionWatcher(context.Background())
 
 	apiMux := http.NewServeMux()
-	registerClaudeRoutes(apiMux)
+	registerAgentRoutes(apiMux)
 
 	// safeweb's DefaultCSP is strict-by-default; everything except
 	// same-origin URLs is blocked. The application JavaScript is now

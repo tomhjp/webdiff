@@ -1,4 +1,10 @@
 (function(){
+  // AGENT_NAME is the user-facing label of the agent webdiff spawns
+  // (default "claude"; configurable via the server's -agent flag). It's
+  // injected by the page template as a body data attribute so client
+  // code can render button copy without a server roundtrip.
+  var AGENT_NAME=(document.body&&document.body.dataset.agentName)||'claude';
+
   // Stream page: a dedicated full-window tail of one tmux pane. We
   // detect it by the presence of #pane-tail (rendered server-side by
   // writeStreamPage) and run a self-contained handler. The diff/listing
@@ -212,7 +218,7 @@
     }
     // Restart wires through to /api/pane/restart, which kills the
     // current tmux session. After the kill we navigate to the same
-    // /_/claude<repoURL> the diff page's claude button hits — that
+    // /_/agent<repoURL> the diff page's agent button hits — that
     // handler spawns a fresh session and 303s back to the stream view.
     var restartBtn=document.getElementById('restart-session');
     if(restartBtn){
@@ -226,7 +232,7 @@
           body:JSON.stringify({paneID:paneID})
         }).then(function(r){
           if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
-          window.location.href='/_/claude'+repoURL;
+          window.location.href='/_/agent'+repoURL;
         }).catch(function(e){
           restartBtn.disabled=false;
           window.alert('restart failed: '+e.message);
@@ -382,7 +388,7 @@
   window.addEventListener('scroll',updateActive,{passive:true});
   requestAnimationFrame(function(){requestAnimationFrame(updateActive)});
 
-  // ─── review comments → claude ──────────────────────────────────────
+  // ─── review comments → agent ───────────────────────────────────────
   var REPO_PATH=window.location.pathname.replace(/\/+$/,'')||'/';
   var COMMENT_KEY='webdiff:comments:'+REPO_PATH;
   var sendBtn=document.getElementById('send-comments');
@@ -671,7 +677,7 @@
   // open so deletes elsewhere on the page don't have to keep a static
   // modal in sync. The footer carries the actual confirm-send button:
   // the floating bottom-right chip just opens this modal, so a stray
-  // mobile tap reviews rather than firing the whole batch off to claude.
+  // mobile tap reviews rather than firing the whole batch off to the agent.
   function commentLoc(c){
     if(!c.file)return '(overall review)';
     if(c.newLine)return c.file+':'+c.newLine;
@@ -711,7 +717,7 @@
     function refreshState(){
       var n=loadComments().length;
       title.textContent='review comments ('+n+')';
-      confirm.textContent='send to claude ('+n+')';
+      confirm.textContent='send to '+AGENT_NAME+' ('+n+')';
       confirm.disabled=n===0;
     }
     function appendRow(c){
@@ -797,4 +803,34 @@
     }
   });
   if(sendBtn)sendBtn.addEventListener('click',openCommentsModal);
+})();
+
+// Listing page: per-repo branch + diff stats are not rendered server-
+// side so the page itself returns instantly. Each <a class="dir-row">
+// for a git repo carries a `data-stats-url` pointing at /_/repo-stats;
+// we fetch each in parallel and fill the empty .dir-stats / .dir-branch
+// spans as responses arrive. Failures are silent — the row just stays
+// blank, matching how a 0-files repo looked before.
+(function(){
+  var rows=document.querySelectorAll('.dir-row[data-stats-url]');
+  if(!rows.length)return;
+  rows.forEach(function(row){
+    var url=row.getAttribute('data-stats-url');
+    fetch(url,{credentials:'same-origin'}).then(function(r){
+      if(!r.ok)throw new Error(r.statusText);
+      return r.json();
+    }).then(function(s){
+      var stats=row.querySelector('.dir-stats');
+      var branch=row.querySelector('.dir-branch');
+      if(stats&&s.files>0){
+        var noun=s.files===1?'file':'files';
+        var html='<span class="stats-files">'+s.files+' '+noun+'</span>';
+        if(s.ins>0)html+=' <span class="stats-ins">+'+s.ins+'</span>';
+        if(s.del>0)html+=' <span class="stats-del">-'+s.del+'</span>';
+        stats.innerHTML=html;
+      }
+      if(branch)branch.textContent=s.branch||'';
+      row.removeAttribute('data-stats-url');
+    }).catch(function(){});
+  });
 })();
