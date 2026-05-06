@@ -414,14 +414,19 @@ func fileDiff(env []string, repo, base, file string, cols int, fullContext bool)
 // rendered line (for blank-detection and heading extraction).
 var htmlTagRE = regexp.MustCompile(`<[^>]+>`)
 
-// addedPrefixRE matches a delta-rendered line whose old-side line-number
-// column (term-fgx88) is empty and whose new-side column (term-fgx28)
-// has a number — i.e. an added line, even if its code body is blank.
+// bg256RE / bg16RE match the CSS classes terminal-to-html emits for
+// 256-color (`term-bgxN`, N=0..255) and 16-color (`term-bgN`, N=40-47
+// or 100-107) background spans. We classify a line as add / del by
+// decoding the dominant bg's hue, which works across every delta theme
+// without us hardcoding which colour the user picked.
 //
-// removedPrefixRE is the symmetric pattern for a removed line.
+// digitRunRE / gutterSepRE drive theme-agnostic line-number parsing
+// from the gutter portion of a rendered line.
 var (
-	addedPrefixRE   = regexp.MustCompile(`class="term-fgx88">\s*</span>.*?class="term-fgx28">\s*\d`)
-	removedPrefixRE = regexp.MustCompile(`class="term-fgx88">\s*\d.*?class="term-fgx28">\s*</span>`)
+	bg256RE     = regexp.MustCompile(`term-bgx(\d+)`)
+	bg16RE      = regexp.MustCompile(`term-bg(\d\d)`)
+	digitRunRE  = regexp.MustCompile(`\d+`)
+	gutterSepRE = regexp.MustCompile(`[│┊⎜|]`)
 )
 
 // extractHeading peels off delta's per-file leading heading — the
@@ -506,29 +511,25 @@ func isVisuallyBlank(s string) bool {
 // same-state diff lines (a 1-line gap inside an added or removed run)
 // so the highlight stays continuous across the visual paragraph.
 //
+// Classification (add / del / context) is theme-agnostic on purpose —
+// webdiff aims to honour whatever delta config the user runs locally,
+// not to pin one theme. classifyLine layers a small ladder of signals
+// (256-colour bg cube hue → 16-colour bg → literal +/- prefix → blank-
+// body gutter position) so any reasonable diff renderer lights up the
+// click-to-comment data-attributes correctly.
+//
 // With delta's line-numbers feature on, each diff line starts with a
 // non-bg gutter prefix (`    ┊ 36 │` etc) and only the code portion gets
-// bg-22/bg-52. We split at the first bg span so the gutter stays
+// the diff bg. We split at the first bg span so the gutter stays
 // uncoloured (matching delta in a real terminal) while the code area
-// extends to the end of the line. Blank added/removed lines have no bg
-// span at all in the HTML — terminal-to-html drops the trailing
-// `\x1b[K` cells — so we additionally classify them by the gutter
-// pattern (term-fgx88 vs term-fgx28 column emptiness).
+// extends to the end of the line.
 func wrapDiffLines(htmlIn, file string) string {
 	htmlIn = strings.TrimRight(htmlIn, "\n")
 	lines := strings.Split(htmlIn, "\n")
 	classes := make([]string, len(lines))
+	bgClasses := make([]string, len(lines))
 	for i, line := range lines {
-		switch {
-		case strings.Contains(line, "term-bgx22"):
-			classes[i] = "add"
-		case strings.Contains(line, "term-bgx52"):
-			classes[i] = "del"
-		case addedPrefixRE.MatchString(line):
-			classes[i] = "add"
-		case removedPrefixRE.MatchString(line):
-			classes[i] = "del"
-		}
+		bgClasses[i], classes[i] = classifyLine(line)
 	}
 	for i := 1; i < len(lines)-1; i++ {
 		if classes[i] != "" || !isVisuallyBlank(lines[i]) {
@@ -536,6 +537,7 @@ func wrapDiffLines(htmlIn, file string) string {
 		}
 		if classes[i-1] != "" && classes[i-1] == classes[i+1] {
 			classes[i] = classes[i-1]
+			bgClasses[i] = bgClasses[i-1]
 		}
 	}
 	fileAttr := ""
@@ -551,7 +553,8 @@ func wrapDiffLines(htmlIn, file string) string {
 	// drag-select flow and we don't want a click ambiguity.
 	fileAnchorWritten := false
 	for i, line := range lines {
-		if classes[i] == "" && !lineHasNumbers(line) {
+		oldNum, newNum := parseLineNumbers(line, bgClasses[i], classes[i])
+		if classes[i] == "" && oldNum == "" && newNum == "" {
 			if !fileAnchorWritten && file != "" {
 				fmt.Fprintf(&b, `<span class="line line-file-anchor" data-file-comment="%s" title="comment on this whole file">%s</span>`,
 					template.HTMLEscapeString(file), line)
@@ -561,7 +564,6 @@ func wrapDiffLines(htmlIn, file string) string {
 			fmt.Fprintf(&b, `<span class="line">%s</span>`, line)
 			continue
 		}
-		oldNum, newNum := lineNumbers(line)
 		lineAttrs := fileAttr
 		if oldNum != "" {
 			lineAttrs += fmt.Sprintf(` data-old-line="%s"`, oldNum)
@@ -573,11 +575,7 @@ func wrapDiffLines(htmlIn, file string) string {
 			fmt.Fprintf(&b, `<span class="line"%s>%s</span>`, lineAttrs, line)
 			continue
 		}
-		bg := "term-bgx22"
-		if classes[i] == "del" {
-			bg = "term-bgx52"
-		}
-		prefix, tail := splitDiffLine(line, bg)
+		prefix, tail := splitDiffLine(line, bgClasses[i])
 		fmt.Fprintf(&b,
 			`<span class="line line-%s"%s><span class="line-prefix">%s</span><span class="line-tail">%s</span></span>`,
 			classes[i], lineAttrs, prefix, tail)
@@ -585,94 +583,221 @@ func wrapDiffLines(htmlIn, file string) string {
 	return b.String()
 }
 
-// lineNumbers returns (old, new) line numbers parsed out of the line's
-// gutter prefix. Either side can be empty: added lines have no old
-// number, removed lines have no new number, decoration lines (hunk
-// headers) have neither and we just leave both empty.
+// classifyLine reports the diff class ("add", "del", or "") of one
+// rendered HTML line and returns the dominant bg-span class that drove
+// the decision (empty when classification came from a non-bg signal).
 //
-// We parse against the same span shapes the prefix regexes match,
-// peeling digits from inside the term-fgx88 / term-fgx28 / term-fgx238
-// columns. We deliberately don't try to handle delta themes that paint
-// line numbers a different colour — if the user reskins delta the
-// data attributes will simply be missing and the comment lands at the
-// file level.
-func lineNumbers(line string) (oldNum, newNum string) {
-	// Old-side column: term-fgx88 (added/removed columns) or
-	// term-fgx238 (unchanged context). For unchanged context lines
-	// both columns use 238, and we read them in document order.
-	if m := lineNumberRE("term-fgx88").FindStringSubmatch(line); m != nil {
-		oldNum = strings.TrimSpace(m[1])
-	} else if m := lineNumberRE("term-fgx238").FindStringSubmatch(line); m != nil {
-		oldNum = strings.TrimSpace(m[1])
-		// Unchanged-context lines have a second 238 span for the new
-		// number; pull that one too if present.
-		if m2 := lineNumberRESecond("term-fgx238").FindStringSubmatch(line); m2 != nil {
-			newNum = strings.TrimSpace(m2[1])
-			return
+// The signals layer like a ladder, cheapest first:
+//  1. Background-colour palette: walk every term-bgxN / term-bgN class
+//     on the line and decode their hues. Indices in the 256-colour
+//     6×6×6 cube whose green coord beats red → add; red beats green →
+//     del. The basic 16 colours (1/9, 2/10) and their 16-colour SGR
+//     equivalents (41/42/101/102) are mapped explicitly. Most
+//     deltathemes set diff bgs from the standard palette, so this hits
+//     regardless of which exact colour the user picked.
+//  2. Literal +/- prefix: raw `git diff --color=always` (no pager) puts
+//     a `+` or `-` as the first visible character of every diff line
+//     and we exclude the file-header lines (+++ / ---).
+//  3. Gutter-position fallback for delta blank-body added/removed
+//     lines: the line-numbers gutter has digits on only one side of
+//     the column separator (left = old/del, right = new/add). bg
+//     detection misses these because terminal-to-html drops the
+//     trailing \x1b[K cells when the body is empty.
+func classifyLine(line string) (bgClass, cls string) {
+	classCount := map[string]int{}
+	bgCount := map[string]int{}
+	for _, m := range bg256RE.FindAllStringSubmatch(line, -1) {
+		n := atoiOrNeg(m[1])
+		c := classifyXterm256(n)
+		if c == "" {
+			continue
+		}
+		classCount[c]++
+		bgCount[m[0]]++
+	}
+	if len(classCount) == 0 {
+		for _, m := range bg16RE.FindAllStringSubmatch(line, -1) {
+			c := classifyXterm16(m[1])
+			if c == "" {
+				continue
+			}
+			classCount[c]++
+			bgCount[m[0]]++
 		}
 	}
-	if m := lineNumberRE("term-fgx28").FindStringSubmatch(line); m != nil {
-		newNum = strings.TrimSpace(m[1])
+	if len(classCount) > 0 {
+		cls = pickMostFrequent(classCount)
+		bgClass = pickMostFrequent(bgCount)
+		return
+	}
+	if c := classifyByPrefixChar(line); c != "" {
+		return "", c
+	}
+	if c := classifyBlankByGutter(line); c != "" {
+		return "", c
+	}
+	return "", ""
+}
+
+// classifyXterm256 returns "add" / "del" for the 256-colour palette
+// indices that read as decisively green or red. 0-15 are the system
+// 16 (1/9 = red, 2/10 = green); 16-231 are the 6×6×6 cube; 232-255 is
+// the grayscale ramp (always neutral).
+func classifyXterm256(n int) string {
+	switch n {
+	case 1, 9:
+		return "del"
+	case 2, 10:
+		return "add"
+	}
+	if n < 16 || n > 231 {
+		return ""
+	}
+	idx := n - 16
+	r, g, bl := idx/36, (idx/6)%6, idx%6
+	if g > r && g > bl {
+		return "add"
+	}
+	if r > g && r > bl {
+		return "del"
+	}
+	return ""
+}
+
+// classifyXterm16 maps the SGR 16-colour bg codes (40-47 normal,
+// 100-107 bright) to add / del by red/green hue.
+func classifyXterm16(s string) string {
+	switch s {
+	case "42", "102":
+		return "add"
+	case "41", "101":
+		return "del"
+	}
+	return ""
+}
+
+// classifyByPrefixChar handles raw `git diff --color=always` (no pager
+// or a non-delta pager): the SGR-coloured spans wrap a literal +/- as
+// the first visible character of the line. File-header lines (+++/---)
+// are excluded since they carry no diff body.
+func classifyByPrefixChar(line string) string {
+	text := htmlTagRE.ReplaceAllString(line, "")
+	if strings.HasPrefix(text, "+++") || strings.HasPrefix(text, "---") {
+		return ""
+	}
+	if strings.HasPrefix(text, "+") {
+		return "add"
+	}
+	if strings.HasPrefix(text, "-") {
+		return "del"
+	}
+	return ""
+}
+
+// classifyBlankByGutter recovers the class of a delta blank-body
+// added/removed line whose body had no \x1b[K cells for terminal-to-
+// html to keep. The line-numbers gutter still carries digits on one
+// side of the column separator (│ ┊ ⎜ |); left-only → del, right-only →
+// add.
+func classifyBlankByGutter(line string) string {
+	text := htmlTagRE.ReplaceAllString(line, "")
+	loc := gutterSepRE.FindStringIndex(text)
+	if loc == nil {
+		return ""
+	}
+	leftHas := digitRunRE.MatchString(text[:loc[0]])
+	rightHas := digitRunRE.MatchString(text[loc[1]:])
+	if leftHas && !rightHas {
+		return "del"
+	}
+	if rightHas && !leftHas {
+		return "add"
+	}
+	return ""
+}
+
+// parseLineNumbers extracts old/new line numbers from the gutter
+// portion of a rendered line — everything before the first bg-span,
+// where delta paints its line-numbers columns. The line's
+// classification picks which slot a single digit run belongs to (add →
+// new, del → old); context lines have two runs and we map them in
+// document order.
+func parseLineNumbers(line, bgClass, cls string) (oldNum, newNum string) {
+	gutter := line
+	if bgClass != "" {
+		if idx := strings.Index(line, bgClass); idx >= 0 {
+			if spanStart := strings.LastIndex(line[:idx], "<span"); spanStart >= 0 {
+				gutter = line[:spanStart]
+			}
+		}
+	}
+	text := htmlTagRE.ReplaceAllString(gutter, "")
+	nums := digitRunRE.FindAllString(text, -1)
+	switch cls {
+	case "add":
+		if len(nums) > 0 {
+			newNum = nums[len(nums)-1]
+		}
+	case "del":
+		if len(nums) > 0 {
+			oldNum = nums[0]
+		}
+	default:
+		if len(nums) >= 2 {
+			oldNum, newNum = nums[0], nums[1]
+		}
 	}
 	return
 }
 
-func lineHasNumbers(line string) bool {
-	return strings.Contains(line, "term-fgx88") || strings.Contains(line, "term-fgx28") || strings.Contains(line, "term-fgx238")
+func atoiOrNeg(s string) int {
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return -1
+		}
+		n = n*10 + int(r-'0')
+		if n > 255 {
+			return -1
+		}
+	}
+	return n
 }
 
-// lineNumberRE / lineNumberRESecond return regexes that capture the
-// digits inside the first / second occurrence of a span with the given
-// class. Cached at package level (built lazily).
-var lineNumberRECache = struct {
-	mu    sync.Mutex
-	first map[string]*regexp.Regexp
-	scnd  map[string]*regexp.Regexp
-}{first: map[string]*regexp.Regexp{}, scnd: map[string]*regexp.Regexp{}}
-
-func lineNumberRE(class string) *regexp.Regexp {
-	lineNumberRECache.mu.Lock()
-	defer lineNumberRECache.mu.Unlock()
-	if re, ok := lineNumberRECache.first[class]; ok {
-		return re
+func pickMostFrequent(counts map[string]int) string {
+	best, bestN := "", 0
+	for k, v := range counts {
+		if v > bestN || (v == bestN && k < best) {
+			best, bestN = k, v
+		}
 	}
-	re := regexp.MustCompile(`class="` + class + `">\s*(\d+)\s*</span>`)
-	lineNumberRECache.first[class] = re
-	return re
-}
-
-func lineNumberRESecond(class string) *regexp.Regexp {
-	lineNumberRECache.mu.Lock()
-	defer lineNumberRECache.mu.Unlock()
-	if re, ok := lineNumberRECache.scnd[class]; ok {
-		return re
-	}
-	// Match the SECOND span of this class: skip the first via .*?, then
-	// capture digits in the next.
-	re := regexp.MustCompile(`class="` + class + `">[^<]*</span>.*?class="` + class + `">\s*(\d+)\s*</span>`)
-	lineNumberRECache.scnd[class] = re
-	return re
+	return best
 }
 
 // splitDiffLine partitions a single rendered line into the gutter
 // prefix (rendered without a diff bg) and the code tail (rendered with
-// the diff bg, extending to end of line via flex).
+// the diff bg, extending to end of line via flex). bg is the bg-class
+// classifyLine picked as dominant on this line — empty when the line
+// was classified by a non-bg signal (raw `git diff` prefix character,
+// or blank-body gutter pattern).
 //
 // Three shapes:
-//   - line has bg-22/bg-52 → split at the first such span; prefix is
-//     the gutter, tail is everything from that span onwards
+//   - line has a known bg span → split at the first such span; prefix
+//     is the gutter, tail is everything from that span onwards
 //   - line has the line-number gutter but no body (blank added/removed
 //     line) → prefix is the whole line, tail is empty
-//   - line has no gutter at all (truly blank line filled by
-//     neighbour-inheritance) → prefix is empty, tail is the whole line
-//     so the bg covers it end-to-end
+//   - line has no gutter at all (raw `git diff` line, or a blank line
+//     filled by neighbour-inheritance) → prefix is empty, tail is the
+//     whole line so the CSS bg covers it end-to-end
 func splitDiffLine(line, bg string) (prefix, tail string) {
-	if idx := strings.Index(line, bg); idx >= 0 {
-		if spanStart := strings.LastIndex(line[:idx], "<span"); spanStart >= 0 {
-			return line[:spanStart], line[spanStart:]
+	if bg != "" {
+		if idx := strings.Index(line, bg); idx >= 0 {
+			if spanStart := strings.LastIndex(line[:idx], "<span"); spanStart >= 0 {
+				return line[:spanStart], line[spanStart:]
+			}
 		}
 	}
-	if strings.Contains(line, "│") {
+	if gutterSepRE.MatchString(line) {
 		return line, ""
 	}
 	return "", line
