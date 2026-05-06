@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -367,37 +368,55 @@ func changedFiles(env []string, repo, base string) []string {
 	return strings.Split(strings.TrimSpace(string(out)), "\n")
 }
 
-// fileDiff gets the diff for a single file and pipes it through the user's
-// configured pager (e.g. delta, diff-so-fancy) if available. fullContext
-// asks git for unlimited unchanged context (effectively the whole file
-// with hunks inlined) — driven by the diff page's "full context" toggle.
-func fileDiff(env []string, repo, base, file string, cols int, fullContext bool) string {
-	args := []string{"diff", "--cached", "--color=always"}
+// fileDiff returns the canonical structure for one file (parsed from
+// `git diff --no-color`, environment-stable) and the styled bytes from
+// the same diff piped through the user's pager (delta etc.). The two
+// halves drive different things: canonical owns line numbers and the
+// add/del/context kind that comments anchor to; styled is purely
+// visual and can vary freely from one machine to another.
+//
+// Wrapping is disabled for delta (`--wrap-max-lines 0`) so each source
+// line maps to exactly one rendered line — the zipper in wrapDiffLines
+// then does a straight 1:1 walk against canonical.
+func fileDiff(env []string, repo, base, file string, cols int, fullContext bool) ([]diffLine, []byte) {
+	colorArgs := []string{"diff", "--cached", "--color=always"}
+	noColorArgs := []string{"diff", "--cached", "--no-color"}
 	if fullContext {
-		args = append(args, "-U99999")
+		colorArgs = append(colorArgs, "-U99999")
+		noColorArgs = append(noColorArgs, "-U99999")
 	}
-	args = append(args, base, "--", file)
-	cmd := exec.Command("git", args...)
-	cmd.Env = env
-	cmd.Dir = repo
-	raw, err := cmd.Output()
+	colorArgs = append(colorArgs, base, "--", file)
+	noColorArgs = append(noColorArgs, base, "--", file)
+
+	canonCmd := exec.Command("git", noColorArgs...)
+	canonCmd.Env = env
+	canonCmd.Dir = repo
+	canonOut, err := canonCmd.Output()
+	if err != nil || len(canonOut) == 0 {
+		return nil, nil
+	}
+	canon := parseCanonical(canonOut)
+
+	colorCmd := exec.Command("git", colorArgs...)
+	colorCmd.Env = env
+	colorCmd.Dir = repo
+	raw, err := colorCmd.Output()
 	if err != nil || len(raw) == 0 {
-		return ""
+		return canon, nil
 	}
 
 	pagerCmd := exec.Command("git", "var", "GIT_PAGER")
 	pagerCmd.Dir = repo
-	pagerOut, err := pagerCmd.Output()
+	pagerOut, _ := pagerCmd.Output()
 	pager := strings.TrimSpace(string(pagerOut))
-	if err != nil || pager == "" || pager == "cat" || pager == "less" || pager == "more" {
-		return string(raw)
+	if pager == "" || pager == "cat" || pager == "less" || pager == "more" {
+		return canon, raw
 	}
 
 	colsEnv := append(env, fmt.Sprintf("COLUMNS=%d", cols), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
-
 	pagerWithWidth := pager
 	if strings.Contains(pager, "delta") {
-		pagerWithWidth = fmt.Sprintf("%s --width %d", pager, cols)
+		pagerWithWidth = fmt.Sprintf("%s --width %d --wrap-max-lines 0", pager, cols)
 	}
 
 	shell := exec.Command("sh", "-c", pagerWithWidth)
@@ -405,30 +424,76 @@ func fileDiff(env []string, repo, base, file string, cols int, fullContext bool)
 	shell.Stdin = strings.NewReader(string(raw))
 	colored, err := shell.Output()
 	if err != nil {
-		return string(raw)
+		return canon, raw
 	}
-	return string(colored)
+	return canon, colored
+}
+
+// diffLine is one source line of a unified diff: an add (`+`), a del
+// (`-`), or a context line (` `). text is the line content with its
+// leading kind byte stripped. oldLine / newLine are 1-based; only the
+// applicable side is set (add has newLine only, del has oldLine only).
+type diffLine struct {
+	kind    byte
+	oldLine int
+	newLine int
+	text    string
+}
+
+var hunkHeaderRE = regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
+
+// parseCanonical walks a `git diff --no-color` body and emits one
+// diffLine per source line, tracking 1-based old/new line numbers via
+// the @@ hunk headers. File headers (`diff --git`, `index`, `---`,
+// `+++`, `Binary files differ`) sit before the first @@ and are
+// skipped; `\ No newline at end of file` markers are skipped too.
+func parseCanonical(raw []byte) []diffLine {
+	out := make([]diffLine, 0, 64)
+	var oldL, newL int
+	inBody := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "@@ ") {
+			if m := hunkHeaderRE.FindStringSubmatch(line); m != nil {
+				oldL, _ = strconv.Atoi(m[1])
+				newL, _ = strconv.Atoi(m[2])
+				inBody = true
+			}
+			continue
+		}
+		if !inBody || line == "" || strings.HasPrefix(line, `\`) {
+			continue
+		}
+		kind := line[0]
+		text := ""
+		if len(line) > 1 {
+			text = line[1:]
+		}
+		switch kind {
+		case ' ':
+			out = append(out, diffLine{kind: ' ', oldLine: oldL, newLine: newL, text: text})
+			oldL++
+			newL++
+		case '+':
+			out = append(out, diffLine{kind: '+', newLine: newL, text: text})
+			newL++
+		case '-':
+			out = append(out, diffLine{kind: '-', oldLine: oldL, text: text})
+			oldL++
+		}
+	}
+	return out
 }
 
 // htmlTagRE strips HTML tags so we can read the visible text of a single
 // rendered line (for blank-detection and heading extraction).
 var htmlTagRE = regexp.MustCompile(`<[^>]+>`)
 
-// bg256RE / bg16RE match the CSS classes terminal-to-html emits for
-// 256-color (`term-bgxN`, N=0..255) and 16-color (`term-bgN`, N=40-47
-// or 100-107) background spans. We classify a line as add / del by
-// decoding the dominant bg's hue, which works across every delta theme
-// without us hardcoding which colour the user picked.
-//
-// digitRunRE / gutterSepRE drive theme-agnostic line-number parsing
-// from the gutter portion of a rendered line.
-var (
-	bg256RE     = regexp.MustCompile(`term-bgx(\d+)`)
-	bg16RE      = regexp.MustCompile(`term-bg(\d\d)`)
-	bgSpanRE    = regexp.MustCompile(`<span [^>]*term-bg(?:x\d+|\d\d)`)
-	digitRunRE  = regexp.MustCompile(`\d+`)
-	gutterSepRE = regexp.MustCompile(`[│┊⎜⋮▏|]`)
-)
+// bgSpanRE matches the opening tag of a <span> whose class list carries
+// any term-bgxN / term-bgN background — i.e. delta's diff body bg,
+// regardless of which colour or emph variant. splitDiffLine uses this
+// to peel the (no-bg) gutter off so CSS can paint the body without the
+// inline ANSI bg fighting it.
+var bgSpanRE = regexp.MustCompile(`<span [^>]*term-bg(?:x\d+|\d\d)`)
 
 // extractHeading peels off delta's per-file leading heading — the
 // "added: foo.go" / "src/foo.go" line and the single `─────` underline
@@ -504,56 +569,36 @@ func isVisuallyBlank(s string) bool {
 	return true
 }
 
-// wrapDiffLines wraps each line of terminal-to-html output in a
-// <span class="line"> so we can extend diff backgrounds across the full
-// line width — terminal-to-html collapses the trailing bg cells that
-// delta paints with `\x1b[K`, leaving the green/red highlight stopping
-// at the end of the text. We also fill blank lines that sit between two
-// same-state diff lines (a 1-line gap inside an added or removed run)
-// so the highlight stays continuous across the visual paragraph.
+// wrapDiffLines walks the styled HTML lines and zips them against the
+// canonical diff records, attaching click-to-comment data attributes
+// (data-file, data-old-line, data-new-line) and the line-add / line-del
+// classes from canonical — never inferring them from styling. Styled
+// lines that don't match canonical (delta's heading box, hunk-summary
+// decorations, etc.) emit as plain `<span class="line">…</span>`; the
+// first such line becomes the file-comment anchor.
 //
-// Classification (add / del / context) is theme-agnostic on purpose —
-// webdiff aims to honour whatever delta config the user runs locally,
-// not to pin one theme. classifyLine layers a small ladder of signals
-// (256-colour bg cube hue → 16-colour bg → literal +/- prefix → blank-
-// body gutter position) so any reasonable diff renderer lights up the
-// click-to-comment data-attributes correctly.
-//
-// With delta's line-numbers feature on, each diff line starts with a
-// non-bg gutter prefix (`    ┊ 36 │` etc) and only the code portion gets
-// the diff bg. We split at the first bg span so the gutter stays
-// uncoloured (matching delta in a real terminal) while the code area
-// extends to the end of the line.
-func wrapDiffLines(htmlIn, file string) string {
+// The match rule is a suffix check on visible text (htmlText strips
+// tags + entities). Delta prepends a line-numbers gutter to the body
+// and never appends, so suffix matching is robust across themes. Empty
+// source lines are matched separately by shape: just a +/-/space prefix
+// (raw `git diff`) or a 2+ separator line-numbers gutter (delta).
+func wrapDiffLines(htmlIn, file string, canon []diffLine) string {
 	htmlIn = strings.TrimRight(htmlIn, "\n")
 	lines := strings.Split(htmlIn, "\n")
-	classes := make([]string, len(lines))
-	for i, line := range lines {
-		classes[i] = classifyLine(line)
-	}
-	for i := 1; i < len(lines)-1; i++ {
-		if classes[i] != "" || !isVisuallyBlank(lines[i]) {
-			continue
-		}
-		if classes[i-1] != "" && classes[i-1] == classes[i+1] {
-			classes[i] = classes[i-1]
-		}
-	}
 	fileAttr := ""
 	if file != "" {
 		fileAttr = fmt.Sprintf(` data-file="%s"`, template.HTMLEscapeString(file))
 	}
 	var b strings.Builder
-	// fileAnchorWritten marks the first visually-quiet line (no diff
-	// class, no line numbers) as the file-comment anchor — clicking it
-	// opens a file-scope composer, replacing the dedicated "+" button
-	// that used to live in the summary. We only stamp non-diff lines
-	// because diff lines already participate in the line-level
-	// drag-select flow and we don't want a click ambiguity.
 	fileAnchorWritten := false
-	for i, line := range lines {
-		oldNum, newNum := parseLineNumbers(line, classes[i])
-		if classes[i] == "" && oldNum == "" && newNum == "" {
+	canonIdx := 0
+	for _, line := range lines {
+		var matched *diffLine
+		if canonIdx < len(canon) && matchesCanonical(htmlText(line), canon[canonIdx].text) {
+			matched = &canon[canonIdx]
+			canonIdx++
+		}
+		if matched == nil {
 			if !fileAnchorWritten && file != "" {
 				fmt.Fprintf(&b, `<span class="line line-file-anchor" data-file-comment="%s" title="comment on this whole file">%s</span>`,
 					template.HTMLEscapeString(file), line)
@@ -563,243 +608,100 @@ func wrapDiffLines(htmlIn, file string) string {
 			fmt.Fprintf(&b, `<span class="line">%s</span>`, line)
 			continue
 		}
-		lineAttrs := fileAttr
-		if oldNum != "" {
-			lineAttrs += fmt.Sprintf(` data-old-line="%s"`, oldNum)
+		attrs := fileAttr
+		if matched.oldLine > 0 {
+			attrs += fmt.Sprintf(` data-old-line="%d"`, matched.oldLine)
 		}
-		if newNum != "" {
-			lineAttrs += fmt.Sprintf(` data-new-line="%s"`, newNum)
+		if matched.newLine > 0 {
+			attrs += fmt.Sprintf(` data-new-line="%d"`, matched.newLine)
 		}
-		if classes[i] == "" {
-			fmt.Fprintf(&b, `<span class="line"%s>%s</span>`, lineAttrs, line)
+		var cls string
+		switch matched.kind {
+		case '+':
+			cls = "add"
+		case '-':
+			cls = "del"
+		}
+		if cls == "" {
+			fmt.Fprintf(&b, `<span class="line"%s>%s</span>`, attrs, line)
 			continue
 		}
 		prefix, tail := splitDiffLine(line)
 		fmt.Fprintf(&b,
 			`<span class="line line-%s"%s><span class="line-prefix">%s</span><span class="line-tail">%s</span></span>`,
-			classes[i], lineAttrs, prefix, tail)
+			cls, attrs, prefix, tail)
 	}
 	return b.String()
 }
 
-// classifyLine reports the diff class ("add", "del", or "") of one
-// rendered HTML line.
+// matchesCanonical decides whether a styled line carries the body of
+// the next canonical record. terminal-to-html expands tabs to spaces
+// based on screen-column tab stops, so byte-exact comparisons miss any
+// line containing a tab — we collapse runs of whitespace on both sides
+// before suffix-matching, which handles both leading indentation and
+// embedded tabs uniformly.
 //
-// The signals layer like a ladder, cheapest first:
-//  1. Background-colour palette: walk every term-bgxN / term-bgN class
-//     on the line and decode their hues. Indices in the 256-colour
-//     6×6×6 cube whose green coord beats red → add; red beats green →
-//     del. The basic 16 colours (1/9, 2/10) and their 16-colour SGR
-//     equivalents (41/42/101/102) are mapped explicitly. Most delta
-//     themes set diff bgs from the standard palette, so this hits
-//     regardless of which exact colour the user picked. Lines with
-//     emph have BOTH a regular and an emph bg class; both decode to
-//     the same hue so the count just adds up.
-//  2. Literal +/- prefix: raw `git diff --color=always` (no pager) puts
-//     a `+` or `-` as the first visible character of every diff line
-//     and we exclude the file-header lines (+++ / ---).
-//  3. Gutter-position fallback for delta blank-body added/removed
-//     lines: the line-numbers gutter has digits on only one side of
-//     the column separator (left = old/del, right = new/add). bg
-//     detection misses these because terminal-to-html drops the
-//     trailing \x1b[K cells when the body is empty.
-func classifyLine(line string) string {
-	classCount := map[string]int{}
-	for _, m := range bg256RE.FindAllStringSubmatch(line, -1) {
-		c := classifyXterm256(atoiOrNeg(m[1]))
-		if c != "" {
-			classCount[c]++
+// For empty source lines we fall back to a shape check: visible is
+// just a +/- (raw `git diff` empty add/del) or a delta line-numbers
+// gutter (≥2 separator characters). That rejects decorations like
+// delta's hunk-box `1│` (only one separator) and the `───┐ ───┘`
+// borders.
+func matchesCanonical(visible, canonText string) bool {
+	if stripped := strings.TrimSpace(canonText); stripped != "" {
+		return strings.HasSuffix(collapseWS(visible), collapseWS(stripped))
+	}
+	trimmed := strings.TrimSpace(visible)
+	if trimmed == "+" || trimmed == "-" {
+		return true
+	}
+	seps := 0
+	for _, r := range trimmed {
+		switch r {
+		case '⋮', '│', '┊', '⎜', '▏', '|':
+			seps++
 		}
 	}
-	if len(classCount) == 0 {
-		for _, m := range bg16RE.FindAllStringSubmatch(line, -1) {
-			c := classifyXterm16(m[1])
-			if c != "" {
-				classCount[c]++
-			}
-		}
-	}
-	if len(classCount) > 0 {
-		return pickMostFrequent(classCount)
-	}
-	if c := classifyByPrefixChar(line); c != "" {
-		return c
-	}
-	return classifyBlankByGutter(line)
+	return seps >= 2
 }
 
-// classifyXterm256 returns "add" / "del" for the 256-colour palette
-// indices that read as decisively green or red. 0-15 are the system
-// 16 (1/9 = red, 2/10 = green); 16-231 are the 6×6×6 cube; 232-255 is
-// the grayscale ramp (always neutral).
-func classifyXterm256(n int) string {
-	switch n {
-	case 1, 9:
-		return "del"
-	case 2, 10:
-		return "add"
-	}
-	if n < 16 || n > 231 {
-		return ""
-	}
-	idx := n - 16
-	r, g, bl := idx/36, (idx/6)%6, idx%6
-	if g > r && g > bl {
-		return "add"
-	}
-	if r > g && r > bl {
-		return "del"
-	}
-	return ""
-}
-
-// classifyXterm16 maps the SGR 16-colour bg codes (40-47 normal,
-// 100-107 bright) to add / del by red/green hue.
-func classifyXterm16(s string) string {
-	switch s {
-	case "42", "102":
-		return "add"
-	case "41", "101":
-		return "del"
-	}
-	return ""
-}
-
-// classifyByPrefixChar handles raw `git diff --color=always` (no pager
-// or a non-delta pager): the SGR-coloured spans wrap a literal +/- as
-// the first visible character of the line. File-header lines (+++/---)
-// are excluded since they carry no diff body.
-func classifyByPrefixChar(line string) string {
-	text := htmlTagRE.ReplaceAllString(line, "")
-	if strings.HasPrefix(text, "+++") || strings.HasPrefix(text, "---") {
-		return ""
-	}
-	if strings.HasPrefix(text, "+") {
-		return "add"
-	}
-	if strings.HasPrefix(text, "-") {
-		return "del"
-	}
-	return ""
-}
-
-// classifyBlankByGutter recovers the class of a delta blank-body
-// added/removed line whose body had no \x1b[K cells for terminal-to-
-// html to keep. delta's line-numbers gutter is shaped:
-//
-//	[old col] <inter-sep> [new col] <gutter-sep> [content]
-//
-// where the inter-sep (often ⋮) splits the two number columns and the
-// gutter-sep (often │) divides the gutter from the line body. We
-// require at least two separator runs so single-separator decorations
-// like a hunk-header `1│` aren't pulled in. Digits in the old col with
-// the new col empty → del; the symmetric case → add.
-func classifyBlankByGutter(line string) string {
-	text := htmlTagRE.ReplaceAllString(line, "")
-	seps := gutterSepRE.FindAllStringIndex(text, -1)
-	if len(seps) < 2 {
-		return ""
-	}
-	interEnd := seps[0][1]
-	gutterEnd := seps[len(seps)-1][0]
-	if interEnd > gutterEnd {
-		return ""
-	}
-	oldHas := digitRunRE.MatchString(text[:seps[0][0]])
-	newHas := digitRunRE.MatchString(text[interEnd:gutterEnd])
-	if oldHas && !newHas {
-		return "del"
-	}
-	if newHas && !oldHas {
-		return "add"
-	}
-	return ""
-}
-
-// parseLineNumbers extracts old/new line numbers from the gutter
-// portion of a rendered line — everything before the first bg-span,
-// where delta paints its line-numbers columns. We further trim to
-// before the LAST gutter separator so digits in the line body (e.g.
-// `var x = 42`) don't leak into the data attributes. The line's
-// classification picks which slot a single digit run belongs to (add →
-// new, del → old); context lines have two runs and we map them in
-// document order.
-func parseLineNumbers(line, cls string) (oldNum, newNum string) {
-	gutter := line
-	if loc := bgSpanRE.FindStringIndex(line); loc != nil {
-		gutter = line[:loc[0]]
-	}
-	text := htmlTagRE.ReplaceAllString(gutter, "")
-	if seps := gutterSepRE.FindAllStringIndex(text, -1); len(seps) > 0 {
-		text = text[:seps[len(seps)-1][0]]
-	}
-	nums := digitRunRE.FindAllString(text, -1)
-	switch cls {
-	case "add":
-		if len(nums) > 0 {
-			newNum = nums[len(nums)-1]
-		}
-	case "del":
-		if len(nums) > 0 {
-			oldNum = nums[0]
-		}
-	default:
-		if len(nums) >= 2 {
-			oldNum, newNum = nums[0], nums[1]
-		}
-	}
-	return
-}
-
-func atoiOrNeg(s string) int {
-	n := 0
+// collapseWS normalises every run of spaces / tabs in s into a single
+// space. terminal-to-html turns tabs into a column-dependent number of
+// spaces; canonical content keeps the literal `\t`, so we have to
+// erase that distinction before comparing.
+func collapseWS(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inWS := false
 	for _, r := range s {
-		if r < '0' || r > '9' {
-			return -1
+		if r == ' ' || r == '\t' {
+			if !inWS {
+				b.WriteByte(' ')
+				inWS = true
+			}
+			continue
 		}
-		n = n*10 + int(r-'0')
-		if n > 255 {
-			return -1
-		}
+		b.WriteRune(r)
+		inWS = false
 	}
-	return n
-}
-
-func pickMostFrequent(counts map[string]int) string {
-	best, bestN := "", 0
-	for k, v := range counts {
-		if v > bestN || (v == bestN && k < best) {
-			best, bestN = k, v
-		}
-	}
-	return best
+	return b.String()
 }
 
 // splitDiffLine partitions a single rendered line into the gutter
 // prefix (rendered without a diff bg) and the code tail (rendered with
-// the diff bg, extending to end of line via flex). The split point is
-// the first <span> whose class list carries any term-bgxN / term-bgN —
-// not the dominant bg, since delta's emph mode mixes a regular bg
-// (bgx52/bgx22) with an emph bg (bgx124/bgx28) on the same line, and
-// splitting at the most-frequent class can land in the middle of the
-// content with the leading whitespace stranded in the (no-bg) prefix.
+// the diff bg, extending to end of line via flex). Splitting at the
+// first bg-span — regardless of which colour or emph variant — keeps
+// the leading whitespace inside the body where the CSS bg covers it,
+// even when delta paints emph words with a different bg class than the
+// surrounding regular bg.
 //
-// Three shapes:
-//   - line has at least one bg span → split at its opening tag; prefix
-//     is the gutter, tail is everything from that span onwards
-//   - line has the line-number gutter but no body (blank added/removed
-//     line) → prefix is the whole line, tail is empty
-//   - line has no gutter at all (raw `git diff` line, or a blank line
-//     filled by neighbour-inheritance) → prefix is empty, tail is the
-//     whole line so the CSS bg covers it end-to-end
+// When the line has no bg span at all (raw `git diff`, or a blank line
+// with only the line-numbers gutter) the whole line goes into the
+// prefix and CSS bg fills the (empty) tail to the right edge.
 func splitDiffLine(line string) (prefix, tail string) {
 	if loc := bgSpanRE.FindStringIndex(line); loc != nil {
 		return line[:loc[0]], line[loc[0]:]
 	}
-	if gutterSepRE.MatchString(line) {
-		return line, ""
-	}
-	return "", line
+	return line, ""
 }
 
 // parentURL returns the URL pointing to the parent listing of urlPath,
@@ -1212,14 +1114,14 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	body.WriteString(`</nav>`)
 
 	for _, file := range files {
-		raw := fileDiff(env, repo, base, file, cols, fullContext)
-		if raw == "" {
+		canon, raw := fileDiff(env, repo, base, file, cols, fullContext)
+		if len(raw) == 0 {
 			continue
 		}
 		screen, _ := terminal.NewScreen(terminal.WithMaxSize(cols, 0))
-		screen.Write([]byte(raw))
+		screen.Write(raw)
 		heading, rest := extractHeading(screen.AsHTML())
-		rendered := wrapDiffLines(rest, file)
+		rendered := wrapDiffLines(rest, file, canon)
 
 		added, removed, binary := fileDiffStat(env, repo, base, file)
 
