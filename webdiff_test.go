@@ -101,6 +101,83 @@ func TestWrapDiffLines_DeltaCustomTheme(t *testing.T) {
 	}
 }
 
+// TestWrapDiffLines_NewFileBlankAddedLines covers a brand-new file
+// where every line is added and the body contains literal blank lines.
+// terminal-to-html drops the trailing \x1b[K bg cells when the body
+// has no characters, so empty added lines arrive at wrapDiffLines with
+// no `term-bgxN` class — classification has to fall through to the
+// gutter-position heuristic. This is exactly the case the friend's
+// "lines render with the wrong bg" screenshot was hitting.
+func TestWrapDiffLines_NewFileBlankAddedLines(t *testing.T) {
+	if _, err := exec.LookPath("delta"); err != nil {
+		t.Skip("delta not installed")
+	}
+	raw := "" +
+		"\x1b[1mdiff --git a/newfile.go b/newfile.go\x1b[m\n" +
+		"\x1b[1mnew file mode 100644\x1b[m\n" +
+		"\x1b[1mindex 0000000..1111111\x1b[m\n" +
+		"\x1b[1m--- /dev/null\x1b[m\n" +
+		"\x1b[1m+++ b/newfile.go\x1b[m\n" +
+		"\x1b[36m@@ -0,0 +1,6 @@\x1b[m\n" +
+		"\x1b[32m+package main\x1b[m\n" +
+		"\x1b[32m+\x1b[m\n" +
+		"\x1b[32m+import (\x1b[m\n" +
+		"\x1b[32m+\t\"foo\"\x1b[m\n" +
+		"\x1b[32m+\x1b[m\n" +
+		"\x1b[32m+)\x1b[m\n"
+	html := renderDiff(t, raw, "delta --no-gitconfig --line-numbers --width 80")
+	for _, want := range []string{
+		`line-add" data-file="f" data-new-line="1"`, // package main
+		`line-add" data-file="f" data-new-line="2"`, // blank line
+		`line-add" data-file="f" data-new-line="3"`, // import (
+		`line-add" data-file="f" data-new-line="5"`, // blank line inside import block
+		`line-add" data-file="f" data-new-line="6"`, // )
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("missing %q in output:\n%s", want, html)
+		}
+	}
+	// Hunk-header decoration `1│` inside the heading box must not be
+	// misread as a removed line.
+	if strings.Contains(html, `data-old-line="1"`) {
+		t.Errorf("hunk header decoration leaked into a line-del:\n%s", html)
+	}
+}
+
+// TestWrapDiffLines_EmphLineSplit covers a removed/added line that
+// delta paints with both a regular diff bg (bgx52/bgx22) AND an emph
+// bg (bgx124/bgx28) on the differing words. splitDiffLine must split
+// at the first bg span (which is always the "regular" bg covering the
+// leading whitespace) — not the most-frequent class — otherwise the
+// leading whitespace gets stranded in the (no-bg) gutter prefix and
+// renders as page background instead of regular diff red/green.
+func TestWrapDiffLines_EmphLineSplit(t *testing.T) {
+	if _, err := exec.LookPath("delta"); err != nil {
+		t.Skip("delta not installed")
+	}
+	raw := "" +
+		"\x1b[1mdiff --git a/f.go b/f.go\x1b[m\n" +
+		"\x1b[1mindex 0..1 100644\x1b[m\n" +
+		"\x1b[1m--- a/f.go\x1b[m\n" +
+		"\x1b[1m+++ b/f.go\x1b[m\n" +
+		"\x1b[36m@@ -1,1 +1,1 @@\x1b[m\n" +
+		"\x1b[31m-\t\t\t\tmaps.Copy(globalClaims, jwtClaims)\x1b[m\n" +
+		"\x1b[32m+\t\t\t\tmaps.Copy(globalClaims, globalJWTClaims)\x1b[m\n"
+	html := renderDiff(t, raw, "delta --no-gitconfig --line-numbers --width 120")
+	// The leading whitespace span (bgx52 / bgx22) MUST be inside
+	// line-tail so the diff bg covers it. If splitDiffLine got
+	// confused by the emph bg the leading whitespace would land in
+	// line-prefix instead, which has no diff bg.
+	for _, want := range []string{
+		`<span class="line-tail"><span class="term-bgx52">`,
+		`<span class="line-tail"><span class="term-fgx231 term-bgx22">`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("missing %q in output:\n%s", want, html)
+		}
+	}
+}
+
 func TestWrapDiffLines_DeltaNoLineNumbers(t *testing.T) {
 	if _, err := exec.LookPath("delta"); err != nil {
 		t.Skip("delta not installed")
