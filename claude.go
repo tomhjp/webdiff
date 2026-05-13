@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -144,6 +145,190 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/pane/input", handlePaneInput)
 	mux.HandleFunc("/api/pane/restart", handlePaneRestart)
 	mux.HandleFunc("/api/sessions/spinning", handleSessionsSpinning)
+	mux.HandleFunc("/api/worktrees/create", handleWorktreeCreate)
+	mux.HandleFunc("/api/worktrees/remove", handleWorktreeRemove)
+}
+
+// handleWorktreeCreate creates a managed worktree under worktreesRoot
+// for a named branch of a repo under rootDir. The on-disk name is
+// `<repoBasename>-<sanitizedLastBranchSegment>` — taking only the last
+// `/`-separated piece of the branch keeps the convention `tongue/foo`
+// → `foo` rather than `tongue-foo`, matching the user's local branch
+// naming. If the branch already exists locally git just checks it out
+// into the new worktree; otherwise it's created from HEAD via `-b`.
+func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Repo   string `json:"repo"`
+		Branch string `json:"branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	req.Repo = strings.TrimSpace(req.Repo)
+	req.Branch = strings.TrimSpace(req.Branch)
+	if req.Repo == "" || req.Branch == "" {
+		http.Error(w, "repo and branch required", http.StatusBadRequest)
+		return
+	}
+	ref, ok := resolveRepoRef("/repos/" + req.Repo + "/")
+	if !ok || ref.kind != "repos" || !isGitRepo(ref.abs) {
+		http.Error(w, "unknown repo", http.StatusNotFound)
+		return
+	}
+	leaf := req.Branch
+	if i := strings.LastIndex(leaf, "/"); i >= 0 {
+		leaf = leaf[i+1:]
+	}
+	leaf = sanitizeBranchSegment(leaf)
+	if leaf == "" {
+		http.Error(w, "branch leaf has no usable characters", http.StatusBadRequest)
+		return
+	}
+	name := ref.name + "-" + leaf
+	wtPath := filepath.Join(worktreesRoot, name)
+	if _, err := os.Stat(wtPath); err == nil {
+		http.Error(w, "worktree already exists: "+name, http.StatusConflict)
+		return
+	}
+
+	// Branch existence drives whether we pass -b or not. We check
+	// against refs/heads/<branch> exactly (rather than `rev-parse
+	// <branch>`) so ambiguity with a tag or remote-tracking ref doesn't
+	// silently steer us into the wrong checkout.
+	var addCmd *exec.Cmd
+	if _, err := exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/heads/"+req.Branch).Output(); err == nil {
+		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", wtPath, req.Branch)
+	} else {
+		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath)
+	}
+	if out, err := addCmd.CombinedOutput(); err != nil {
+		http.Error(w, "git worktree add failed: "+strings.TrimSpace(string(out)), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": "/worktrees/" + name + "/"})
+}
+
+// handleWorktreeRemove tears down a managed worktree: kills its tmux
+// session (if any), runs `git worktree remove --force` so uncommitted
+// throwaway work doesn't block teardown, and wipes the warm diff
+// cache for it. Falls back to RemoveAll for the dir if git left
+// anything behind (e.g. a manually-corrupted worktree).
+func handleWorktreeRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	ref, ok := resolveRepoRef("/worktrees/" + req.Name + "/")
+	if !ok || ref.kind != "worktrees" {
+		http.Error(w, "unknown worktree", http.StatusNotFound)
+		return
+	}
+	ctx := r.Context()
+
+	sessName := repoSessionName(ref.abs)
+	if sessionExists(ctx, sessName) {
+		if _, err := tmuxOut(ctx, "kill-session", "-t", sessName); err != nil {
+			http.Error(w, "tmux kill-session failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
+
+	// `git worktree remove` needs to run from inside the parent repo, not
+	// the worktree itself (the worktree's git common dir tells us where).
+	parent, ok := worktreeParentGitDir(ref.abs)
+	if ok {
+		removeCmd := exec.Command("git", "-C", parent, "worktree", "remove", "--force", ref.abs)
+		if out, err := removeCmd.CombinedOutput(); err != nil {
+			// Fall through to filesystem removal — the parent repo may
+			// already be gone, in which case the orphan worktree dir is
+			// all that's left.
+			_ = out
+		}
+	}
+	// Belt-and-braces: ensure both the worktree dir and its diff cache
+	// are gone regardless of how `git worktree remove` fared.
+	_ = os.RemoveAll(ref.abs)
+	_ = os.RemoveAll(filepath.Join(repoCacheRoot, ref.name))
+	// If the worktree was already broken before we touched it, git's
+	// remove command was skipped above and any registered worktree
+	// metadata in some parent repo's .git/worktrees/ is now stale.
+	// Prune every known repo so future `git worktree list` calls stay
+	// clean. Cheap — one tiny git call per repo.
+	pruneAllRepos()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// pruneAllRepos runs `git worktree prune` against every git repo
+// directly under rootDir. Called after a worktree removal to clear
+// stale `.git/worktrees/<name>` entries that the worktree's parent
+// repo may still be holding — typically for broken worktrees where
+// our preferred `git -C <parent> worktree remove` path didn't run.
+func pruneAllRepos() {
+	entries, err := os.ReadDir(rootDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		sub := filepath.Join(rootDir, e.Name())
+		if !isGitRepo(sub) {
+			continue
+		}
+		_ = exec.Command("git", "-C", sub, "worktree", "prune").Run()
+	}
+}
+
+// worktreeParentGitDir returns the parent repo's working tree path
+// for a managed worktree, derived from `git rev-parse
+// --git-common-dir`. The result is what we pass to `git -C` for
+// `worktree remove`. ok=false when git can't introspect the dir
+// (orphaned worktree) — the caller falls back to plain filesystem
+// removal.
+func worktreeParentGitDir(wtPath string) (string, bool) {
+	out, err := exec.Command("git", "-C", wtPath, "rev-parse", "--git-common-dir").Output()
+	if err != nil {
+		return "", false
+	}
+	common := strings.TrimSpace(string(out))
+	if common == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(wtPath, common)
+	}
+	return filepath.Dir(common), true
+}
+
+// sanitizeBranchSegment lowercases and strips a single branch leaf
+// down to characters safe in a directory name. Empty input or input
+// that strips down to nothing returns "" — the caller rejects that
+// case so we don't end up with `<repo>-` worktree dirs.
+func sanitizeBranchSegment(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // allowedPaneKeys is the whitelist for /api/pane/input's `key` field.
@@ -208,7 +393,7 @@ func handlePaneInput(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePaneRestart kills the webdiff-managed tmux session that owns
-// paneID. The client navigates to /_/agent<repoURL> after this returns,
+// paneID. The client navigates to /agent<refURL> after this returns,
 // which respawns a fresh session with a clean scrollback. Used by the
 // stream page's "restart session" button when accumulated history has
 // made the live tail sluggish to render.
@@ -270,13 +455,13 @@ func handleCommentsSend(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	// req.Repo is the URL pathname the browser was viewing (e.g.
-	// "/webdiff"). Translate it to the absolute filesystem path so the
-	// prompt names a location the agent can actually `cd` into. Fall
-	// back to the raw value if resolution fails — better a confusing
-	// prompt than no prompt.
+	// "/repos/webdiff" or "/worktrees/webdiff-feat-x"). Translate it to
+	// the absolute filesystem path so the prompt names a location the
+	// agent can actually `cd` into. Fall back to the raw value if
+	// resolution fails — better a confusing prompt than no prompt.
 	repoPath := req.Repo
-	if abs, ok := resolvePath(req.Repo); ok {
-		repoPath = abs
+	if ref, ok := resolveRepoRef(req.Repo); ok {
+		repoPath = ref.abs
 	}
 	prompt := formatPrompt(repoPath, req.Comments)
 
@@ -574,31 +759,25 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 	return Pane{}, fmt.Errorf("%s didn't start within 15 s", agentName)
 }
 
-// handleStartSession ensures the repo's webdiff-<base> tmux session
-// exists, then 303-redirects to /_/stream<repoUrl>. Mounted at
-// /_/agent/ as a prefix handler so the URL suffix is the repo's diff
-// URL path (e.g. /_/agent/foo/ → /foo/), mirroring /_/stream/. The
+// handleStartSession ensures the ref's webdiff-<base> tmux session
+// exists, then 303-redirects to /stream<refUrl>. Mounted at /agent/
+// as a prefix handler so the URL suffix is the ref's diff URL path
+// (/repos/<name>/ or /worktrees/<name>/), mirroring /stream/. The
 // diff page's agent header button uses this so a single button works
 // whether the session is already running (fast lookup) or needs to
 // be spawned (~5 s for the bash → agent exec to settle).
 func handleStartSession(w http.ResponseWriter, r *http.Request) {
-	repoURL := strings.TrimPrefix(r.URL.Path, "/_/agent")
-	if repoURL == "" {
-		repoURL = "/"
-	}
-	if !strings.HasSuffix(repoURL, "/") {
-		repoURL += "/"
-	}
-	abs, ok := resolvePath(repoURL)
+	repoURL := strings.TrimPrefix(r.URL.Path, "/agent")
+	ref, ok := resolveRepoRef(repoURL)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	if _, err := ensureRepoSession(r.Context(), abs); err != nil {
+	if _, err := ensureRepoSession(r.Context(), ref.abs); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	http.Redirect(w, r, "/_/stream"+repoURL, http.StatusSeeOther)
+	http.Redirect(w, r, "/stream"+ref.url, http.StatusSeeOther)
 }
 
 // repoStreamPane returns the pane id and session label for the repo's

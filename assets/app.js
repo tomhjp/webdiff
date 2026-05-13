@@ -198,12 +198,21 @@
     });
     var msgInput=document.getElementById('pane-msg');
     var sendMsgBtn=document.getElementById('pane-send');
+    // resizeMsg keeps the textarea sized to its content up to the CSS
+    // max-height (120px). We toggle overflow-y here rather than leaving it
+    // `auto` in CSS because desktop browsers paint a scrollbar gutter for
+    // an empty single-row textarea otherwise.
+    function resizeMsg(){
+      msgInput.style.height='auto';
+      msgInput.style.height=msgInput.scrollHeight+'px';
+      msgInput.style.overflowY=msgInput.scrollHeight>120?'auto':'hidden';
+    }
     function sendMessage(){
       var t=msgInput.value;
       if(!t)return;
       postInput({text:t}).then(function(){
         msgInput.value='';
-        msgInput.style.height='auto';
+        resizeMsg();
       });
     }
     if(sendMsgBtn)sendMsgBtn.addEventListener('click',sendMessage);
@@ -211,15 +220,12 @@
       msgInput.addEventListener('keydown',function(ev){
         if(ev.key==='Enter'&&!ev.shiftKey){ev.preventDefault();sendMessage()}
       });
-      msgInput.addEventListener('input',function(){
-        msgInput.style.height='auto';
-        msgInput.style.height=msgInput.scrollHeight+'px';
-      });
+      msgInput.addEventListener('input',resizeMsg);
     }
     // Restart wires through to /api/pane/restart, which kills the
     // current tmux session. After the kill we navigate to the same
-    // /_/agent<repoURL> the diff page's agent button hits — that
-    // handler spawns a fresh session and 303s back to the stream view.
+    // /agent<refURL> the diff page's agent button hits — that handler
+    // spawns a fresh session and 303s back to the stream view.
     var restartBtn=document.getElementById('restart-session');
     if(restartBtn){
       restartBtn.addEventListener('click',function(){
@@ -232,7 +238,7 @@
           body:JSON.stringify({paneID:paneID})
         }).then(function(r){
           if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
-          window.location.href='/_/agent'+repoURL;
+          window.location.href='/agent'+repoURL;
         }).catch(function(e){
           restartBtn.disabled=false;
           window.alert('restart failed: '+e.message);
@@ -315,6 +321,79 @@
       if(ctxBtn.dataset.full==='true')u.searchParams.delete('context');
       else u.searchParams.set('context','full');
       location.href=u.toString();
+    });
+  }
+
+  // Worktree create — repo diff page only. Clicking "+ worktree"
+  // reveals an inline form; submitting POSTs to /api/worktrees/create
+  // and navigates to the new worktree's diff page. The form stays
+  // visually attached to the page heading rather than floating as a
+  // modal so the iOS soft keyboard doesn't reflow the page out from
+  // under the textbox.
+  var wtNewBtn=document.getElementById('wt-new-btn');
+  var wtRow=document.getElementById('wt-create-row');
+  var wtBranch=document.getElementById('wt-branch');
+  var wtSubmit=document.getElementById('wt-create-submit');
+  var wtCancel=document.getElementById('wt-create-cancel');
+  if(wtNewBtn&&wtRow){
+    function openWt(){
+      wtRow.hidden=false;
+      if(wtBranch){wtBranch.focus();wtBranch.select()}
+    }
+    function closeWt(){wtRow.hidden=true;if(wtBranch)wtBranch.value=''}
+    wtNewBtn.addEventListener('click',function(){wtRow.hidden?openWt():closeWt()});
+    if(wtCancel)wtCancel.addEventListener('click',closeWt);
+    function submitWt(){
+      var branch=(wtBranch&&wtBranch.value||'').trim();
+      var repo=wtRow.dataset.repo;
+      if(!branch||!repo)return;
+      if(wtSubmit){wtSubmit.disabled=true;wtSubmit.textContent='creating…'}
+      fetch('/api/worktrees/create',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({repo:repo,branch:branch})
+      }).then(function(r){
+        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+        return r.json();
+      }).then(function(j){
+        if(j&&j.url)location.href=j.url;
+      }).catch(function(e){
+        if(wtSubmit){wtSubmit.disabled=false;wtSubmit.textContent='create'}
+        window.alert('create failed: '+e.message);
+      });
+    }
+    if(wtSubmit)wtSubmit.addEventListener('click',submitWt);
+    if(wtBranch){
+      wtBranch.addEventListener('keydown',function(ev){
+        if(ev.key==='Enter'){ev.preventDefault();submitWt()}
+        else if(ev.key==='Escape'){ev.preventDefault();closeWt()}
+      });
+    }
+  }
+
+  // Worktree remove — worktree diff page only. Confirm-then-POST; the
+  // server kills the tmux session and tears down the dir. On success
+  // we navigate home, where the worktree is now gone from the listing.
+  var wtRemoveBtn=document.getElementById('wt-remove-btn');
+  if(wtRemoveBtn){
+    wtRemoveBtn.addEventListener('click',function(){
+      var name=wtRemoveBtn.dataset.name;
+      if(!name)return;
+      if(!window.confirm('Remove worktree "'+name+'"? Tmux session and uncommitted changes will be lost.'))return;
+      wtRemoveBtn.disabled=true;
+      wtRemoveBtn.textContent='removing…';
+      fetch('/api/worktrees/remove',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:name})
+      }).then(function(r){
+        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+        location.href='/';
+      }).catch(function(e){
+        wtRemoveBtn.disabled=false;
+        wtRemoveBtn.textContent='remove';
+        window.alert('remove failed: '+e.message);
+      });
     });
   }
 
@@ -659,12 +738,12 @@
         clearComments();
         document.querySelectorAll('.comment-bubble').forEach(function(b){b.remove()});
         refreshSendBtn();
-        // Each repo maps 1-1 to its tmux pane, so the stream URL is
-        // just /_/stream<repoPath> — no paneID or label to thread
+        // Each ref maps 1-1 to its tmux pane, so the stream URL is
+        // just /stream<refPath> — no paneID or label to thread
         // through.
         var path=window.location.pathname;
         if(path.slice(-1)!=='/')path+='/';
-        window.location.href='/_/stream'+path;
+        window.location.href='/stream'+path;
         return;
       }
       flashStatus(res.body.error||('error '+res.status),'err');
@@ -805,12 +884,13 @@
   if(sendBtn)sendBtn.addEventListener('click',openCommentsModal);
 })();
 
-// Listing page: per-repo branch + diff stats are not rendered server-
+// Home page: per-repo branch + diff stats are not rendered server-
 // side so the page itself returns instantly. Each <a class="dir-row">
-// for a git repo carries a `data-stats-url` pointing at /_/repo-stats;
-// we fetch each in parallel and fill the empty .dir-stats / .dir-branch
-// spans as responses arrive. Failures are silent — the row just stays
-// blank, matching how a 0-files repo looked before.
+// for a git repo or worktree carries a `data-stats-url` pointing at
+// /stats/<kind>/<name>/; we fetch each in parallel and fill the empty
+// .dir-stats / .dir-branch spans as responses arrive. Failures are
+// silent — the row just stays blank, matching how a 0-files ref
+// looked before.
 (function(){
   var rows=document.querySelectorAll('.dir-row[data-stats-url]');
   if(!rows.length)return;

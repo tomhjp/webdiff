@@ -36,7 +36,7 @@ var appJS string
 // pageTmpl is the HTML wrapper for every rendered view. Parsed once at
 // init time so a malformed template panics on startup rather than on
 // the first request. The CSS blocks are still inlined (each from its
-// own `<style>` tag), but the JavaScript lives at /_/app.js so we can
+// own `<style>` tag), but the JavaScript lives at /app.js so we can
 // keep `script-src` strict.
 var pageTmpl = template.Must(template.New("page").Parse(pageTmplSrc))
 
@@ -66,11 +66,18 @@ var (
 	agentName = "claude"
 )
 
-// cacheRoot is where per-repo warm git index/object caches live, e.g.
-// ~/.cache/webdiff. Reused across requests and process restarts so the
-// stat cache built by the first `git add -A` is available for subsequent
-// page loads.
-var cacheRoot string
+// cacheRoot is the top-level webdiff cache directory (e.g.
+// ~/.cache/webdiff). repoCacheRoot and worktreesRoot are its two
+// children, both webdiff-owned: per-repo warm git index/object caches
+// in the first, managed worktree checkouts in the second. Splitting
+// the two means a worktree's checkout never lives under its own
+// diff-cache (or vice versa), and the on-disk layout mirrors the home
+// page's "repos / worktrees" sections.
+var (
+	cacheRoot     string
+	repoCacheRoot string
+	worktreesRoot string
+)
 
 // repoCache holds the warm-path state for one repo: a per-repo mutex (so
 // concurrent requests don't corrupt the shared index file) and the last
@@ -86,12 +93,17 @@ var (
 	caches   = map[string]*repoCache{}
 )
 
+// getRepoCache returns the warm cache for repo, lazily creating its
+// in-memory entry on first access. The on-disk cache dir is
+// `<repoCacheRoot>/<basename>` — a flat layout where collisions between
+// two repos with the same basename across different rootDirs self-heal
+// via the `head != c.head` check in diffEnv.
 func getRepoCache(repo string) *repoCache {
 	cachesMu.Lock()
 	defer cachesMu.Unlock()
 	c, ok := caches[repo]
 	if !ok {
-		c = &repoCache{dir: filepath.Join(cacheRoot, strings.TrimPrefix(repo, string(filepath.Separator)))}
+		c = &repoCache{dir: filepath.Join(repoCacheRoot, filepath.Base(repo))}
 		caches[repo] = c
 	}
 	return c
@@ -103,24 +115,58 @@ func isGitRepo(dir string) bool {
 	return err == nil
 }
 
-// resolvePath turns a URL path into an absolute directory under rootDir, or
-// returns ok=false if it would escape the root or doesn't exist.
-func resolvePath(urlPath string) (string, bool) {
-	rel := strings.Trim(urlPath, "/")
-	target := filepath.Clean(filepath.Join(rootDir, rel))
-	rootAbs, _ := filepath.Abs(rootDir)
-	abs, err := filepath.Abs(target)
-	if err != nil {
-		return "", false
+// repoRef names one diffable target — either a regular repo under
+// rootDir or a managed worktree under worktreesRoot. The two are
+// disjoint URL namespaces (/repos/<name>/, /worktrees/<name>/) so the
+// kind field doubles as the URL's first segment.
+type repoRef struct {
+	abs  string // absolute filesystem path
+	kind string // "repos" or "worktrees"
+	name string // basename of abs, doubles as URL slug
+	url  string // canonical URL with trailing slash, e.g. "/repos/foo/"
+}
+
+// resolveRepoRef parses a URL path like "/repos/foo/" or
+// "/worktrees/foo-bar/" and resolves it to a repoRef. The caller must
+// have already stripped any handler-specific prefix (e.g. "/stream",
+// "/agent") so the remaining path starts with the kind segment. Returns
+// ok=false for unknown kinds, missing names, traversal attempts, or
+// non-existent dirs.
+func resolveRepoRef(urlPath string) (repoRef, bool) {
+	trimmed := strings.Trim(urlPath, "/")
+	parts := strings.SplitN(trimmed, "/", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return repoRef{}, false
 	}
-	if abs != rootAbs && !strings.HasPrefix(abs, rootAbs+string(filepath.Separator)) {
-		return "", false
+	if len(parts) == 3 && parts[2] != "" {
+		return repoRef{}, false
+	}
+	kind, name := parts[0], parts[1]
+	if strings.HasPrefix(name, ".") || strings.ContainsAny(name, "/\\") {
+		return repoRef{}, false
+	}
+	var base string
+	switch kind {
+	case "repos":
+		base = rootDir
+	case "worktrees":
+		base = worktreesRoot
+	default:
+		return repoRef{}, false
+	}
+	baseAbs, err := filepath.Abs(base)
+	if err != nil {
+		return repoRef{}, false
+	}
+	abs := filepath.Join(baseAbs, name)
+	if abs != filepath.Clean(abs) || filepath.Dir(abs) != baseAbs {
+		return repoRef{}, false
 	}
 	info, err := os.Stat(abs)
 	if err != nil || !info.IsDir() {
-		return "", false
+		return repoRef{}, false
 	}
-	return abs, true
+	return repoRef{abs: abs, kind: kind, name: name, url: "/" + kind + "/" + name + "/"}, true
 }
 
 // diffEnv returns an environment pointing at a warm, per-repo index and
@@ -704,43 +750,30 @@ func splitDiffLine(line string) (prefix, tail string) {
 	return line, ""
 }
 
-// parentURL returns the URL pointing to the parent listing of urlPath,
-// or "" if urlPath is already at root.
-func parentURL(urlPath string) string {
-	trimmed := strings.Trim(urlPath, "/")
-	if trimmed == "" {
-		return ""
-	}
-	parts := strings.Split(trimmed, "/")
-	if len(parts) <= 1 {
-		return "/"
-	}
-	return "/" + strings.Join(parts[:len(parts)-1], "/") + "/"
-}
-
-// writeWorkdir renders the path line in the header, making it a back-link to
-// the parent listing when one exists.
-func writeWorkdir(b *strings.Builder, displayPath, urlPath string) {
-	parent := parentURL(urlPath)
-	if parent == "" {
-		fmt.Fprintf(b, `<span class="workdir">%s</span>`, template.HTMLEscapeString(displayPath))
-		return
-	}
-	fmt.Fprintf(b, `<a class="workdir workdir-back" href="%s" title="back to listing">%s</a>`,
-		template.HTMLEscapeString(parent), template.HTMLEscapeString(displayPath))
-}
-
-func handler(w http.ResponseWriter, r *http.Request) {
-	target, ok := resolvePath(r.URL.Path)
-	if !ok {
+// renderHomeHandler is the root-only fallback. Anything other than "/"
+// 404s — there is no nested directory navigation, just the two named
+// URL namespaces (/repos/, /worktrees/) and the home page's three
+// sections (repos, worktrees, tmux).
+func renderHomeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
-	if isGitRepo(target) {
-		renderRepo(w, r, target)
-	} else {
-		renderListing(w, r, target)
+	renderHome(w, r)
+}
+
+// renderRepoDiff is the shared handler for /repos/<name>/ and
+// /worktrees/<name>/. Both resolve to a repoRef and dispatch to
+// renderRepo; the kind field on the ref is what later distinguishes
+// "add a worktree" (on a repo) from "remove this worktree" (on a
+// worktree) in the diff page chrome.
+func renderRepoDiff(w http.ResponseWriter, r *http.Request) {
+	ref, ok := resolveRepoRef(r.URL.Path)
+	if !ok || !isGitRepo(ref.abs) {
+		http.NotFound(w, r)
+		return
 	}
+	renderRepo(w, r, ref)
 }
 
 // repoSummary is the per-repo info shown on a directory listing.
@@ -767,20 +800,17 @@ func summarizeRepo(repo, mode string) repoSummary {
 	}
 }
 
-// renderListing renders a directory of subdirectories. Per-repo branch
-// and diff stats are NOT computed server-side — they're filled in by
-// the client via /_/repo-stats so the page itself renders instantly
-// even when one repo's `git diff` is slow. The diff page (renderRepo)
-// keeps blocking on its own data; this lazy-loading is listing-only.
-func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
-	entries, err := os.ReadDir(dir)
+// renderHome renders the root landing page. It has up to three
+// sections: repos (git subdirs of rootDir), worktrees (managed
+// checkouts under worktreesRoot), and tmux sessions (live *-wd panes).
+// Per-repo branch and diff stats are NOT computed server-side — they
+// load via /stats/repos/<name>/ (or /stats/worktrees/...) so the page
+// itself renders instantly even when one repo's `git diff` is slow.
+func renderHome(w http.ResponseWriter, r *http.Request) {
+	entries, err := os.ReadDir(rootDir)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	urlPath := r.URL.Path
-	if !strings.HasSuffix(urlPath, "/") {
-		urlPath += "/"
 	}
 
 	mode := r.URL.Query().Get("mode")
@@ -789,22 +819,21 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 	}
 	modeQS := modeQuery(mode)
 
-	type row struct {
-		name  string
-		isGit bool
-	}
-	var rows []row
+	var repoNames []string
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		rows = append(rows, row{name: e.Name(), isGit: isGitRepo(filepath.Join(dir, e.Name()))})
+		if !isGitRepo(filepath.Join(rootDir, e.Name())) {
+			continue
+		}
+		repoNames = append(repoNames, e.Name())
 	}
 
 	var body strings.Builder
 	body.WriteString(`<div class="header"><div class="header-left">`)
-	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(dir)))
-	writeWorkdir(&body, dir, urlPath)
+	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(rootDir)))
+	fmt.Fprintf(&body, `<span class="workdir">%s</span>`, template.HTMLEscapeString(rootDir))
 	body.WriteString(`</div><div class="header-right">`)
 	body.WriteString(`<select id="diff-mode-select">`)
 	for _, opt := range []struct{ val, label string }{
@@ -822,56 +851,70 @@ func renderListing(w http.ResponseWriter, r *http.Request, dir string) {
 
 	body.WriteString(`<h2 class="section-title">repos</h2>`)
 	body.WriteString(`<div class="dir-list">`)
-	for _, r := range rows {
-		cls := "dir-row"
-		if !r.isGit {
-			cls += " dir-folder"
-		}
-		// Git rows leave dir-stats and dir-branch empty server-side; the
-		// `data-stats-url` attribute is the cue for app.js to fetch and
-		// fill them. Non-git folders have no stats to load, so they
-		// render fully here. The empty spans are present from the start
-		// so layout doesn't shift when stats arrive.
-		statsAttr := ""
-		if r.isGit {
-			statsAttr = fmt.Sprintf(` data-stats-url="%s"`,
-				template.HTMLEscapeString("/_/repo-stats"+urlPath+r.name+"/"+modeQS))
-		}
-		fmt.Fprintf(&body, `<a class="%s" href="%s"%s><span class="dir-name">%s</span>`,
-			cls, template.HTMLEscapeString(urlPath+r.name+"/"+modeQS),
-			statsAttr,
-			template.HTMLEscapeString(r.name))
-		if r.isGit {
-			body.WriteString(`<span class="dir-stats"></span><span class="dir-branch"></span>`)
-		} else {
-			body.WriteString(`<span class="dir-branch dir-folder-tag">folder</span>`)
-		}
-		body.WriteString(`</a>`)
+	for _, name := range repoNames {
+		writeDirRow(&body, "repos", name, "", modeQS, false)
 	}
-	if len(rows) == 0 {
-		body.WriteString(`<p class="empty">No subdirectories here.</p>`)
+	if len(repoNames) == 0 {
+		body.WriteString(`<p class="empty">No git repos under this directory.</p>`)
 	}
 	body.WriteString(`</div>`)
 
-	// Only the actual root listing gets the tmux section — deeper
-	// non-git folders are project subdirectories where surfacing
-	// host-wide tmux state would be noise.
-	if dir == rootDir {
-		writeTmuxSection(&body, r.Context())
+	worktrees := listManagedWorktrees()
+	if len(worktrees) > 0 {
+		body.WriteString(`<h2 class="section-title">worktrees</h2>`)
+		body.WriteString(`<div class="dir-list">`)
+		for _, wt := range worktrees {
+			writeDirRow(&body, "worktrees", wt.Name, wt.Repo, modeQS, wt.Broken)
+		}
+		body.WriteString(`</div>`)
 	}
+
+	writeTmuxSection(&body, r.Context())
 
 	writePage(w, body.String())
 }
 
-// handleRepoStats returns JSON {branch, files, ins, del} for one repo,
-// computed via summarizeRepo. The path to the repo comes from the URL
-// path after /_/repo-stats (matching the listing routing), and the
-// diff base is selected via ?mode=. This is the lazy-load endpoint
-// behind the listing's per-row stats; the diff page does not use it.
+// writeDirRow emits one <a class="dir-row"> for a repo or worktree on
+// the home page. Stats come in via the data-stats-url that app.js
+// fetches per row. parentRepo is shown in the right-side metadata only
+// for worktrees (where it disambiguates which repo a branch belongs
+// to); broken worktrees get the dir-broken class so they're greyed
+// out but still clickable through to the diff page where the remove
+// button lives.
+func writeDirRow(b *strings.Builder, kind, name, parentRepo, modeQS string, broken bool) {
+	url := "/" + kind + "/" + name + "/" + modeQS
+	statsURL := "/stats/" + kind + "/" + name + "/" + modeQS
+	cls := "dir-row"
+	if broken {
+		cls += " dir-broken"
+	}
+	fmt.Fprintf(b, `<a class="%s" href="%s" data-stats-url="%s"><span class="dir-name">%s</span>`,
+		cls,
+		template.HTMLEscapeString(url),
+		template.HTMLEscapeString(statsURL),
+		template.HTMLEscapeString(name))
+	b.WriteString(`<span class="dir-stats"></span>`)
+	if parentRepo != "" {
+		fmt.Fprintf(b, `<span class="dir-parent">%s</span>`, template.HTMLEscapeString(parentRepo))
+	}
+	if broken {
+		b.WriteString(`<span class="dir-branch dir-folder-tag">broken</span>`)
+	} else {
+		b.WriteString(`<span class="dir-branch"></span>`)
+	}
+	b.WriteString(`</a>`)
+}
+
+// handleRepoStats returns JSON {branch, files, ins, del} for one repo
+// or worktree, computed via summarizeRepo. Mounted at /stats/ so the
+// URL after the prefix is the same /repos/<name>/ or /worktrees/<name>/
+// path used by the diff page itself; resolveRepoRef does the lookup.
+// This is the lazy-load endpoint behind the home page's per-row stats;
+// the diff page does not use it.
 func handleRepoStats(w http.ResponseWriter, r *http.Request) {
-	repoPath := strings.TrimPrefix(r.URL.Path, "/_/repo-stats")
-	target, ok := resolvePath(repoPath)
-	if !ok || !isGitRepo(target) {
+	repoPath := strings.TrimPrefix(r.URL.Path, "/stats")
+	ref, ok := resolveRepoRef(repoPath)
+	if !ok || !isGitRepo(ref.abs) {
 		http.NotFound(w, r)
 		return
 	}
@@ -879,7 +922,7 @@ func handleRepoStats(w http.ResponseWriter, r *http.Request) {
 	if mode != "working" && mode != "branch" && mode != "remote" {
 		mode = "working"
 	}
-	s := summarizeRepo(target, mode)
+	s := summarizeRepo(ref.abs, mode)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		Branch string `json:"branch"`
@@ -887,6 +930,71 @@ func handleRepoStats(w http.ResponseWriter, r *http.Request) {
 		Ins    int    `json:"ins"`
 		Del    int    `json:"del"`
 	}{s.branch, s.files, s.ins, s.del})
+}
+
+// worktreeEntry describes one managed worktree as rendered on the home
+// page. Repo is the parent repo's basename for display (e.g. "webdiff")
+// — purely informational, not used for resolution. Broken means we
+// couldn't talk to git for it; the entry is still listed so it can be
+// removed via the worktree's own diff page.
+type worktreeEntry struct {
+	Name   string
+	Path   string
+	Repo   string
+	Broken bool
+}
+
+// listManagedWorktrees scans worktreesRoot for direct subdirectories
+// and returns one entry per managed worktree. The result is sorted by
+// name. Dotfiles and non-directories are skipped. Healthy worktrees
+// have a parent repo we can name; broken ones fall back to "" and
+// render greyed out on the home page.
+func listManagedWorktrees() []worktreeEntry {
+	if worktreesRoot == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(worktreesRoot)
+	if err != nil {
+		return nil
+	}
+	var out []worktreeEntry
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		path := filepath.Join(worktreesRoot, e.Name())
+		repo, ok := worktreeParentRepo(path)
+		out = append(out, worktreeEntry{
+			Name:   e.Name(),
+			Path:   path,
+			Repo:   repo,
+			Broken: !ok,
+		})
+	}
+	return out
+}
+
+// worktreeParentRepo returns the basename of the repo a worktree
+// belongs to, derived from `git rev-parse --git-common-dir`. That
+// command prints the absolute path to the parent repo's .git
+// directory; its parent is the repo's top-level. ok=false means git
+// couldn't make sense of the directory — typically because the parent
+// repo has been deleted, leaving the worktree's gitfile dangling.
+func worktreeParentRepo(wtPath string) (string, bool) {
+	out, err := exec.Command("git", "-C", wtPath, "rev-parse", "--git-common-dir").Output()
+	if err != nil {
+		return "", false
+	}
+	common := strings.TrimSpace(string(out))
+	if common == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(wtPath, common)
+	}
+	// --git-common-dir points at <parentRepo>/.git; the parent of that
+	// is the repo's top-level dir whose basename we want to display.
+	return filepath.Base(filepath.Dir(common)), true
 }
 
 // writeTmuxSection appends a "tmux sessions" block to the root listing
@@ -909,10 +1017,10 @@ func writeTmuxSection(b *strings.Builder, ctx context.Context) {
 		if p.Title != "" && p.Title != p.Command {
 			desc += " · " + p.Title
 		}
-		// /_/pane is the arbitrary-pane viewer; the handler looks up the
+		// /pane is the arbitrary-pane viewer; the handler looks up the
 		// session name from the paneID at request time so we don't need
 		// to pass it as a query param.
-		href := "/_/pane?paneID=" + url.QueryEscape(p.PaneID)
+		href := "/pane?paneID=" + url.QueryEscape(p.PaneID)
 		fmt.Fprintf(b, `<a class="dir-row tmux-row" href="%s" data-session="%s"><span class="dir-name">%s</span><span class="dir-stats">%s</span><span class="dir-branch">%s</span></a>`,
 			template.HTMLEscapeString(href),
 			template.HTMLEscapeString(p.Session),
@@ -945,8 +1053,12 @@ func formatLastUsed(ts int64, now time.Time) string {
 	}
 }
 
-// renderRepo renders the diff view for a single git repo.
-func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
+// renderRepo renders the diff view for one repoRef (a regular repo or
+// a managed worktree). The kind on the ref drives the small chrome
+// differences between the two: only repos get the "+ worktree"
+// button; only worktrees get the "remove" button.
+func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
+	repo := ref.abs
 	_, hasUpstream := upstreamRef(repo)
 
 	// The chosen diff mode lives in the URL (?mode=working|branch|remote).
@@ -980,16 +1092,13 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 		fmt.Sscanf(c, "%d", &cols)
 	}
 
-	urlPath := r.URL.Path
-	if !strings.HasSuffix(urlPath, "/") {
-		urlPath += "/"
-	}
+	urlPath := ref.url
 	modeQS := modeQuery(mode)
 
 	// Agent header button — always visible. When the repo's
 	// webdiff-<base> session is already running it short-circuits
-	// straight to /_/stream<repoUrl>; otherwise it points at
-	// /_/agent<repoUrl>, which spawns the session and 303-redirects to
+	// straight to /stream<repoUrl>; otherwise it points at
+	// /agent<repoUrl>, which spawns the session and 303-redirects to
 	// the same place. The dashed-border "to-be-created" treatment (via
 	// add-comment-btn) signals the click will spend ~5 s spawning a new
 	// pane rather than instantly attaching to a live one. Both URLs are
@@ -998,11 +1107,11 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	paneID, _ := repoStreamPane(r.Context(), repo)
 	var agentHref, agentClass, agentTitle string
 	if paneID != "" {
-		agentHref = "/_/stream" + urlPath
+		agentHref = "/stream" + urlPath
 		agentClass = "toggle"
 		agentTitle = "open the running " + agentName + " session for this repo"
 	} else {
-		agentHref = "/_/agent" + urlPath
+		agentHref = "/agent" + urlPath
 		agentClass = "toggle add-comment-btn"
 		agentTitle = "start a " + agentName + " session for this repo"
 	}
@@ -1052,6 +1161,14 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 	fmt.Fprintf(&body, `<a class="toggle" href="/%s">home</a>`, modeQS)
 	fmt.Fprintf(&body, `<a class="%s" href="%s" title="%s">%s</a>`,
 		agentClass, template.HTMLEscapeString(agentHref), template.HTMLEscapeString(agentTitle), template.HTMLEscapeString(agentName))
+	switch ref.kind {
+	case "repos":
+		fmt.Fprintf(&body, `<button class="toggle add-comment-btn" type="button" id="wt-new-btn" data-repo="%s" title="create a worktree of this repo">+ worktree</button>`,
+			template.HTMLEscapeString(ref.name))
+	case "worktrees":
+		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
+			template.HTMLEscapeString(ref.name))
+	}
 	body.WriteString(`</div>`)
 
 	body.WriteString(`<div class="header-buttons">`)
@@ -1080,7 +1197,22 @@ func renderRepo(w http.ResponseWriter, r *http.Request, repo string) {
 		fmt.Fprintf(&body, `<button class="toggle" type="button" id="toggle-context" data-full="%t">%s</button>`,
 			fullContext, ctxLabel)
 	}
-	body.WriteString(`</div></div></div>`)
+	body.WriteString(`</div></div>`)
+
+	// Worktree create form — hidden until "+ worktree" is clicked.
+	// Inline rather than modal so it works the same on mobile Safari
+	// as on desktop, and stays visually attached to the button that
+	// reveals it. data-repo on the form picks up which repo the
+	// worktree-add call should target.
+	if ref.kind == "repos" {
+		fmt.Fprintf(&body, `<div class="page-heading-row wt-create-row" id="wt-create-row" data-repo="%s" hidden>`,
+			template.HTMLEscapeString(ref.name))
+		body.WriteString(`<input type="text" id="wt-branch" class="wt-branch-input" placeholder="branch name (e.g. tongue/foo)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">`)
+		body.WriteString(`<button type="button" class="toggle send-btn" id="wt-create-submit">create</button>`)
+		body.WriteString(`<button type="button" class="toggle" id="wt-create-cancel">cancel</button>`)
+		body.WriteString(`</div>`)
+	}
+	body.WriteString(`</div>`)
 
 	// send-comments is always visible (no `hidden`) so the modal — which
 	// owns the "+ overall review comment" composer in the new layout —
@@ -1177,7 +1309,7 @@ func writePage(w http.ResponseWriter, body string) {
 }
 
 // serveAppJS hands out the embedded application JavaScript at
-// /_/app.js. Cached briefly client-side — the source only changes when
+// /app.js. Cached briefly client-side — the source only changes when
 // the binary is rebuilt and the user reloads.
 func serveAppJS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
@@ -1185,40 +1317,48 @@ func serveAppJS(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(appJS))
 }
 
-// paneRepoURL derives the diff page URL from a tmux session label of the
-// form "<basename>-wd" or "<basename>-wd:<window>" by scanning rootDir's
-// subdirectories for the one whose repoSessionName matches (which also
-// handles repos with "." or ":" in their name). Returns "" when the
-// label doesn't resolve to a known repo.
+// paneRepoURL derives the diff page URL from a tmux session label of
+// the form "<basename>-wd" or "<basename>-wd:<window>" by checking
+// rootDir's subdirs and worktreesRoot's entries for the one whose
+// repoSessionName matches (which also handles names containing "." or
+// ":"). Returns "" when the label doesn't resolve to anything
+// webdiff is currently managing.
 func paneRepoURL(label string) string {
 	session := strings.SplitN(label, ":", 2)[0]
 	if !strings.HasSuffix(session, "-wd") {
 		return ""
 	}
-	entries, err := os.ReadDir(rootDir)
-	if err != nil {
-		return ""
-	}
-	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+	for _, scope := range []struct {
+		kind, root string
+	}{
+		{"repos", rootDir},
+		{"worktrees", worktreesRoot},
+	} {
+		entries, err := os.ReadDir(scope.root)
+		if err != nil {
 			continue
 		}
-		sub := filepath.Join(rootDir, e.Name())
-		if isGitRepo(sub) && repoSessionName(sub) == session {
-			return "/" + e.Name() + "/"
+		for _, e := range entries {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			sub := filepath.Join(scope.root, e.Name())
+			if isGitRepo(sub) && repoSessionName(sub) == session {
+				return "/" + scope.kind + "/" + e.Name() + "/"
+			}
 		}
 	}
 	return ""
 }
 
 // renderRepoStreamPage renders the live tail of the tmux pane paired
-// with one repo. Mounted at /_/stream/ as a prefix handler so the URL
-// suffix is the repo's diff URL path: /_/stream/ → root repo,
-// /_/stream/foo/ → /foo/. Each repo maps 1-1 to its `<base>-wd` tmux
-// session, so the server resolves the paneID from the repo path
-// instead of accepting it as a query param. If the session hasn't been
-// spawned yet the request 303-redirects to /_/agent<repoUrl>, which
-// spawns it and bounces back here.
+// with one repo or worktree. Mounted at /stream/ as a prefix handler
+// so the URL suffix is the diff URL (/repos/<name>/ or
+// /worktrees/<name>/) — each ref maps 1-1 to its `<base>-wd` tmux
+// session, so the server resolves the paneID from the ref instead of
+// accepting it as a query param. If the session hasn't been spawned
+// yet the request 303-redirects to /agent<refUrl>, which spawns it
+// and bounces back here.
 //
 // Layout: sticky page heading with nav links, streaming term tail in
 // the middle, and a bottom-fixed toolbar with esc / ↑ / ↓ / enter keys
@@ -1226,34 +1366,28 @@ func paneRepoURL(label string) string {
 // behaviour live in app.js; this handler just serves the chrome and
 // the empty container the JS fills in.
 func renderRepoStreamPage(w http.ResponseWriter, r *http.Request) {
-	repoURL := strings.TrimPrefix(r.URL.Path, "/_/stream")
-	if repoURL == "" {
-		repoURL = "/"
-	}
-	if !strings.HasSuffix(repoURL, "/") {
-		repoURL += "/"
-	}
-	abs, ok := resolvePath(repoURL)
-	if !ok || !isGitRepo(abs) {
+	repoURL := strings.TrimPrefix(r.URL.Path, "/stream")
+	ref, ok := resolveRepoRef(repoURL)
+	if !ok || !isGitRepo(ref.abs) {
 		http.NotFound(w, r)
 		return
 	}
-	paneID, _ := repoStreamPane(r.Context(), abs)
+	paneID, _ := repoStreamPane(r.Context(), ref.abs)
 	if paneID == "" {
-		http.Redirect(w, r, "/_/agent"+repoURL, http.StatusSeeOther)
+		http.Redirect(w, r, "/agent"+ref.url, http.StatusSeeOther)
 		return
 	}
-	writeStreamPage(w, paneID, repoURL, "")
+	writeStreamPage(w, paneID, ref.url, "")
 }
 
 // renderArbitraryPanePage is the streaming view for tmux panes that
 // aren't paired with a repo — opened from the home page's "tmux
 // sessions" listing. The session name is looked up from paneID via
-// tmux so the URL stays at just /_/pane?paneID=... (no label query
+// tmux so the URL stays at just /pane?paneID=... (no label query
 // param). The "diff" back-link is still shown when the pane's session
-// matches a known webdiff repo (paneRepoURL), so clicking a
-// `<base>-wd` row from the listing still gets the same chrome as the
-// repo-paired view.
+// matches a known webdiff repo or worktree (paneRepoURL), so clicking
+// a `<base>-wd` row from the listing still gets the same chrome as
+// the ref-paired view.
 func renderArbitraryPanePage(w http.ResponseWriter, r *http.Request) {
 	paneID := r.URL.Query().Get("paneID")
 	if paneID == "" {
@@ -1385,9 +1519,13 @@ func main() {
 	} else {
 		cacheRoot = filepath.Join(os.TempDir(), "webdiff-cache")
 	}
-	if err := os.MkdirAll(cacheRoot, 0700); err != nil {
-		fmt.Fprintln(os.Stderr, "cannot create cache dir:", err)
-		os.Exit(1)
+	repoCacheRoot = filepath.Join(cacheRoot, "repos")
+	worktreesRoot = filepath.Join(cacheRoot, "worktrees")
+	for _, d := range []string{cacheRoot, repoCacheRoot, worktreesRoot} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			fmt.Fprintln(os.Stderr, "cannot create cache dir:", err)
+			os.Exit(1)
+		}
 	}
 
 	auth, err := newOwnerAuth(context.Background())
@@ -1397,12 +1535,14 @@ func main() {
 	}
 
 	browserMux := http.NewServeMux()
-	browserMux.HandleFunc("/_/app.js", serveAppJS)
-	browserMux.HandleFunc("/_/stream/", renderRepoStreamPage)
-	browserMux.HandleFunc("/_/pane", renderArbitraryPanePage)
-	browserMux.HandleFunc("/_/agent/", handleStartSession)
-	browserMux.HandleFunc("/_/repo-stats/", handleRepoStats)
-	browserMux.HandleFunc("/", handler)
+	browserMux.HandleFunc("/app.js", serveAppJS)
+	browserMux.HandleFunc("/stream/", renderRepoStreamPage)
+	browserMux.HandleFunc("/pane", renderArbitraryPanePage)
+	browserMux.HandleFunc("/agent/", handleStartSession)
+	browserMux.HandleFunc("/stats/", handleRepoStats)
+	browserMux.HandleFunc("/repos/", renderRepoDiff)
+	browserMux.HandleFunc("/worktrees/", renderRepoDiff)
+	browserMux.HandleFunc("/", renderHomeHandler)
 
 	startSessionWatcher(context.Background())
 
@@ -1411,7 +1551,7 @@ func main() {
 
 	// safeweb's DefaultCSP is strict-by-default; everything except
 	// same-origin URLs is blocked. The application JavaScript is now
-	// served from /_/app.js so script-src can stay strict ('self' only
+	// served from /app.js so script-src can stay strict ('self' only
 	// — no 'unsafe-inline' needed). The three CSS blocks are still
 	// inlined into the page, so style-src allows inline via the
 	// CSPAllowInlineStyles config flag below.
@@ -1447,8 +1587,8 @@ func main() {
 		listeners = append(listeners, ln)
 		addrs = append(addrs, addr)
 	}
-	fmt.Printf("Serving on %s (root: %s, cache: %s, owner: %d)\n",
-		strings.Join(addrs, ", "), rootDir, cacheRoot, auth.ownerID)
+	fmt.Printf("Serving on %s (root: %s, repos: %s, worktrees: %s, owner: %d)\n",
+		strings.Join(addrs, ", "), rootDir, repoCacheRoot, worktreesRoot, auth.ownerID)
 	// Wrap safeweb's handler with the owner check so the auth gate runs
 	// before any security-headers / CSRF / mux dispatch logic.
 	httpSrv := &http.Server{Handler: auth.middleware(srv)}

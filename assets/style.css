@@ -135,6 +135,13 @@ body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
    on narrow viewports — buttons always sit on a single line. */
 .page-heading-row-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch }
 .page-heading-row-scroll > * { flex-shrink: 0 }
+/* Worktree create row: appears below the controls row when the
+   user clicks "+ worktree". Stays single-line so the iOS keyboard
+   sliding up doesn't reflow it. */
+.wt-create-row { gap: 6px }
+.wt-create-row[hidden] { display: none }
+.wt-branch-input { flex: 1; min-width: 0; font: inherit; font-size: 13px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box }
+.wt-branch-input:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
 .header { padding: 10px 12px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 4px }
 .header-left { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0 }
 .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
@@ -161,6 +168,9 @@ body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
 .dir-stats { color: var(--muted); font-size: 12px; flex-shrink: 0 }
 .dir-folder-tag { color: var(--muted); font-size: 12px }
 .dir-folder-tag::before { content: none }
+.dir-parent { color: var(--muted); font-size: 12px; flex-shrink: 0 }
+.dir-broken .dir-name { color: var(--muted); text-decoration: line-through }
+.dir-broken .dir-parent { display: none }
 .empty { color: var(--muted); padding: 16px }
 .section-title { margin: 24px 0 0; padding: 8px 12px; color: var(--muted); font-size: 11px; font-weight: normal; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--border) }
 
@@ -305,7 +315,7 @@ details .term-container { margin: 0 }
 .stream-toolbar-row { display: flex; gap: 4px; align-items: flex-end }
 .stream-toolbar .toggle { flex-shrink: 0; align-self: flex-end }
 .stream-key { min-width: 36px; text-align: center }
-.stream-msg { flex: 1; min-width: 0; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box; resize: none; overflow-y: auto; max-height: 120px; line-height: 1.4 }
+.stream-msg { flex: 1; min-width: 0; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box; resize: none; overflow-y: hidden; max-height: 120px; line-height: 1.4 }
 .stream-msg:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
 
 /* iOS Safari auto-zooms the viewport whenever a focused input has a
