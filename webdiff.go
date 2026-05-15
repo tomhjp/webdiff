@@ -1197,6 +1197,14 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		fmt.Fprintf(&body, `<button class="toggle" type="button" id="toggle-context" data-full="%t">%s</button>`,
 			fullContext, ctxLabel)
 	}
+	// Sync buttons: hand-off to the desktop client's /_local/sync mux.
+	// The browser is reverse-proxied through the client, so a relative
+	// POST lands on the desktop, never on the sandbox. data-sync-dir
+	// is the only differentiator the JS needs.
+	fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="pull" data-kind="%s" data-name="%s" title="pull sandbox state into this desktop repo">&#x2193; pull</button>`,
+		template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
+	fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="push" data-kind="%s" data-name="%s" title="push this desktop repo into the sandbox">&#x2191; push</button>`,
+		template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
 	body.WriteString(`</div></div>`)
 
 	// Worktree create form — hidden until "+ worktree" is clicked.
@@ -1485,6 +1493,13 @@ func main() {
 		}
 		return
 	}
+	if len(args) > 0 && args[0] == "client" {
+		if err := runClient(args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	agentCmd = strings.TrimSpace(*agentFlag)
 	if agentCmd == "" {
@@ -1548,6 +1563,7 @@ func main() {
 
 	apiMux := http.NewServeMux()
 	registerAgentRoutes(apiMux)
+	registerSyncRoutes(apiMux)
 
 	// safeweb's DefaultCSP is strict-by-default; everything except
 	// same-origin URLs is blocked. The application JavaScript is now

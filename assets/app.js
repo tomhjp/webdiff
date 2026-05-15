@@ -324,6 +324,35 @@
     });
   }
 
+  // Sync buttons (push/pull) — relative POSTs land on the desktop
+  // client's /_local/sync mux (the page is served via the desktop
+  // reverse proxy, so same-origin = desktop). Brief visual feedback
+  // states the request outcome without taking the user off the page.
+  Array.prototype.forEach.call(document.querySelectorAll('button[data-sync-dir]'),function(b){
+    var origLabel=b.textContent;
+    b.addEventListener('click',function(){
+      var dir=b.dataset.syncDir;
+      var body={kind:b.dataset.kind,name:b.dataset.name};
+      b.disabled=true;b.title='';
+      b.classList.remove('sync-ok','sync-err');
+      b.classList.add('sync-busy');
+      b.textContent=(dir==='push'?'pushing…':'pulling…');
+      fetch('/_local/sync/'+dir,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+        .then(function(r){
+          if(!r.ok)return r.text().then(function(t){throw new Error(t||('status '+r.status))});
+          b.classList.remove('sync-busy');b.classList.add('sync-ok');
+          b.textContent=origLabel;
+          setTimeout(function(){b.classList.remove('sync-ok');b.disabled=false},1200);
+        })
+        .catch(function(err){
+          b.classList.remove('sync-busy');b.classList.add('sync-err');
+          b.title=String(err&&err.message||err);
+          b.textContent=origLabel;
+          setTimeout(function(){b.classList.remove('sync-err');b.disabled=false},2500);
+        });
+    });
+  });
+
   // Worktree create — repo diff page only. Clicking "+ worktree"
   // reveals an inline form; submitting POSTs to /api/worktrees/create
   // and navigates to the new worktree's diff page. The form stays

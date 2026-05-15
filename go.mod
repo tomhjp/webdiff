@@ -2,7 +2,10 @@ module github.com/tomhjp/webdiff
 
 go 1.26.2
 
-require github.com/buildkite/terminal-to-html/v3 v3.16.8
+require (
+	github.com/buildkite/terminal-to-html/v3 v3.16.8
+	github.com/fsnotify/fsnotify v1.10.1
+)
 
 require (
 	github.com/gorilla/csrf v1.7.3 // indirect

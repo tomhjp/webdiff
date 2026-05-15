@@ -51,13 +51,89 @@ type sendRequest struct {
 // wdSession* tracks live pane-change state for all *-wd tmux sessions,
 // updated by the background watcher and consumed by the listing page.
 var (
-	wdSessionsMu  sync.RWMutex
-	wdSpinning    = map[string]bool{}
-	wdLastRaw     = map[string]string{}
-	wdLastChange  = map[string]time.Time{}
+	wdSessionsMu sync.RWMutex
+	wdSpinning   = map[string]bool{}
+	wdLastRaw    = map[string]string{}
+	wdLastChange = map[string]time.Time{}
+	// wdSessionRepo maps a *-wd tmux session name to the repo it was
+	// spawned for, populated by ensureRepoSession. Consumed by
+	// pollWdSessions when broadcasting turn-ended events so subscribers
+	// know which repo to sync without having to reverse-derive the path
+	// from the session name (which can ambiguate when repos in rootDir
+	// and worktreesRoot share a basename).
+	wdSessionRepo = map[string]repoRef{}
 )
 
 const wdSpinTimeout = 3 * time.Second
+
+// turnEvent fires when a *-wd session transitions from "spinning" to
+// "idle" — our proxy for "the agent just finished its turn." The
+// payload carries enough for a sync client to act without another
+// round-trip to the server.
+type turnEvent struct {
+	Kind    string `json:"kind"`    // "repos" or "worktrees"
+	Name    string `json:"name"`    // repo basename / URL slug
+	Session string `json:"session"` // tmux session name
+	TS      int64  `json:"ts"`      // unix milliseconds
+}
+
+var (
+	turnSubsMu sync.Mutex
+	turnSubs   = map[chan turnEvent]struct{}{}
+)
+
+func subscribeTurnEvents() (<-chan turnEvent, func()) {
+	ch := make(chan turnEvent, 32)
+	turnSubsMu.Lock()
+	turnSubs[ch] = struct{}{}
+	turnSubsMu.Unlock()
+	return ch, func() {
+		turnSubsMu.Lock()
+		delete(turnSubs, ch)
+		turnSubsMu.Unlock()
+		close(ch)
+	}
+}
+
+// broadcastTurnEvent is non-blocking: slow subscribers drop events
+// rather than backing up the poller. Subscribers are expected to be
+// idempotent (a missed event just means the next agent turn re-fires
+// the sync).
+func broadcastTurnEvent(ev turnEvent) {
+	turnSubsMu.Lock()
+	defer turnSubsMu.Unlock()
+	for ch := range turnSubs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// recordRepoSession is called by ensureRepoSession on every cache hit
+// or miss to keep wdSessionRepo current with the live sessions. The
+// caller is the only place a *-wd session is created or observed by
+// name+repo together, so this is the right registration point.
+func recordRepoSession(sessionName, repoPath string) {
+	var kind string
+	switch {
+	case rootDir != "" && strings.HasPrefix(repoPath, rootDir+string(os.PathSeparator)):
+		kind = "repos"
+	case worktreesRoot != "" && strings.HasPrefix(repoPath, worktreesRoot+string(os.PathSeparator)):
+		kind = "worktrees"
+	default:
+		return // not under either root — nothing to broadcast for
+	}
+	ref := repoRef{
+		abs:  repoPath,
+		kind: kind,
+		name: filepath.Base(repoPath),
+		url:  "/" + kind + "/" + filepath.Base(repoPath) + "/",
+	}
+	wdSessionsMu.Lock()
+	wdSessionRepo[sessionName] = ref
+	wdSessionsMu.Unlock()
+}
 
 // startSessionWatcher polls all *-wd tmux sessions once per second and
 // marks each as spinning when its pane content has changed within the
@@ -104,8 +180,8 @@ func pollWdSessions(ctx context.Context) {
 		snaps = append(snaps, snap{name, raw})
 	}
 	now := time.Now()
+	var transitions []turnEvent
 	wdSessionsMu.Lock()
-	defer wdSessionsMu.Unlock()
 	for _, s := range snaps {
 		prev, seen := wdLastRaw[s.name]
 		wdLastRaw[s.name] = s.raw
@@ -113,14 +189,33 @@ func pollWdSessions(ctx context.Context) {
 			wdLastChange[s.name] = now
 		}
 		lc := wdLastChange[s.name]
-		wdSpinning[s.name] = !lc.IsZero() && now.Sub(lc) < wdSpinTimeout
+		nowSpinning := !lc.IsZero() && now.Sub(lc) < wdSpinTimeout
+		// Spinning→idle is the turn-end signal. We require the
+		// previous tick to have been spinning to avoid firing on
+		// every startup-idle session.
+		if wdSpinning[s.name] && !nowSpinning {
+			if ref, ok := wdSessionRepo[s.name]; ok {
+				transitions = append(transitions, turnEvent{
+					Kind:    ref.kind,
+					Name:    ref.name,
+					Session: s.name,
+					TS:      now.UnixMilli(),
+				})
+			}
+		}
+		wdSpinning[s.name] = nowSpinning
 	}
 	for name := range wdSpinning {
 		if !active[name] {
 			delete(wdSpinning, name)
 			delete(wdLastRaw, name)
 			delete(wdLastChange, name)
+			delete(wdSessionRepo, name)
 		}
+	}
+	wdSessionsMu.Unlock()
+	for _, ev := range transitions {
+		broadcastTurnEvent(ev)
 	}
 }
 
@@ -145,8 +240,67 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/pane/input", handlePaneInput)
 	mux.HandleFunc("/api/pane/restart", handlePaneRestart)
 	mux.HandleFunc("/api/sessions/spinning", handleSessionsSpinning)
+	mux.HandleFunc("/api/sessions/turn-events", handleTurnEvents)
 	mux.HandleFunc("/api/worktrees/create", handleWorktreeCreate)
 	mux.HandleFunc("/api/worktrees/remove", handleWorktreeRemove)
+}
+
+// handleTurnEvents streams turn-ended events as Server-Sent Events.
+// Each event is a JSON turnEvent. The connection stays open until the
+// client disconnects; the subscriber channel is closed on cleanup so
+// pollWdSessions stops blasting it.
+//
+// Subscribers connect from the desktop client to auto-pull a repo
+// when its agent finishes a turn. Browsers could also subscribe to
+// drive future UI; v1 only uses it from client_events.go.
+func handleTurnEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ch, cancel := subscribeTurnEvents()
+	defer cancel()
+
+	// Initial comment so any HTTP-2 / proxy buffer flushes the headers
+	// and clients see a connected state right away.
+	fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+
+	ctx := r.Context()
+	// Light keepalive so an idle subscriber's intermediary doesn't
+	// time the connection out. Half of typical 60 s proxy idle.
+	keepalive := time.NewTicker(30 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepalive.C:
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case ev := <-ch:
+			data, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 // handleWorktreeCreate creates a managed worktree under worktreesRoot
@@ -676,6 +830,7 @@ func streamDelta(old, new []string) (drop int, appendLines []string) {
 // keeps the behaviour predictable.
 func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 	name := repoSessionName(repoPath)
+	recordRepoSession(name, repoPath)
 	if sessionExists(ctx, name) {
 		out, err := tmuxOut(ctx, "display", "-t", name+":0.0", "-p", "#{pane_id}")
 		if err != nil {

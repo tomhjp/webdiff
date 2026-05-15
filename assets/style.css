@@ -190,6 +190,9 @@ body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
 .toggle:hover { background: var(--chrome-bg) }
 .toggle.danger { color: var(--removed); border-color: var(--removed) }
 .toggle.danger:hover { background: var(--removed); color: var(--bg) }
+.toggle.sync-busy { color: var(--muted); border-color: var(--muted) }
+.toggle.sync-ok   { color: var(--added);  border-color: var(--added) }
+.toggle.sync-err  { color: var(--removed); border-color: var(--removed) }
 
 #diff-mode-select { font: inherit; font-size: 12px; background: var(--chrome-bg); color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 4px; cursor: pointer }
 
