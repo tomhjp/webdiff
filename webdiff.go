@@ -1161,6 +1161,8 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	fmt.Fprintf(&body, `<a class="toggle" href="/%s">home</a>`, modeQS)
 	fmt.Fprintf(&body, `<a class="%s" href="%s" title="%s">%s</a>`,
 		agentClass, template.HTMLEscapeString(agentHref), template.HTMLEscapeString(agentTitle), template.HTMLEscapeString(agentName))
+	fmt.Fprintf(&body, `<a class="toggle" href="/file/%s/%s/" title="browse repo files">files</a>`,
+		ref.kind, template.HTMLEscapeString(ref.name))
 	switch ref.kind {
 	case "repos":
 		fmt.Fprintf(&body, `<button class="toggle add-comment-btn" type="button" id="wt-new-btn" data-repo="%s" title="create a worktree of this repo">+ worktree</button>`,
@@ -1557,6 +1559,7 @@ func main() {
 	browserMux.HandleFunc("/stats/", handleRepoStats)
 	browserMux.HandleFunc("/repos/", renderRepoDiff)
 	browserMux.HandleFunc("/worktrees/", renderRepoDiff)
+	browserMux.HandleFunc("/file/", renderFileBrowser)
 	browserMux.HandleFunc("/", renderHomeHandler)
 
 	startSessionWatcher(context.Background())

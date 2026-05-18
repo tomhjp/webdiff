@@ -117,6 +117,12 @@ html {
    anchor land off-screen when the user had scrolled the page right. */
 body { margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden }
 
+/* Default link colour for unstyled `<a>` — most notably the OSC 8
+   hyperlinks buildkite/terminal-to-html emits in the stream view, which
+   have no class. Class-styled links (.pill, .toggle, .workdir, …) win
+   by specificity and keep their own colours. */
+a { color: var(--accent) }
+
 /* Sticky page heading: stays pinned at the top while everything else
    scrolls. Used by the diff page (title "<repo> diff") and the stream
    page (title "<repo> agent"). The non-sticky info bar with git/diff
@@ -355,3 +361,69 @@ details .term-container { margin: 0 }
 #pane-tail .line-bg-del .term-bgx52,
 #pane-tail .line-bg-del .term-bg41 { background: transparent }
 
+/* ─── file browser ───────────────────────────────────────────────
+ * Breadcrumb in the page heading: each path segment is its own `<a
+ * class="crumb">`, joined by "/" separators. Inherit the muted
+ * branch-row colour so the crumbs read as path text rather than
+ * competing with the page-heading nav buttons. Hover and the final
+ * segment get accent so the user knows where they are. */
+.crumb { color: var(--muted); text-decoration: none }
+.crumb:hover { color: var(--accent); text-decoration: underline }
+.branch .crumb:last-of-type { color: var(--branch) }
+.crumb-sep { color: var(--muted) }
+
+/* Chroma syntax-highlight palette. Token class names come from
+ * chroma's standard taxonomy (matches Pygments). Colours intentionally
+ * pull from --color-N so a user's palette.css override propagates
+ * here too — no separate file-viewer theme to maintain.
+ *
+ * Scoped to .term-container so the rules can't leak into the diff
+ * body or the stream pane, both of which already use term-container
+ * for unrelated layout. */
+.term-container .chroma { background: var(--bg); color: var(--fg); margin: 0 }
+.term-container .chroma pre { margin: 0 }
+.term-container .chroma .line { padding: 0 8px }
+.term-container .chroma .ln { color: var(--muted); padding-right: 12px; user-select: none }
+.term-container .chroma .lnlinks { color: var(--muted); text-decoration: none }
+.term-container .chroma .hl { background: color-mix(in srgb, var(--accent) 12%, transparent) }
+
+/* Comments — muted + italic (mirrors `.term-fg3` from the ANSI block). */
+.term-container .chroma .c,  .term-container .chroma .ch,
+.term-container .chroma .cm, .term-container .chroma .c1,
+.term-container .chroma .cs, .term-container .chroma .cp,
+.term-container .chroma .cpf { color: var(--muted); font-style: italic }
+
+/* Keywords. */
+.term-container .chroma .k,  .term-container .chroma .kc,
+.term-container .chroma .kd, .term-container .chroma .kn,
+.term-container .chroma .kp, .term-container .chroma .kr,
+.term-container .chroma .kt { color: var(--color-13) }
+
+/* Strings + char/string-like literals. */
+.term-container .chroma .s,  .term-container .chroma .sa,
+.term-container .chroma .sb, .term-container .chroma .sc,
+.term-container .chroma .dl, .term-container .chroma .sd,
+.term-container .chroma .s2, .term-container .chroma .se,
+.term-container .chroma .sh, .term-container .chroma .si,
+.term-container .chroma .sx, .term-container .chroma .sr,
+.term-container .chroma .s1, .term-container .chroma .ss { color: var(--color-2) }
+
+/* Numeric literals. */
+.term-container .chroma .m,  .term-container .chroma .mb,
+.term-container .chroma .mf, .term-container .chroma .mh,
+.term-container .chroma .mi, .term-container .chroma .il,
+.term-container .chroma .mo { color: var(--color-3) }
+
+/* Names: function definitions, builtins, types/classes, attrs,
+ * decorators, exceptions. Operators + punctuation deliberately inherit
+ * --fg so dense syntactic noise stays calm. */
+.term-container .chroma .nf, .term-container .chroma .fm { color: var(--color-12) }
+.term-container .chroma .nb { color: var(--color-14) }
+.term-container .chroma .nc, .term-container .chroma .nn,
+.term-container .chroma .nt { color: var(--color-11) }
+.term-container .chroma .na { color: var(--color-6) }
+.term-container .chroma .nd { color: var(--color-5) }
+.term-container .chroma .ne { color: var(--color-9) }
+
+/* Lexer errors — wavy red underline, hard to miss but doesn't reflow. */
+.term-container .chroma .err { color: var(--removed); text-decoration: underline wavy }

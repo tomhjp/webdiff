@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -735,6 +738,14 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 			screen, _ := terminal.NewScreen()
 			screen.Write([]byte(out))
 			rendered := strings.TrimRight(screen.AsHTML(), "\n")
+			// Claude Code (and tools like ripgrep with --hyperlink-format)
+			// emit OSC 8 hyperlinks for file paths, which terminal-to-html
+			// renders as `<a href="file:///…">`. The browser is on a
+			// different host to the sandbox so those URLs are dead; rewrite
+			// any whose target lives under a known repo/worktree to /file/…
+			// instead. Out-of-scope paths are left alone — no worse than
+			// today, and the user can still copy the absolute path out.
+			rendered = rewriteFileHrefs(rendered)
 			var wrapped []string
 			if rendered != "" {
 				for _, line := range strings.Split(rendered, "\n") {
@@ -1140,6 +1151,95 @@ func formatPrompt(repo string, comments []Comment) string {
 		fmt.Fprintf(&b, "- %s — %s\n", loc, text)
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// fileHrefRE matches the `href="file://…"` attributes that
+// terminal-to-html emits when the agent prints an OSC 8 hyperlink. The
+// path is captured raw and HTML-decoded inside the rewriter — file
+// paths rarely contain HTML-special characters, but `&` in a filename
+// would arrive as `&amp;` and round-tripping cleanly is cheap.
+var fileHrefRE = regexp.MustCompile(`href="file://([^"]*)"`)
+
+// rewriteFileHrefs walks every `href="file://…"` in `s` and, for those
+// whose target lives under a webdiff-managed repo or worktree, rewrites
+// the href to point at /file/<kind>/<name>/<rest>. The browser sits on
+// a different machine to the sandbox, so the original file:// URLs are
+// broken; pointing them at the file viewer turns each into a working
+// click-through into the source. Anything outside rootDir / worktreesRoot
+// is left as-is so the user can still see and copy the path.
+func rewriteFileHrefs(s string) string {
+	if !strings.Contains(s, `href="file://`) {
+		return s
+	}
+	return fileHrefRE.ReplaceAllStringFunc(s, func(match string) string {
+		sub := fileHrefRE.FindStringSubmatch(match)
+		if len(sub) != 2 {
+			return match
+		}
+		// Reverse the HTML escape buildkite applied to the URL, then
+		// parse so url.Path is properly percent-decoded and any
+		// trailing #fragment is split off.
+		raw := html.UnescapeString(sub[1])
+		u, err := url.Parse("file://" + raw)
+		if err != nil || u.Path == "" {
+			return match
+		}
+		mapped := mapFilePathToWebdiff(u.Path, u.Fragment)
+		if mapped == "" {
+			return match
+		}
+		return `href="` + html.EscapeString(mapped) + `"`
+	})
+}
+
+// mapFilePathToWebdiff turns an absolute filesystem path into the /file
+// URL that serves it, or returns "" if the path doesn't live under any
+// repo or worktree webdiff manages. Both rootDir and worktreesRoot are
+// resolved fresh each call rather than cached — they're set once at
+// startup and the cost is a couple of stat-free Clean calls per OSC 8
+// link, which is negligible at the SSE emit cadence.
+func mapFilePathToWebdiff(absPath, fragment string) string {
+	for _, scope := range []struct {
+		kind, root string
+	}{
+		{"repos", rootDir},
+		{"worktrees", worktreesRoot},
+	} {
+		if scope.root == "" {
+			continue
+		}
+		rootAbs, err := filepath.Abs(scope.root)
+		if err != nil {
+			continue
+		}
+		rootAbs = filepath.Clean(rootAbs)
+		prefix := rootAbs + string(filepath.Separator)
+		if !strings.HasPrefix(absPath, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(absPath, prefix)
+		parts := strings.SplitN(rest, string(filepath.Separator), 2)
+		repoName := parts[0]
+		if repoName == "" || strings.HasPrefix(repoName, ".") {
+			continue
+		}
+		out := "/file/" + scope.kind + "/" + url.PathEscape(repoName) + "/"
+		if len(parts) == 2 && parts[1] != "" {
+			var encoded []string
+			for seg := range strings.SplitSeq(parts[1], string(filepath.Separator)) {
+				if seg == "" {
+					continue
+				}
+				encoded = append(encoded, url.PathEscape(seg))
+			}
+			out += strings.Join(encoded, "/")
+		}
+		if fragment != "" {
+			out += "#" + fragment
+		}
+		return out
+	}
+	return ""
 }
 
 // tmuxOut runs `tmux <args...>` and returns combined stdout. Errors
