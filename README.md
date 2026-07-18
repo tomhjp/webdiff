@@ -24,6 +24,12 @@ webdiff [-agent="<command>"] [port]
 
 `-agent` accepts a full command line (e.g. `-agent="opencode --foo"`); the first whitespace-separated token is used as the display name on the diff page's agent button. Defaults to `claude`.
 
+Alternatively, get a more opinionated install from `deploy/install.sh` which:
+
+* Installs and starts a user systemd unit
+* Serves webdiff's own parent directory as the code directory
+* Enables linger
+
 ## Terminal colour palette
 
 By default webdiff uses a built-in colour scheme. To match your terminal's actual palette:

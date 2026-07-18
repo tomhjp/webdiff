@@ -74,7 +74,12 @@ html {
 }
 .term-inner { display: block; width: max-content; min-width: 100%; box-sizing: border-box }
 .term-container .line { display: block; white-space: pre; padding: 0 8px }
-.term-container .line-add, .term-container .line-del { display: flex; padding: 0 }
+/* Any line carrying a gutter (add/del always; context lines once delta's
+   line-number column is split off) lays its prefix + tail out as flex so
+   the per-span padding lines the columns up identically across line
+   kinds. */
+.term-container .line-add, .term-container .line-del,
+.term-container .line:has(.line-gutter) { display: flex; padding: 0 }
 .term-container .line-prefix { flex: 0 0 auto; padding-left: 8px; white-space: pre }
 .term-container .line-tail { flex: 1 0 auto; padding-right: 8px; white-space: pre }
 .term-container .line-add .line-tail { background: var(--diff-add-bg) }
@@ -148,6 +153,7 @@ a { color: var(--accent) }
 .wt-create-row[hidden] { display: none }
 .wt-branch-input { flex: 1; min-width: 0; font: inherit; font-size: 13px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box }
 .wt-branch-input:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
+.wt-from-main { font-size: 13px; white-space: nowrap; display: flex; align-items: center; gap: 4px }
 .header { padding: 10px 12px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 4px }
 .header-left { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0 }
 .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
@@ -161,8 +167,17 @@ a { color: var(--accent) }
 
 .stats { color: var(--muted) }
 .stats-files { color: var(--fg) }
+/* The signed counts render entirely from pseudo-content pulled out of
+   `data-stat`, so no digits ever land in a text node. iOS Safari's
+   data detectors only scan text nodes, not attributes or generated
+   content, so there's nothing left for it to offer to dial.
+   (`format-detection: telephone=no` is set too, but it's unreliable.)
+   Trade-off: the counts can't be selected or copied — acceptable for a
+   decorative stat. */
 .stats-ins { color: var(--added) }
 .stats-del { color: var(--removed) }
+.stats-ins::before { content: attr(data-stat) }
+.stats-del::before { content: attr(data-stat) }
 
 .dir-list { display: flex; flex-direction: column }
 .dir-row { display: flex; align-items: baseline; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--fg); text-decoration: none }
@@ -176,8 +191,15 @@ a { color: var(--accent) }
 .dir-folder-tag::before { content: none }
 .dir-parent { color: var(--muted); font-size: 12px; flex-shrink: 0 }
 .dir-broken .dir-name { color: var(--muted); text-decoration: line-through }
-.dir-broken .dir-parent { display: none }
 .empty { color: var(--muted); padding: 16px }
+
+/* Repo/worktree rows read "repo … <stats> <branch>". The repo path is
+   the flexible cell: it absorbs the slack (pushing stats+branch to the
+   right as a pair) and ellipses away first when a narrow viewport runs
+   out of room. Stats and branch keep their natural size on the right. */
+.repo-row .dir-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.repo-row .dir-stats { flex: 0 0 auto }
+.repo-row .dir-branch { flex: 0 0 auto }
 .section-title { margin: 24px 0 0; padding: 8px 12px; color: var(--muted); font-size: 11px; font-weight: normal; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--border) }
 
 /* Repo rows ellipsis the dir-name because folder paths can be long
@@ -220,11 +242,22 @@ details:not([open]) > summary::before { content: "▸" }
 details { margin-bottom: 0 }
 details .term-container { margin: 0 }
 
-/* ─── review comments ────────────────────────────────────────────── */
-.term-container .line[data-file],
-.term-container .line-file-anchor { cursor: pointer }
-.term-container .line[data-file]:hover,
-.term-container .line-file-anchor:hover { outline: 1px dashed var(--border); outline-offset: -1px }
+/* ─── review comments ──────────────────────────────────────────────
+   Comments are left from the left gutter only: the line-number column
+   (`.line-gutter`) is the click/drag affordance and is excluded from
+   text selection, so a copy grabs the code and not the line numbers or
+   box-drawing separators. The code column (`.line-tail`) keeps a text
+   cursor and stays selectable. Lines with no gutter — raw `git diff`
+   output, or the per-file quiet anchor — keep the whole line as the
+   comment surface, as before. */
+.term-container .line-gutter,
+.term-container .line-file-anchor,
+.term-container .line[data-file]:not(:has(.line-gutter)) { cursor: pointer }
+.term-container .line-gutter:hover,
+.term-container .line-file-anchor:hover,
+.term-container .line[data-file]:not(:has(.line-gutter)):hover { outline: 1px dashed var(--border); outline-offset: -1px }
+.term-container .line-gutter { -webkit-user-select: none; user-select: none }
+.term-container .line-tail { cursor: text }
 .term-container .line-drag-selected { background: color-mix(in srgb, var(--accent) 18%, transparent); outline: 1px solid var(--accent); outline-offset: -1px }
 .term-container .line-add.line-drag-selected .line-tail,
 .term-container .line-del.line-drag-selected .line-tail { background: transparent }
@@ -297,6 +330,8 @@ details .term-container { margin: 0 }
 .modal-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent) }
 .modal-loc { color: var(--accent); font-size: 12px; flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .modal-text { flex: 1; color: var(--fg); font-size: 12px; white-space: pre-wrap; min-width: 0 }
+.modal-note { color: var(--muted); font-size: 12px; margin: 8px 0 6px }
+.history-url-input { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 6px 8px; margin-bottom: 8px; user-select: all }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--border) }
 .modal-footer .send-btn { background: var(--branch); color: var(--bg); font-weight: bold; padding: 6px 14px; border-color: var(--branch) }
 .modal-footer .send-btn:hover { background: color-mix(in srgb, var(--branch) 80%, white); color: var(--bg) }
@@ -337,6 +372,34 @@ details .term-container { margin: 0 }
   .stream-msg { font-size: 16px }
 }
 .stream-send { font-weight: bold; color: var(--branch); border-color: var(--branch) }
+.stream-attach { min-width: 36px; text-align: center }
+.stream-attachments:not([hidden]) { display: flex; flex-wrap: wrap; gap: 4px }
+.attachment-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; padding: 2px 4px 2px 8px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); max-width: 100% }
+.attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px }
+.attachment-del { background: transparent; border: none; color: var(--muted); font-size: 14px; line-height: 1; padding: 0 4px; cursor: pointer }
+.attachment-del:hover { color: var(--fg) }
+
+/* Attach modal — paste a big blob of text or drop a file. Reuses the
+   .modal chrome from the review-comments modal; .attach-drop is the
+   one bespoke region. The dashed border + hover state mirror the diff
+   page's add-comment-btn styling so the affordance reads as
+   "drop here" without needing a separate dropzone icon. */
+.attach-modal .modal-body { padding: 12px }
+.attach-drop { border: 1px dashed var(--border); padding: 12px; display: flex; flex-direction: column; gap: 8px; background: var(--bg) }
+.attach-drop-over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg)) }
+.attach-hint { color: var(--muted); font-size: 12px }
+.attach-text { font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 6px 8px; box-sizing: border-box; resize: vertical; width: 100%; min-height: 120px }
+.attach-name-row { display: flex; gap: 8px; align-items: center }
+.attach-name-label { font-size: 12px; color: var(--muted) }
+.attach-name-input { flex: 1; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box }
+.attach-file-input { display: none }
+.attach-status { color: var(--muted); font-size: 12px; align-self: center; flex: 1 }
+@media (pointer: coarse) {
+  .attach-text, .attach-name-input { font-size: 16px }
+}
+@media (pointer: coarse) {
+  .history-url-input { font-size: 16px }
+}
 #pane-tail { padding-bottom: 100px }
 
 /* Diff-coloured stream rows get their bg painted on the .line block

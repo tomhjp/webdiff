@@ -74,9 +74,10 @@ var (
 // diff-cache (or vice versa), and the on-disk layout mirrors the home
 // page's "repos / worktrees" sections.
 var (
-	cacheRoot     string
-	repoCacheRoot string
-	worktreesRoot string
+	cacheRoot       string
+	repoCacheRoot   string
+	worktreesRoot   string
+	attachmentsRoot string
 )
 
 // repoCache holds the warm-path state for one repo: a per-repo mutex (so
@@ -668,6 +669,23 @@ func wrapDiffLines(htmlIn, file string, canon []diffLine) string {
 		case '-':
 			cls = "del"
 		}
+		// Peel delta's line-number gutter off the code so the two can be
+		// driven independently: the gutter is the click/drag target for
+		// leaving comments and is excluded from text selection, while the
+		// code column stays selectable for copying. splitGutter handles
+		// delta (every body line, add/del/context alike); raw `git diff`
+		// has no gutter, so add/del fall back to the bg-span split and
+		// context lines emit whole.
+		if gp, gt, ok := splitGutter(line); ok {
+			lineCls := "line"
+			if cls != "" {
+				lineCls += " line-" + cls
+			}
+			fmt.Fprintf(&b,
+				`<span class="%s"%s><span class="line-prefix line-gutter">%s</span><span class="line-tail">%s</span></span>`,
+				lineCls, attrs, gp, gt)
+			continue
+		}
 		if cls == "" {
 			fmt.Fprintf(&b, `<span class="line"%s>%s</span>`, attrs, line)
 			continue
@@ -748,6 +766,28 @@ func splitDiffLine(line string) (prefix, tail string) {
 		return line[:loc[0]], line[loc[0]:]
 	}
 	return line, ""
+}
+
+// splitGutter peels delta's line-number gutter off a rendered diff line,
+// returning the gutter HTML and the code HTML on a clean tag boundary.
+// Delta closes the gutter with a `│` column separator immediately before
+// the code, sitting in its own coloured span; we cut after that span's
+// closing tag so neither side is left with a dangling element. ok is
+// false when there's no delta gutter (raw `git diff` output), leaving the
+// caller to fall back to its non-delta handling.
+func splitGutter(line string) (prefix, tail string, ok bool) {
+	const sep = "│" // U+2502, delta's gutter→code column separator
+	i := strings.Index(line, sep)
+	if i < 0 {
+		return "", "", false
+	}
+	rest := line[i+len(sep):]
+	c := strings.Index(rest, "</span>")
+	if c < 0 {
+		return "", "", false
+	}
+	cut := i + len(sep) + c + len("</span>")
+	return line[:cut], line[cut:], true
 }
 
 // renderHomeHandler is the root-only fallback. Anything other than "/"
@@ -835,6 +875,7 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(rootDir)))
 	fmt.Fprintf(&body, `<span class="workdir">%s</span>`, template.HTMLEscapeString(rootDir))
 	body.WriteString(`</div><div class="header-right">`)
+	body.WriteString(`<a class="toggle" href="/history/" title="archived agent sessions">history</a>`)
 	body.WriteString(`<select id="diff-mode-select">`)
 	for _, opt := range []struct{ val, label string }{
 		{"working", "uncommitted"},
@@ -852,7 +893,7 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	body.WriteString(`<h2 class="section-title">repos</h2>`)
 	body.WriteString(`<div class="dir-list">`)
 	for _, name := range repoNames {
-		writeDirRow(&body, "repos", name, "", modeQS, false)
+		writeDirRow(&body, "repos", name, name, modeQS, false)
 	}
 	if len(repoNames) == 0 {
 		body.WriteString(`<p class="empty">No git repos under this directory.</p>`)
@@ -864,7 +905,15 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 		body.WriteString(`<h2 class="section-title">worktrees</h2>`)
 		body.WriteString(`<div class="dir-list">`)
 		for _, wt := range worktrees {
-			writeDirRow(&body, "worktrees", wt.Name, wt.Repo, modeQS, wt.Broken)
+			// Left-hand label is the parent repo, so a worktree reads as
+			// "repo … branch" across the row. Broken worktrees have no
+			// resolvable parent; fall back to the dir name so the row is
+			// still identifiable enough to click through and remove.
+			label := wt.Repo
+			if label == "" {
+				label = wt.Name
+			}
+			writeDirRow(&body, "worktrees", wt.Name, label, modeQS, wt.Broken)
 		}
 		body.WriteString(`</div>`)
 	}
@@ -874,17 +923,17 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	writePage(w, body.String())
 }
 
-// writeDirRow emits one <a class="dir-row"> for a repo or worktree on
-// the home page. Stats come in via the data-stats-url that app.js
-// fetches per row. parentRepo is shown in the right-side metadata only
-// for worktrees (where it disambiguates which repo a branch belongs
-// to); broken worktrees get the dir-broken class so they're greyed
-// out but still clickable through to the diff page where the remove
-// button lives.
-func writeDirRow(b *strings.Builder, kind, name, parentRepo, modeQS string, broken bool) {
-	url := "/" + kind + "/" + name + "/" + modeQS
-	statsURL := "/stats/" + kind + "/" + name + "/" + modeQS
-	cls := "dir-row"
+// writeDirRow emits one <a class="dir-row repo-row"> for a repo or
+// worktree on the home page. slug is the URL/stats path component; label
+// is what shows on the left (the repo name for a repo, the parent repo
+// for a worktree, so every row reads "repo … branch"). The branch and
+// diff stats fill in via the data-stats-url that app.js fetches per row.
+// Broken worktrees get the dir-broken class so they're greyed out but
+// still clickable through to the diff page where the remove button lives.
+func writeDirRow(b *strings.Builder, kind, slug, label, modeQS string, broken bool) {
+	url := "/" + kind + "/" + slug + "/" + modeQS
+	statsURL := "/stats/" + kind + "/" + slug + "/" + modeQS
+	cls := "dir-row repo-row"
 	if broken {
 		cls += " dir-broken"
 	}
@@ -892,11 +941,8 @@ func writeDirRow(b *strings.Builder, kind, name, parentRepo, modeQS string, brok
 		cls,
 		template.HTMLEscapeString(url),
 		template.HTMLEscapeString(statsURL),
-		template.HTMLEscapeString(name))
+		template.HTMLEscapeString(label))
 	b.WriteString(`<span class="dir-stats"></span>`)
-	if parentRepo != "" {
-		fmt.Fprintf(b, `<span class="dir-parent">%s</span>`, template.HTMLEscapeString(parentRepo))
-	}
 	if broken {
 		b.WriteString(`<span class="dir-branch dir-folder-tag">broken</span>`)
 	} else {
@@ -1127,11 +1173,15 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 			var sb strings.Builder
 			sb.WriteString(`<span class="stats">`)
 			fmt.Fprintf(&sb, `<span class="stats-files">%d %s</span>`, nfiles, noun)
+			// The counts live in `data-stat` and are rendered from CSS
+			// pseudo-content (see .stats-ins/.stats-del) so no digits sit
+			// in a text node for iOS Safari's data detector to turn into
+			// a tap-to-dial phone link.
 			if ins > 0 {
-				fmt.Fprintf(&sb, ` <span class="stats-ins">+%d</span>`, ins)
+				fmt.Fprintf(&sb, ` <span class="stats-ins" data-stat="+%d"></span>`, ins)
 			}
 			if del > 0 {
-				fmt.Fprintf(&sb, ` <span class="stats-del">-%d</span>`, del)
+				fmt.Fprintf(&sb, ` <span class="stats-del" data-stat="-%d"></span>`, del)
 			}
 			sb.WriteString(`</span>`)
 			stats = sb.String()
@@ -1144,8 +1194,18 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// mode/context/expand controls (right). Everything that used to
 	// live in a separate info bar is folded in here so only the
 	// streaming diff body scrolls.
+	// Title is the repo name. A worktree's dir is named <repo>-<branch>,
+	// which is redundant next to the branch shown in the meta; show its
+	// parent repo instead so the heading reads "repo … branch" like the
+	// home-page rows do.
+	title := filepath.Base(repo)
+	if ref.kind == "worktrees" {
+		if parent, ok := worktreeParentRepo(repo); ok {
+			title = parent
+		}
+	}
 	body.WriteString(`<div class="page-heading"><div class="page-heading-row">`)
-	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(repo)))
+	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(title))
 	body.WriteString(`<span class="head-meta">`)
 	fmt.Fprintf(&body, `<span class="head-branch">%s</span>`, template.HTMLEscapeString(currentBranch(repo)))
 	body.WriteString(stats)
@@ -1202,11 +1262,16 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// Sync buttons: hand-off to the desktop client's /_local/sync mux.
 	// The browser is reverse-proxied through the client, so a relative
 	// POST lands on the desktop, never on the sandbox. data-sync-dir
-	// is the only differentiator the JS needs.
-	fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="pull" data-kind="%s" data-name="%s" title="pull sandbox state into this desktop repo">&#x2193; pull</button>`,
-		template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
-	fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="push" data-kind="%s" data-name="%s" title="push this desktop repo into the sandbox">&#x2191; push</button>`,
-		template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
+	// is the only differentiator the JS needs. Only emit them when the
+	// request came through the client's proxy (it tags requests with
+	// X-Webdiff-Client) — on direct web-app access the /_local/sync
+	// endpoints don't exist, so the buttons would be dead.
+	if r.Header.Get("X-Webdiff-Client") != "" {
+		fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="pull" data-kind="%s" data-name="%s" title="pull sandbox state into this desktop repo">&#x2193; pull</button>`,
+			template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
+		fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="push" data-kind="%s" data-name="%s" title="push this desktop repo into the sandbox">&#x2191; push</button>`,
+			template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
+	}
 	body.WriteString(`</div></div>`)
 
 	// Worktree create form — hidden until "+ worktree" is clicked.
@@ -1218,6 +1283,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		fmt.Fprintf(&body, `<div class="page-heading-row wt-create-row" id="wt-create-row" data-repo="%s" hidden>`,
 			template.HTMLEscapeString(ref.name))
 		body.WriteString(`<input type="text" id="wt-branch" class="wt-branch-input" placeholder="branch name (e.g. tongue/foo)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">`)
+		body.WriteString(`<label class="wt-from-main"><input type="checkbox" id="wt-from-main" checked> from main</label>`)
 		body.WriteString(`<button type="button" class="toggle send-btn" id="wt-create-submit">create</button>`)
 		body.WriteString(`<button type="button" class="toggle" id="wt-create-cancel">cancel</button>`)
 		body.WriteString(`</div>`)
@@ -1286,7 +1352,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		case binary:
 			body.WriteString(`<span class="stats-files">binary</span>`)
 		case added != "" || removed != "":
-			fmt.Fprintf(&body, `<span class="stats-ins">+%s</span> <span class="stats-del">-%s</span>`,
+			fmt.Fprintf(&body, `<span class="stats-ins" data-stat="+%s"></span> <span class="stats-del" data-stat="-%s"></span>`,
 				template.HTMLEscapeString(added), template.HTMLEscapeString(removed))
 		}
 		body.WriteString(`</span></summary><div class="term-container"><div class="term-inner">`)
@@ -1449,7 +1515,9 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle strin
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Down" title="send down arrow">↓</button>`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Enter" title="send Enter">enter</button>`)
 	body.WriteString(`</div>`)
+	body.WriteString(`<div class="stream-attachments" id="stream-attachments" hidden></div>`)
 	body.WriteString(`<div class="stream-toolbar-row">`)
+	body.WriteString(`<button class="toggle stream-attach" type="button" id="pane-attach" title="attach a large paste or file">📎</button>`)
 	body.WriteString(`<textarea id="pane-msg" class="stream-msg" rows="1" placeholder="message…" autocomplete="off"></textarea>`)
 	body.WriteString(`<button class="toggle stream-send" type="button" id="pane-send">send</button>`)
 	body.WriteString(`</div>`)
@@ -1538,7 +1606,9 @@ func main() {
 	}
 	repoCacheRoot = filepath.Join(cacheRoot, "repos")
 	worktreesRoot = filepath.Join(cacheRoot, "worktrees")
-	for _, d := range []string{cacheRoot, repoCacheRoot, worktreesRoot} {
+	attachmentsRoot = filepath.Join(cacheRoot, "attachments")
+	historyRoot = filepath.Join(cacheRoot, "history")
+	for _, d := range []string{cacheRoot, repoCacheRoot, worktreesRoot, attachmentsRoot, historyRoot} {
 		if err := os.MkdirAll(d, 0700); err != nil {
 			fmt.Fprintln(os.Stderr, "cannot create cache dir:", err)
 			os.Exit(1)
@@ -1560,6 +1630,7 @@ func main() {
 	browserMux.HandleFunc("/repos/", renderRepoDiff)
 	browserMux.HandleFunc("/worktrees/", renderRepoDiff)
 	browserMux.HandleFunc("/file/", renderFileBrowser)
+	browserMux.HandleFunc("/history/", handleHistory)
 	browserMux.HandleFunc("/", renderHomeHandler)
 
 	startSessionWatcher(context.Background())

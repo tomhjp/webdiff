@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -157,7 +158,7 @@ func startSessionWatcher(ctx context.Context) {
 }
 
 func pollWdSessions(ctx context.Context) {
-	out, err := tmuxOut(ctx, "list-sessions", "-F", "#{session_name}")
+	out, err := tmuxOut(ctx, "list-sessions", "-F", "#{session_name}\t#{session_created}")
 	if err != nil {
 		if isTmuxDown(err) {
 			wdSessionsMu.Lock()
@@ -168,10 +169,15 @@ func pollWdSessions(ctx context.Context) {
 		}
 		return
 	}
-	type snap struct{ name, raw string }
+	type snap struct {
+		name    string
+		created int64
+		raw     string
+	}
 	var snaps []snap
 	active := map[string]bool{}
-	for _, name := range strings.Fields(out) {
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		name, createdStr, _ := strings.Cut(line, "\t")
 		if !strings.HasSuffix(name, "-wd") {
 			continue
 		}
@@ -180,16 +186,23 @@ func pollWdSessions(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		snaps = append(snaps, snap{name, raw})
+		created, _ := strconv.ParseInt(strings.TrimSpace(createdStr), 10, 64)
+		snaps = append(snaps, snap{name: name, created: created, raw: raw})
 	}
 	now := time.Now()
 	var transitions []turnEvent
+	// changed / wentIdle drive the history capture below; collected under
+	// the lock but acted on after it's released (captureHistory shells out
+	// to tmux and writes files — not work to hold the watcher mutex for).
+	changed := make(map[string]bool, len(snaps))
+	wentIdle := make(map[string]bool, len(snaps))
 	wdSessionsMu.Lock()
 	for _, s := range snaps {
 		prev, seen := wdLastRaw[s.name]
 		wdLastRaw[s.name] = s.raw
 		if seen && s.raw != prev {
 			wdLastChange[s.name] = now
+			changed[s.name] = true
 		}
 		lc := wdLastChange[s.name]
 		nowSpinning := !lc.IsZero() && now.Sub(lc) < wdSpinTimeout
@@ -197,6 +210,7 @@ func pollWdSessions(ctx context.Context) {
 		// previous tick to have been spinning to avoid firing on
 		// every startup-idle session.
 		if wdSpinning[s.name] && !nowSpinning {
+			wentIdle[s.name] = true
 			if ref, ok := wdSessionRepo[s.name]; ok {
 				transitions = append(transitions, turnEvent{
 					Kind:    ref.kind,
@@ -217,6 +231,14 @@ func pollWdSessions(ctx context.Context) {
 		}
 	}
 	wdSessionsMu.Unlock()
+	// Archive scrollback for sessions that produced new output (throttled)
+	// or just finished a turn (forced, so the resting state is always
+	// captured complete).
+	for _, s := range snaps {
+		if changed[s.name] || wentIdle[s.name] {
+			captureHistory(ctx, s.name, s.created, wentIdle[s.name])
+		}
+	}
 	for _, ev := range transitions {
 		broadcastTurnEvent(ev)
 	}
@@ -242,10 +264,122 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/pane/stream", handlePaneStream)
 	mux.HandleFunc("/api/pane/input", handlePaneInput)
 	mux.HandleFunc("/api/pane/restart", handlePaneRestart)
+	mux.HandleFunc("/api/pane/history-url", handlePaneHistoryURL)
+	mux.HandleFunc("/api/pane/attach", handlePaneAttach)
 	mux.HandleFunc("/api/sessions/spinning", handleSessionsSpinning)
 	mux.HandleFunc("/api/sessions/turn-events", handleTurnEvents)
 	mux.HandleFunc("/api/worktrees/create", handleWorktreeCreate)
 	mux.HandleFunc("/api/worktrees/remove", handleWorktreeRemove)
+}
+
+// maxAttachmentBytes is the upper bound on a single attachment after
+// base64 decoding. 20 MB comfortably covers logs and small binaries
+// without inviting OOM from a runaway upload; the base64'd JSON body
+// itself lands ~27 MB which still fits well inside default http body
+// limits.
+const maxAttachmentBytes = 20 * 1024 * 1024
+
+// attachmentNameRE strips a filename down to characters safe in a
+// disk path (and a tmux/terminal copy-paste). Anything outside the
+// allowed set collapses to a single underscore so two adjacent bad
+// runs don't blow the name out.
+var attachmentNameRE = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// sanitizeAttachmentName turns a user-supplied filename into one safe
+// to write to disk. Drops directory components, normalises bad chars
+// to underscores, caps the length, and substitutes a sensible default
+// when the input strips down to nothing.
+func sanitizeAttachmentName(name string) string {
+	name = filepath.Base(strings.TrimSpace(name))
+	if name == "." || name == "/" || name == "\\" {
+		name = ""
+	}
+	name = attachmentNameRE.ReplaceAllString(name, "_")
+	name = strings.Trim(name, "._")
+	if name == "" {
+		name = "attachment.txt"
+	}
+	if len(name) > 80 {
+		name = name[:80]
+	}
+	return name
+}
+
+// handlePaneAttach writes a single attachment to disk and returns the
+// absolute path so the client can paste it into the next message as
+// an appendix. The pane has to be a webdiff-managed session — we
+// derive the session name from the paneID so an attacker who got a
+// hold of a foreign pane id can't drop files using our endpoint.
+//
+// Attachments live under attachmentsRoot/<session>/<timestamp>-<name>.
+// One subdir per session means a session restart can clear just its
+// own staging area without sweeping everyone else's pending uploads.
+func handlePaneAttach(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Cap the body before we even read it: a 30 MB ceiling lets a
+	// fully base64'd 20 MB binary land with room for envelope, and
+	// stops a hostile client from streaming gigabytes into json.Decode.
+	r.Body = http.MaxBytesReader(w, r.Body, int64(maxAttachmentBytes*4/3+4096))
+	var req struct {
+		PaneID        string `json:"paneID"`
+		Name          string `json:"name"`
+		ContentBase64 string `json:"contentBase64"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.PaneID == "" {
+		http.Error(w, "paneID required", http.StatusBadRequest)
+		return
+	}
+	if req.ContentBase64 == "" {
+		http.Error(w, "contentBase64 required", http.StatusBadRequest)
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(req.ContentBase64)
+	if err != nil {
+		http.Error(w, "contentBase64 not valid base64: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(data) > maxAttachmentBytes {
+		http.Error(w, fmt.Sprintf("attachment too large (%d bytes, max %d)", len(data), maxAttachmentBytes), http.StatusRequestEntityTooLarge)
+		return
+	}
+	ctx := r.Context()
+	sessionOut, err := tmuxOut(ctx, "display-message", "-t", req.PaneID, "-p", "#{session_name}")
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "tmux display-message failed: "+err.Error(), nil)
+		return
+	}
+	session := strings.TrimSpace(sessionOut)
+	if !strings.HasSuffix(session, "-wd") {
+		http.Error(w, "pane is not in a webdiff-managed session", http.StatusForbidden)
+		return
+	}
+	if attachmentsRoot == "" {
+		http.Error(w, "attachments root not configured", http.StatusInternalServerError)
+		return
+	}
+	dir := filepath.Join(attachmentsRoot, session)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "mkdir attachments dir: "+err.Error(), nil)
+		return
+	}
+	name := sanitizeAttachmentName(req.Name)
+	final := filepath.Join(dir, fmt.Sprintf("%d-%s", time.Now().UnixNano(), name))
+	if err := os.WriteFile(final, data, 0600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "write attachment: "+err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":  final,
+		"name":  name,
+		"bytes": len(data),
+	})
 }
 
 // handleTurnEvents streams turn-ended events as Server-Sent Events.
@@ -312,15 +446,18 @@ func handleTurnEvents(w http.ResponseWriter, r *http.Request) {
 // `/`-separated piece of the branch keeps the convention `tongue/foo`
 // → `foo` rather than `tongue-foo`, matching the user's local branch
 // naming. If the branch already exists locally git just checks it out
-// into the new worktree; otherwise it's created from HEAD via `-b`.
+// into the new worktree; otherwise it's created via `-b` from the
+// fetched origin/main (when "from main" is set), the current HEAD, or
+// origin/<branch> if the branch already exists on the remote.
 func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
-		Repo   string `json:"repo"`
-		Branch string `json:"branch"`
+		Repo     string `json:"repo"`
+		Branch   string `json:"branch"`
+		FromMain bool   `json:"fromMain"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
@@ -337,29 +474,35 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown repo", http.StatusNotFound)
 		return
 	}
-	leaf := req.Branch
-	if i := strings.LastIndex(leaf, "/"); i >= 0 {
-		leaf = leaf[i+1:]
-	}
-	leaf = sanitizeBranchSegment(leaf)
-	if leaf == "" {
-		http.Error(w, "branch leaf has no usable characters", http.StatusBadRequest)
+	slug := sanitizeBranchName(req.Branch)
+	if slug == "" {
+		http.Error(w, "branch name has no usable characters", http.StatusBadRequest)
 		return
 	}
-	name := ref.name + "-" + leaf
+	name := ref.name + "-" + slug
 	wtPath := filepath.Join(worktreesRoot, name)
 	if _, err := os.Stat(wtPath); err == nil {
-		http.Error(w, "worktree already exists: "+name, http.StatusConflict)
+		writeJSON(w, http.StatusOK, map[string]string{"url": "/worktrees/" + name + "/"})
 		return
 	}
 
-	// Branch existence drives whether we pass -b or not. We check
-	// against refs/heads/<branch> exactly (rather than `rev-parse
-	// <branch>`) so ambiguity with a tag or remote-tracking ref doesn't
-	// silently steer us into the wrong checkout.
+	exec.Command("git", "-C", ref.abs, "fetch", "origin", req.Branch).Run()
+
+	localExists := exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/heads/"+req.Branch).Run() == nil
+	remoteExists := exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/remotes/origin/"+req.Branch).Run() == nil
+
 	var addCmd *exec.Cmd
-	if _, err := exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/heads/"+req.Branch).Output(); err == nil {
+	if localExists {
 		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", wtPath, req.Branch)
+	} else if remoteExists {
+		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath, "refs/remotes/origin/"+req.Branch)
+	} else if req.FromMain {
+		exec.Command("git", "-C", ref.abs, "fetch", "origin", "main").Run()
+		base := "main"
+		if exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/remotes/origin/main").Run() == nil {
+			base = "refs/remotes/origin/main"
+		}
+		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath, base)
 	} else {
 		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath)
 	}
@@ -396,6 +539,9 @@ func handleWorktreeRemove(w http.ResponseWriter, r *http.Request) {
 
 	sessName := repoSessionName(ref.abs)
 	if sessionExists(ctx, sessName) {
+		// Removing the worktree kills the session and the scrollback with
+		// it; archive it first so the history survives the teardown.
+		snapshotSessionHistory(ctx, sessName)
 		if _, err := tmuxOut(ctx, "kill-session", "-t", sessName); err != nil {
 			http.Error(w, "tmux kill-session failed: "+err.Error(), http.StatusBadGateway)
 			return
@@ -470,11 +616,14 @@ func worktreeParentGitDir(wtPath string) (string, bool) {
 	return filepath.Dir(common), true
 }
 
-// sanitizeBranchSegment lowercases and strips a single branch leaf
-// down to characters safe in a directory name. Empty input or input
-// that strips down to nothing returns "" — the caller rejects that
+// sanitizeBranchName lowercases a full branch name and reduces it to
+// characters safe in a single directory component, folding the path
+// separators a branch may carry (e.g. "feature/foo") into dashes
+// rather than stripping the prefix — the worktree dir keeps the whole
+// branch so two branches sharing a leaf don't collide. Empty input or
+// input that reduces to nothing returns "" — the caller rejects that
 // case so we don't end up with `<repo>-` worktree dirs.
-func sanitizeBranchSegment(s string) string {
+func sanitizeBranchName(s string) string {
 	s = strings.ToLower(s)
 	var b strings.Builder
 	for _, r := range s {
@@ -483,6 +632,8 @@ func sanitizeBranchSegment(s string) string {
 			b.WriteRune(r)
 		case r == '-' || r == '_' || r == '.':
 			b.WriteRune(r)
+		case r == '/':
+			b.WriteRune('-')
 		}
 	}
 	return b.String()
@@ -549,6 +700,61 @@ func handlePaneInput(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// webdiffSessionForPane resolves the tmux session that owns paneID and
+// verifies it's webdiff-managed. The `-wd` suffix is webdiff's marker;
+// arbitrary user sessions must not be reachable from a browser request.
+// A non-zero status is an HTTP error code with a matching message.
+func webdiffSessionForPane(ctx context.Context, paneID string) (name string, status int, msg string) {
+	out, err := tmuxOut(ctx, "display-message", "-t", paneID, "-p", "#{session_name}")
+	if err != nil {
+		return "", http.StatusBadGateway, "tmux display-message failed: " + err.Error()
+	}
+	name = strings.TrimSpace(out)
+	if name == "" {
+		return "", http.StatusBadGateway, "no session for pane"
+	}
+	if !strings.HasSuffix(name, "-wd") {
+		return "", http.StatusForbidden, "session is not webdiff-managed"
+	}
+	return name, 0, ""
+}
+
+// handlePaneHistoryURL archives the pane's current scrollback and returns
+// the /history/<id>.txt URL without killing the session. The restart popup
+// fetches this so it can show a copyable history link for the next session
+// *before* the user confirms the kill.
+func handlePaneHistoryURL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		PaneID string `json:"paneID"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.PaneID == "" {
+		http.Error(w, "paneID required", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	name, status, msg := webdiffSessionForPane(ctx, req.PaneID)
+	if status != 0 {
+		http.Error(w, msg, status)
+		return
+	}
+	resp := struct {
+		HistoryURL string `json:"historyURL,omitempty"`
+	}{}
+	if histID := snapshotSessionHistory(ctx, name); histID != "" {
+		resp.HistoryURL = "/history/" + histID + ".txt"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 // handlePaneRestart kills the webdiff-managed tmux session that owns
 // paneID. The client navigates to /agent<refURL> after this returns,
 // which respawns a fresh session with a clean scrollback. Used by the
@@ -571,28 +777,26 @@ func handlePaneRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	out, err := tmuxOut(ctx, "display-message", "-t", req.PaneID, "-p", "#{session_name}")
-	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, "tmux display-message failed: "+err.Error(), nil)
+	name, status, msg := webdiffSessionForPane(ctx, req.PaneID)
+	if status != 0 {
+		http.Error(w, msg, status)
 		return
 	}
-	name := strings.TrimSpace(out)
-	if name == "" {
-		writeJSONError(w, http.StatusBadGateway, "no session for pane", nil)
-		return
-	}
-	// Refuse to kill anything we didn't spawn ourselves: the `-wd`
-	// suffix is webdiff's marker, and arbitrary user sessions shouldn't
-	// be killable from a browser request.
-	if !strings.HasSuffix(name, "-wd") {
-		http.Error(w, "session is not webdiff-managed", http.StatusForbidden)
-		return
-	}
+	// Archive the scrollback before we throw it away — the whole point of
+	// "restart" is a clean slate, so this is the last chance to keep it.
+	histID := snapshotSessionHistory(ctx, name)
 	if _, err := tmuxOut(ctx, "kill-session", "-t", name); err != nil {
 		writeJSONError(w, http.StatusBadGateway, "tmux kill-session failed: "+err.Error(), nil)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	resp := struct {
+		HistoryURL string `json:"historyURL,omitempty"`
+	}{}
+	if histID != "" {
+		resp.HistoryURL = "/history/" + histID + ".txt"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func handleCommentsSend(w http.ResponseWriter, r *http.Request) {

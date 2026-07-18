@@ -1,0 +1,18 @@
+[Unit]
+Description=webdiff git diff browser
+After=default.target
+
+[Service]
+Type=simple
+# The serve root: a directory *containing* your git repos, not a repo itself.
+# __CODE_DIR__ is templated in by deploy/install.sh.
+WorkingDirectory=__CODE_DIR__
+ExecStart=__CODE_DIR__/webdiff/webdiff 80
+Restart=on-failure
+RestartSec=2
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

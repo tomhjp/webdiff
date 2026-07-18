@@ -90,6 +90,12 @@ func runClient(args []string) error {
 			// so this is future-proofing for a browser-mux POST
 			// landing on the sandbox later.
 			pr.Out.Host = pr.In.Host
+			// Marks the request as coming through the desktop client
+			// so the sandbox renders /_local/sync-dependent UI (the
+			// push/pull buttons). Not a trust boundary — the sync
+			// endpoints only exist here on the client, never on the
+			// sandbox — just keeps dead buttons out of direct access.
+			pr.Out.Header.Set("X-Webdiff-Client", "1")
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("proxy %s %s: %v", r.Method, r.URL.Path, err)

@@ -207,11 +207,57 @@
       msgInput.style.height=msgInput.scrollHeight+'px';
       msgInput.style.overflowY=msgInput.scrollHeight>120?'auto':'hidden';
     }
+    // Attachments staged for the next message. Each entry is the
+    // server's response {path,name,bytes}. They're sent as a trailing
+    // "Attachments:\n- <path>" appendix on the next pane input — keeps
+    // big logs and binaries out of the tmux paste buffer while still
+    // pointing the agent at something it can `cat` (or read with its
+    // own file tools) on the sandbox.
+    var attachments=[];
+    var attachBox=document.getElementById('stream-attachments');
+    function refreshAttachments(){
+      if(!attachBox)return;
+      attachBox.innerHTML='';
+      if(attachments.length===0){attachBox.hidden=true;return}
+      attachBox.hidden=false;
+      attachments.forEach(function(a,idx){
+        var chip=document.createElement('span');chip.className='attachment-chip';
+        var label=document.createElement('span');label.className='attachment-name';
+        label.textContent=a.name;
+        label.title=a.path+' ('+formatBytes(a.bytes)+')';
+        var x=document.createElement('button');x.type='button';x.className='attachment-del';x.textContent='×';
+        x.title='remove this attachment';
+        x.addEventListener('click',function(){
+          attachments.splice(idx,1);refreshAttachments();
+        });
+        chip.appendChild(label);chip.appendChild(x);
+        attachBox.appendChild(chip);
+      });
+      syncPad();
+    }
+    function formatBytes(n){
+      if(!n&&n!==0)return '';
+      if(n<1024)return n+' B';
+      if(n<1024*1024)return (n/1024).toFixed(1)+' KB';
+      return (n/(1024*1024)).toFixed(1)+' MB';
+    }
     function sendMessage(){
       var t=msgInput.value;
-      if(!t)return;
-      postInput({text:t}).then(function(){
+      if(!t&&attachments.length===0)return;
+      var body=t;
+      if(attachments.length>0){
+        // Trailing list — the agent reads the user message first, then
+        // sees an "Attachments:" appendix it can fan out into reads.
+        // Keeping it as a bare list (no other prose) means a re-prompt
+        // doesn't accidentally restate the attachments.
+        if(body)body+='\n\n';
+        body+=attachments.length===1?'Attachment:\n- ':'Attachments:\n- ';
+        body+=attachments.map(function(a){return a.path}).join('\n- ');
+      }
+      postInput({text:body}).then(function(){
         msgInput.value='';
+        attachments=[];
+        refreshAttachments();
         resizeMsg();
       });
     }
@@ -222,23 +268,217 @@
       });
       msgInput.addEventListener('input',resizeMsg);
     }
-    // Restart wires through to /api/pane/restart, which kills the
-    // current tmux session. After the kill we navigate to the same
-    // /agent<refURL> the diff page's agent button hits — that handler
-    // spawns a fresh session and 303s back to the stream view.
+
+    // Attach modal — paste a big blob of text or drop a file. The
+    // upload posts JSON with base64-encoded contents (multipart would
+    // need a CSRF carve-out in safeweb's config; sticking to JSON
+    // keeps the API surface uniform). The 20 MB cap lives on the
+    // server too — this is just a friendly client-side check.
+    var ATTACH_MAX=20*1024*1024;
+    var attachBtn=document.getElementById('pane-attach');
+    function bytesToBase64(bytes){
+      // chunk so a multi-MB attachment doesn't blow String.fromCharCode's
+      // argument-count limit on some engines.
+      var CHUNK=0x8000;var parts=[];
+      for(var i=0;i<bytes.length;i+=CHUNK){
+        parts.push(String.fromCharCode.apply(null,bytes.subarray(i,i+CHUNK)));
+      }
+      return btoa(parts.join(''));
+    }
+    function uploadAttachment(name,bytes){
+      if(bytes.length>ATTACH_MAX){
+        window.alert('Attachment too large: '+formatBytes(bytes.length)+' (max '+formatBytes(ATTACH_MAX)+')');
+        return Promise.reject(new Error('too large'));
+      }
+      return fetch('/api/pane/attach',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({paneID:paneID,name:name,contentBase64:bytesToBase64(bytes)})
+      }).then(function(r){
+        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+        return r.json();
+      }).then(function(j){
+        attachments.push(j);refreshAttachments();return j;
+      });
+    }
+    function readFileBytes(file){
+      return new Promise(function(resolve,reject){
+        var fr=new FileReader();
+        fr.onerror=function(){reject(fr.error||new Error('read failed'))};
+        fr.onload=function(){resolve(new Uint8Array(fr.result))};
+        fr.readAsArrayBuffer(file);
+      });
+    }
+    function pickFileName(prefix){
+      var d=new Date();
+      function pad(n){return n<10?'0'+n:n}
+      return prefix+'-'+d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate())+'-'+pad(d.getHours())+pad(d.getMinutes())+pad(d.getSeconds())+'.txt';
+    }
+    function openAttachModal(){
+      var backdrop=document.createElement('div');backdrop.className='modal-backdrop';
+      var modal=document.createElement('div');modal.className='modal attach-modal';
+      var header=document.createElement('div');header.className='modal-header';
+      var title=document.createElement('span');title.textContent='attach context';
+      var close=document.createElement('button');close.type='button';close.className='toggle';close.textContent='close';
+      close.addEventListener('click',function(){backdrop.remove()});
+      header.appendChild(title);header.appendChild(close);
+      var bodyEl=document.createElement('div');bodyEl.className='modal-body';
+
+      // Drop zone doubles as the paste target so the user can either
+      // click "choose file", drop one onto the box, or paste text
+      // straight in. The textarea inside it captures pasted text.
+      var drop=document.createElement('div');drop.className='attach-drop';
+      var hint=document.createElement('div');hint.className='attach-hint';
+      hint.textContent='paste a large blob of text here, or drop / choose a file';
+      var ta=document.createElement('textarea');ta.className='attach-text';ta.placeholder='(paste text here)';ta.rows=8;
+      var nameRow=document.createElement('div');nameRow.className='attach-name-row';
+      var nameLabel=document.createElement('label');nameLabel.textContent='filename:';nameLabel.className='attach-name-label';
+      var nameInput=document.createElement('input');nameInput.type='text';nameInput.className='attach-name-input';
+      nameInput.placeholder=pickFileName('paste');
+      nameRow.appendChild(nameLabel);nameRow.appendChild(nameInput);
+      var picker=document.createElement('input');picker.type='file';picker.className='attach-file-input';
+      var pickBtn=document.createElement('button');pickBtn.type='button';pickBtn.className='toggle';pickBtn.textContent='choose file…';
+      pickBtn.addEventListener('click',function(){picker.click()});
+      drop.appendChild(hint);drop.appendChild(ta);drop.appendChild(nameRow);drop.appendChild(pickBtn);drop.appendChild(picker);
+      bodyEl.appendChild(drop);
+
+      var footer=document.createElement('div');footer.className='modal-footer';
+      var status=document.createElement('span');status.className='attach-status';
+      var addBtn=document.createElement('button');addBtn.type='button';addBtn.className='toggle send-btn';addBtn.textContent='attach';
+      footer.appendChild(status);footer.appendChild(addBtn);
+
+      function setBusy(msg){
+        status.textContent=msg||'';addBtn.disabled=!!msg;pickBtn.disabled=!!msg;
+      }
+      function handleFile(file){
+        setBusy('uploading '+file.name+'…');
+        readFileBytes(file).then(function(bytes){
+          return uploadAttachment(file.name,bytes);
+        }).then(function(){
+          backdrop.remove();
+        }).catch(function(e){
+          setBusy('');window.alert('attach failed: '+(e&&e.message||e));
+        });
+      }
+      function handleText(){
+        var t=ta.value;
+        if(!t)return;
+        var nm=(nameInput.value||'').trim()||pickFileName('paste');
+        var enc=new TextEncoder().encode(t);
+        setBusy('uploading…');
+        uploadAttachment(nm,enc).then(function(){
+          backdrop.remove();
+        }).catch(function(e){
+          setBusy('');window.alert('attach failed: '+(e&&e.message||e));
+        });
+      }
+      addBtn.addEventListener('click',function(){
+        if(picker.files&&picker.files[0]){handleFile(picker.files[0]);return}
+        handleText();
+      });
+      picker.addEventListener('change',function(){
+        if(picker.files&&picker.files[0])handleFile(picker.files[0]);
+      });
+      // Drop anywhere on the .attach-drop region. preventDefault on
+      // dragover is what tells the browser the region accepts a drop.
+      ['dragenter','dragover'].forEach(function(t){
+        drop.addEventListener(t,function(ev){ev.preventDefault();drop.classList.add('attach-drop-over')});
+      });
+      ['dragleave','drop'].forEach(function(t){
+        drop.addEventListener(t,function(ev){ev.preventDefault();drop.classList.remove('attach-drop-over')});
+      });
+      drop.addEventListener('drop',function(ev){
+        var f=ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files[0];
+        if(f)handleFile(f);
+      });
+
+      modal.appendChild(header);modal.appendChild(bodyEl);modal.appendChild(footer);
+      backdrop.appendChild(modal);
+      backdrop.addEventListener('click',function(ev){if(ev.target===backdrop)backdrop.remove()});
+      document.body.appendChild(backdrop);
+      // Defer focus a tick so the textarea captures the user's next
+      // paste even if they triggered this via keyboard.
+      setTimeout(function(){ta.focus()},0);
+    }
+    if(attachBtn)attachBtn.addEventListener('click',openAttachModal);
+    // Restart pops a single confirm modal *before* the kill. Opening it
+    // hits /api/pane/history-url, which archives the live scrollback and
+    // returns its plain-text /history/<id> URL without touching the
+    // session — so the modal can show a copyable history link for the next
+    // session up front. The modal's confirm button is what actually kills
+    // (via /api/pane/restart) and navigates to /agent<refURL>, the same
+    // handler the diff page's agent button hits, which spawns a fresh
+    // session and 303s back to the stream view.
     var restartBtn=document.getElementById('restart-session');
     if(restartBtn){
+      function showRestartModal(historyURL,repoURL){
+        var fullURL=historyURL?(window.location.origin+historyURL):'';
+        var backdrop=document.createElement('div');backdrop.className='modal-backdrop';
+        var modal=document.createElement('div');modal.className='modal';
+        var header=document.createElement('div');header.className='modal-header';
+        var title=document.createElement('span');title.textContent='restart session';
+        var close=document.createElement('button');close.type='button';close.className='toggle';close.textContent='cancel';
+        close.addEventListener('click',function(){backdrop.remove()});
+        header.appendChild(title);header.appendChild(close);
+        var bodyEl=document.createElement('div');bodyEl.className='modal-body';
+        var note=document.createElement('p');note.className='modal-note';
+        note.textContent=fullURL
+          ?'The tmux session will be killed and a fresh one started. Its scrollback is archived first — copy this URL to give the next session its history:'
+          :'The tmux session will be killed and a fresh one started.';
+        bodyEl.appendChild(note);
+        var urlInput;
+        if(fullURL){
+          urlInput=document.createElement('input');urlInput.type='text';urlInput.readOnly=true;
+          urlInput.className='history-url-input';urlInput.value=fullURL;
+          bodyEl.appendChild(urlInput);
+        }
+        var footer=document.createElement('div');footer.className='modal-footer';
+        if(fullURL){
+          var copyBtn=document.createElement('button');copyBtn.type='button';copyBtn.className='toggle';copyBtn.textContent='copy';
+          copyBtn.addEventListener('click',function(){
+            function ok(){copyBtn.textContent='copied';setTimeout(function(){copyBtn.textContent='copy'},1500)}
+            urlInput.focus();urlInput.select();
+            if(navigator.clipboard&&navigator.clipboard.writeText){
+              navigator.clipboard.writeText(fullURL).then(ok,function(){try{document.execCommand('copy');ok()}catch(e){}});
+            }else{try{document.execCommand('copy');ok()}catch(e){}}
+          });
+          footer.appendChild(copyBtn);
+        }
+        var goBtn=document.createElement('button');goBtn.type='button';goBtn.className='toggle send-btn';goBtn.textContent='kill & start fresh';
+        goBtn.addEventListener('click',function(){
+          goBtn.disabled=true;
+          fetch('/api/pane/restart',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({paneID:paneID})
+          }).then(function(r){
+            if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+            window.location.href='/agent'+repoURL;
+          }).catch(function(e){
+            goBtn.disabled=false;
+            window.alert('restart failed: '+e.message);
+          });
+        });
+        footer.appendChild(goBtn);
+        modal.appendChild(header);modal.appendChild(bodyEl);modal.appendChild(footer);
+        backdrop.appendChild(modal);
+        backdrop.addEventListener('click',function(ev){if(ev.target===backdrop)backdrop.remove()});
+        document.body.appendChild(backdrop);
+        if(urlInput)setTimeout(function(){urlInput.focus();urlInput.select()},0);
+      }
       restartBtn.addEventListener('click',function(){
-        if(!window.confirm('Kill the tmux session and start a fresh one? Scrollback will be lost.'))return;
         var repoURL=restartBtn.dataset.repoUrl||'/';
         restartBtn.disabled=true;
-        fetch('/api/pane/restart',{
+        fetch('/api/pane/history-url',{
           method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({paneID:paneID})
         }).then(function(r){
           if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
-          window.location.href='/agent'+repoURL;
+          return r.json().catch(function(){return {}});
+        }).then(function(j){
+          restartBtn.disabled=false;
+          showRestartModal(j&&j.historyURL,repoURL);
         }).catch(function(e){
           restartBtn.disabled=false;
           window.alert('restart failed: '+e.message);
@@ -362,6 +602,7 @@
   var wtNewBtn=document.getElementById('wt-new-btn');
   var wtRow=document.getElementById('wt-create-row');
   var wtBranch=document.getElementById('wt-branch');
+  var wtFromMain=document.getElementById('wt-from-main');
   var wtSubmit=document.getElementById('wt-create-submit');
   var wtCancel=document.getElementById('wt-create-cancel');
   if(wtNewBtn&&wtRow){
@@ -380,7 +621,7 @@
       fetch('/api/worktrees/create',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({repo:repo,branch:branch})
+        body:JSON.stringify({repo:repo,branch:branch,fromMain:wtFromMain&&wtFromMain.checked})
       }).then(function(r){
         if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
         return r.json();
@@ -462,9 +703,25 @@
 
   function anyOpen(){return Array.from(details).some(function(d){return d.open})}
   function refreshBtn(){if(btn)btn.textContent=anyOpen()?'collapse all':'expand all'}
+  // When a file collapses while the user is scrolled past its top
+  // (typically: read to the bottom of a long diff, then collapsed),
+  // pin the just-closed summary at its sticky offset. Without this,
+  // the document shrinks under a preserved scrollY and dumps the user
+  // far below — disorienting because the heading they just acted on
+  // is now off-screen.
+  function stickyOffset(){
+    var s=getComputedStyle(document.documentElement);
+    var h=parseFloat(s.getPropertyValue('--page-heading-h'))||0;
+    var p=parseFloat(s.getPropertyValue('--pillbar-h'))||0;
+    return h+p;
+  }
   details.forEach(function(d){
     d.addEventListener('toggle',function(){
       state[d.id]=d.open;save(state);refreshBtn();
+      if(d.open)return;
+      var off=stickyOffset();
+      var target=d.getBoundingClientRect().top+window.scrollY-off;
+      if(window.scrollY>target+1)window.scrollTo(0,Math.max(0,target));
     });
   });
   refreshBtn();
@@ -703,6 +960,11 @@
     if(ev.target.closest('.comment-bubble,.comment-composer,.comment-del,.toggle,a,button,input,textarea'))return;
     var line=ev.target.closest('.line[data-file]');
     if(!line)return;
+    // Lines split into gutter + code (delta) only start a comment when
+    // the press lands on the gutter — the code column is left to native
+    // text selection so it can be copied without the line numbers. Lines
+    // with no gutter (raw `git diff`) accept a press anywhere, as before.
+    if(line.querySelector('.line-gutter')&&!ev.target.closest('.line-gutter'))return;
     ev.preventDefault();
     dragStart=line;
     clearDragHighlight();
@@ -739,6 +1001,40 @@
       ev.preventDefault();ev.stopPropagation();
       openComposer({kind:'file',anchor:el,file:el.dataset.fileComment||''},null);
     });
+  });
+
+  // Faithful multi-line copy. Each diff row is a block, and browsers
+  // derive the newlines in copied text from block boundaries — but only
+  // for blocks that hold selected text. A blank source line renders an
+  // empty .line-tail (the line-number gutter is user-select:none), so it
+  // contributes no text and its newline is silently dropped: `a`/blank/`b`
+  // copies as "a\nb". We rebuild the plaintext ourselves from the
+  // .line-tail of every row the selection touches, joined by \n, so blank
+  // rows keep their newline. Only engages for multi-row selections inside
+  // the diff body; single-row and chrome/bubble copies fall through to
+  // native.
+  function clippedText(range,el){
+    var full=document.createRange();full.selectNodeContents(el);
+    var out=document.createRange();out.selectNodeContents(el);
+    if(range.compareBoundaryPoints(Range.START_TO_START,full)>0)out.setStart(range.startContainer,range.startOffset);
+    if(range.compareBoundaryPoints(Range.END_TO_END,full)<0)out.setEnd(range.endContainer,range.endOffset);
+    return out.toString();
+  }
+  document.addEventListener('copy',function(ev){
+    var sel=window.getSelection();
+    if(!sel||sel.isCollapsed||sel.rangeCount===0)return;
+    var range=sel.getRangeAt(0);
+    var anc=range.commonAncestorContainer;
+    if(anc.nodeType===3)anc=anc.parentNode;
+    if(!anc.closest)return;
+    var inner=anc.closest('.term-inner');
+    if(!inner)return;
+    if(anc.closest('.comment-bubble,.comment-composer,textarea,input'))return;
+    var rows=Array.prototype.filter.call(inner.querySelectorAll('.line'),function(l){return sel.containsNode(l,true)});
+    if(rows.length<2)return;
+    var text=rows.map(function(l){return clippedText(range,l.querySelector('.line-tail')||l)}).join('\n');
+    ev.clipboardData.setData('text/plain',text);
+    ev.preventDefault();
   });
 
   renderAllBubbles();
@@ -934,8 +1230,10 @@
       if(stats&&s.files>0){
         var noun=s.files===1?'file':'files';
         var html='<span class="stats-files">'+s.files+' '+noun+'</span>';
-        if(s.ins>0)html+=' <span class="stats-ins">+'+s.ins+'</span>';
-        if(s.del>0)html+=' <span class="stats-del">-'+s.del+'</span>';
+        // Counts go in data-stat and render via CSS pseudo-content so no
+        // digits sit in a text node for iOS to dial — see webdiff.go.
+        if(s.ins>0)html+=' <span class="stats-ins" data-stat="+'+s.ins+'"></span>';
+        if(s.del>0)html+=' <span class="stats-del" data-stat="-'+s.del+'"></span>';
         stats.innerHTML=html;
       }
       if(branch)branch.textContent=s.branch||'';
