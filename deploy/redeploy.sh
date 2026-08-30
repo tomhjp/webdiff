@@ -6,7 +6,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH=/usr/local/go/bin:$PATH
 
-( cd "$repo_root" && go build -o webdiff ./... )
+( cd "$repo_root" && go build -o webdiff . )
 # setcap is dropped whenever the binary is replaced, so reapply it each build.
 sudo setcap cap_net_bind_service=+ep "$repo_root/webdiff"
 systemctl --user restart webdiff

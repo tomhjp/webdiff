@@ -160,6 +160,29 @@ a { color: var(--accent) }
 .header-buttons { display: flex; gap: 4px; flex-wrap: wrap }
 .header-buttons-right { display: flex; gap: 4px; margin-left: auto }
 .branch { color: var(--branch); font-weight: bold }
+/* Titles come in a short form (repo basename) and a full form (the
+   checkout's absolute path). Phones get the short one; on wide
+   viewports the full path is free disambiguation between repos and
+   their worktrees. Emitted by writeTitle in webdiff.go. */
+.title-full { display: none }
+/* The Zed/Ghostty hand-off links go to custom schemes that only resolve
+   on a desktop with those apps installed, so they'd be dead taps on a
+   phone. Same breakpoint as the title, for one less thing to reason
+   about. Emitted by writeOpenButtons in webdiff.go. */
+.open-link { display: none }
+@media (min-width: 900px) {
+  .title-short { display: none }
+  .title-full { display: inline }
+  .open-link { display: inline-flex; align-items: center }
+}
+/* The sprite is hidden by size rather than display:none, which in some
+   engines stops <use> resolving against it. Emitted from assets/icons.svg
+   into every page by writePage. */
+.icon-sprite { position: absolute; width: 0; height: 0; overflow: hidden }
+/* The traced marks are dense at the sizes we use them, so they get a hair
+   more room than a text glyph would. fill comes from currentColor, which
+   is what lets the link's own :hover recolour them. */
+.icon { width: 15px; height: 15px; fill: currentColor; flex: 0 0 auto }
 .workdir { color: var(--muted); text-decoration: none; font-size: 12px }
 .workdir-back::before { content: "← "; color: var(--accent) }
 .workdir-back { color: var(--accent); cursor: pointer }
@@ -191,6 +214,11 @@ a { color: var(--accent) }
 .dir-folder-tag::before { content: none }
 .dir-parent { color: var(--muted); font-size: 12px; flex-shrink: 0 }
 .dir-broken .dir-name { color: var(--muted); text-decoration: line-through }
+/* A remembered-but-no-longer-running agent session. Muted throughout so
+   it reads as inert next to the live rows above it, but still clearly a
+   link through to the archived scrollback. */
+.session-stopped .dir-name { color: var(--muted) }
+.session-stopped .dir-branch { color: var(--muted) }
 .empty { color: var(--muted); padding: 16px }
 
 /* Repo/worktree rows read "repo … <stats> <branch>". The repo path is
@@ -200,6 +228,25 @@ a { color: var(--accent) }
 .repo-row .dir-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .repo-row .dir-stats { flex: 0 0 auto }
 .repo-row .dir-branch { flex: 0 0 auto }
+
+/* A repo/worktree row is an <a> plus sibling open/copy buttons (neither a
+   button nor an anchor can nest inside an anchor). The wrapper takes over
+   the row's border and hover so they still read as one row, and hovering
+   any button lights up the whole thing. */
+.dir-row-wrap { display: flex; align-items: stretch; border-bottom: 1px solid var(--border) }
+.dir-row-wrap:hover { background: var(--chrome-bg) }
+.dir-row-wrap > .dir-row { flex: 1 1 auto; min-width: 0; border-bottom: none }
+.dir-row-wrap > .dir-row:hover { background: transparent }
+/* 📋 is a text glyph, so the tap target comes from padding rather than
+   the glyph's own size — 12px either side plus the row's own vertical
+   padding clears the 44px iOS minimum. */
+.dir-copy { flex: 0 0 auto; background: transparent; border: none; color: var(--muted); font: inherit; font-size: 13px; padding: 0 12px; cursor: pointer; -webkit-tap-highlight-color: transparent }
+.dir-copy:hover { color: var(--accent) }
+.dir-copy.copy-ok { color: var(--added) }
+/* Same treatment as .dir-copy, tightened up because these two sit side by
+   side and would otherwise push the stats off a narrow row. */
+.dir-open { flex: 0 0 auto; align-self: center; background: transparent; border: none; color: var(--muted); padding: 0 8px; text-decoration: none; -webkit-tap-highlight-color: transparent }
+.dir-open:hover { color: var(--accent) }
 .section-title { margin: 24px 0 0; padding: 8px 12px; color: var(--muted); font-size: 11px; font-weight: normal; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--border) }
 
 /* Repo rows ellipsis the dir-name because folder paths can be long
@@ -216,13 +263,16 @@ a { color: var(--accent) }
 
 .toggle { font: inherit; font-size: 12px; background: transparent; color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 8px; cursor: pointer }
 .toggle:hover { background: var(--chrome-bg) }
+/* Slightly smaller inside a .toggle so an icon button ends up the same
+   height as the text ones it sits next to in .header-buttons. */
+.toggle .icon { width: 13px; height: 13px }
 .toggle.danger { color: var(--removed); border-color: var(--removed) }
 .toggle.danger:hover { background: var(--removed); color: var(--bg) }
 .toggle.sync-busy { color: var(--muted); border-color: var(--muted) }
 .toggle.sync-ok   { color: var(--added);  border-color: var(--added) }
 .toggle.sync-err  { color: var(--removed); border-color: var(--removed) }
 
-#diff-mode-select { font: inherit; font-size: 12px; background: var(--chrome-bg); color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 4px; cursor: pointer }
+#diff-mode-select, .chrome-select { font: inherit; font-size: 12px; background: var(--chrome-bg); color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 4px; cursor: pointer }
 
 /* Pillbar and summary stickies stack below the sticky page heading.
    The offsets come from --page-heading-h and --pillbar-h, set by
@@ -331,6 +381,7 @@ details .term-container { margin: 0 }
 .modal-loc { color: var(--accent); font-size: 12px; flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .modal-text { flex: 1; color: var(--fg); font-size: 12px; white-space: pre-wrap; min-width: 0 }
 .modal-note { color: var(--muted); font-size: 12px; margin: 8px 0 6px }
+.modal-agent-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--muted); font-size: 12px }
 .history-url-input { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 6px 8px; margin-bottom: 8px; user-select: all }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--border) }
 .modal-footer .send-btn { background: var(--branch); color: var(--bg); font-weight: bold; padding: 6px 14px; border-color: var(--branch) }
@@ -430,6 +481,13 @@ details .term-container { margin: 0 }
  * branch-row colour so the crumbs read as path text rather than
  * competing with the page-heading nav buttons. Hover and the final
  * segment get accent so the user knows where they are. */
+/* The breadcrumb row scrolls horizontally rather than widening the
+   sticky heading past the viewport (a long worktree name + nested path
+   was the last source of page-level horizontal scroll on phones).
+   nowrap keeps the path on a single line inside the scroller; app.js
+   scrolls it to the right end on load so the current segment — the
+   filename — is what you see first. */
+.crumb-row { white-space: nowrap }
 .crumb { color: var(--muted); text-decoration: none }
 .crumb:hover { color: var(--accent); text-decoration: underline }
 .branch .crumb:last-of-type { color: var(--branch) }
@@ -490,3 +548,30 @@ details .term-container { margin: 0 }
 
 /* Lexer errors — wavy red underline, hard to miss but doesn't reflow. */
 .term-container .chroma .err { color: var(--removed); text-decoration: underline wavy }
+
+/* ─── rendered markdown (file viewer) ─────────────────────────────
+ * Prose reflows to the viewport, so this block never needs a
+ * page-wide horizontal scroll — that's the whole point of the view.
+ * Wide embedded content (tables, code blocks) scrolls locally
+ * instead. Same mono stack as everything else so the page still
+ * reads as one surface; the max-width keeps line length readable
+ * when the same page is opened on a desktop. */
+.md-body { padding: 12px; max-width: 760px; line-height: 1.55; overflow-wrap: break-word }
+.md-body h1, .md-body h2, .md-body h3,
+.md-body h4, .md-body h5, .md-body h6 { margin: 1.4em 0 0.5em; line-height: 1.25 }
+.md-body h1 { font-size: 20px; border-bottom: 1px solid var(--border); padding-bottom: 6px }
+.md-body h2 { font-size: 17px; border-bottom: 1px solid var(--border); padding-bottom: 4px }
+.md-body h3 { font-size: 15px }
+.md-body h4, .md-body h5, .md-body h6 { font-size: 13px }
+.md-body h1:first-child { margin-top: 0.2em }
+.md-body code { background: var(--chrome-bg); padding: 1px 4px }
+.md-body pre { background: var(--chrome-bg); border: 1px solid var(--border); padding: 8px; overflow-x: auto }
+.md-body pre code { background: transparent; padding: 0 }
+.md-body blockquote { margin: 0; padding: 0 12px; border-left: 2px solid var(--border); color: var(--muted) }
+.md-body table { border-collapse: collapse; display: block; max-width: max-content; overflow-x: auto }
+.md-body th, .md-body td { border: 1px solid var(--border); padding: 4px 8px; text-align: left }
+.md-body th { background: var(--chrome-bg) }
+.md-body img { max-width: 100% }
+.md-body hr { border: none; border-top: 1px solid var(--border) }
+.md-body li { margin: 0.2em 0 }
+.md-body input[type="checkbox"] { accent-color: var(--accent) }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -24,10 +25,10 @@ type syncEngine struct {
 	root          string // local mirror of sandbox rootDir (regular repos)
 	worktreesRoot string // local mirror of sandbox worktreesRoot
 
-	mu        sync.Mutex
-	locks     map[string]*sync.Mutex // per-repo serialization, keyed by kind|name
-	lastSync  map[string]time.Time   // wall-clock of the last completed sync per key
-	inFlight  map[string]bool        // set while a sync is running
+	mu       sync.Mutex
+	locks    map[string]*sync.Mutex // per-repo serialization, keyed by kind|name
+	lastSync map[string]time.Time   // wall-clock of the last completed sync per key
+	inFlight map[string]bool        // set while a sync is running
 
 	hc *http.Client
 }
@@ -47,8 +48,10 @@ func newSyncEngine(upstream *url.URL, root, worktreesRoot string) *syncEngine {
 }
 
 // localPath returns the desktop-side absolute path for (kind, name).
-// Existence is not checked here; callers decide whether to require it
-// (apply step) or auto-create (pull step).
+// Existence is not checked for repos; a worktree's slug flattens
+// `<repo>/<leaf>` into one segment, so it can only be turned back into a
+// path by matching what's on disk — a worktree we haven't mirrored yet
+// returns errNoRepo, and pullRepo falls back to localWorktreeCreatePath.
 func (e *syncEngine) localPath(kind, name string) (string, error) {
 	if !validRepoName(name) {
 		return "", fmt.Errorf("invalid repo name %q", name)
@@ -57,10 +60,45 @@ func (e *syncEngine) localPath(kind, name string) (string, error) {
 	case "repos":
 		return filepath.Join(e.root, name), nil
 	case "worktrees":
-		return filepath.Join(e.worktreesRoot, name), nil
+		repos, err := os.ReadDir(e.worktreesRoot)
+		if err != nil {
+			return "", err
+		}
+		for _, repo := range repos {
+			if !repo.IsDir() || strings.HasPrefix(repo.Name(), ".") {
+				continue
+			}
+			leaf, ok := strings.CutPrefix(name, repo.Name()+"-")
+			if !ok {
+				continue
+			}
+			abs := filepath.Join(e.worktreesRoot, repo.Name(), leaf)
+			if info, err := os.Stat(abs); err == nil && info.IsDir() {
+				return abs, nil
+			}
+		}
+		return "", fmt.Errorf("%w: worktree %q not mirrored locally", errNoRepo, name)
 	default:
 		return "", fmt.Errorf("unknown kind %q", kind)
 	}
+}
+
+// localWorktreeCreatePath is where a not-yet-mirrored worktree should be
+// created, splitting the slug on the parent repo name the sandbox
+// reported. Only the pull path can use this — the slug alone is
+// ambiguous about where the repo name ends.
+func (e *syncEngine) localWorktreeCreatePath(name, parent string) (string, error) {
+	if parent == "" {
+		return "", fmt.Errorf("sandbox didn't report parent repo for worktree %q", name)
+	}
+	leaf, ok := strings.CutPrefix(name, parent+"-")
+	if !ok || leaf == "" {
+		return "", fmt.Errorf("worktree %q is not under reported parent %q", name, parent)
+	}
+	if !validRepoName(parent) || !validRepoName(leaf) {
+		return "", fmt.Errorf("invalid worktree name %q/%q", parent, leaf)
+	}
+	return filepath.Join(e.worktreesRoot, parent, leaf), nil
 }
 
 func validRepoName(name string) bool {
@@ -170,6 +208,9 @@ func (e *syncEngine) pullRepo(kind, name string) error {
 	}
 
 	localAbs, err := e.localPath(kind, name)
+	if errors.Is(err, errNoRepo) && kind == "worktrees" {
+		localAbs, err = e.localWorktreeCreatePath(name, build.Parent)
+	}
 	if err != nil {
 		return err
 	}
@@ -266,6 +307,9 @@ func (e *syncEngine) ensureLocalRepo(kind, name, localAbs string, build syncRefB
 		branchOrHead := build.Head
 		if build.Branch != "" {
 			branchOrHead = strings.TrimPrefix(build.Branch, "refs/heads/")
+		}
+		if err := os.MkdirAll(filepath.Dir(localAbs), 0700); err != nil {
+			return err
 		}
 		out, err := exec.Command("git", "-C", parentAbs, "worktree", "add", localAbs, branchOrHead).CombinedOutput()
 		if err != nil {

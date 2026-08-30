@@ -11,7 +11,109 @@
   // logic below shouldn't run here — there are no <details> on this
   // page anyway, but bailing early keeps the two flows independent.
   var streamRoot=document.getElementById('pane-tail');
-  if(streamRoot){setupStreamPage(streamRoot);return}
+  if(streamRoot){setupStreamPage(streamRoot);setupWorktreeRemove();return}
+
+  // showHistoryModal is the shared "confirm, and here's the scrollback URL
+  // to hand the next session" dialog. Both entry points need it: restart
+  // (on the stream page, which archives then kills) and resume (on a
+  // history entry, which only spawns) — they differ solely in the copy and
+  // in what the confirm button does, so opts carries those.
+  //
+  // opts: {title, note, confirmLabel, historyURL, agents, onConfirm(done,
+  // agent)}. The confirm handler gets a `done(err)` callback to re-enable
+  // the button when its request fails, and the selected agent id when
+  // opts.agents was supplied.
+  //
+  // opts.agents: {options:[id,…], selected} renders an agent drop-down
+  // above the history URL. Omit it and the modal is exactly what it was
+  // before — the resume flow on a history page has no agent to choose.
+  function showHistoryModal(opts){
+    var fullURL=opts.historyURL?(window.location.origin+opts.historyURL):'';
+    var backdrop=document.createElement('div');backdrop.className='modal-backdrop';
+    var modal=document.createElement('div');modal.className='modal';
+    var header=document.createElement('div');header.className='modal-header';
+    var title=document.createElement('span');title.textContent=opts.title;
+    var close=document.createElement('button');close.type='button';close.className='toggle';close.textContent='cancel';
+    close.addEventListener('click',function(){backdrop.remove()});
+    header.appendChild(title);header.appendChild(close);
+    var bodyEl=document.createElement('div');bodyEl.className='modal-body';
+    var note=document.createElement('p');note.className='modal-note';
+    note.textContent=opts.note;
+    bodyEl.appendChild(note);
+    var agentSel;
+    if(opts.agents&&opts.agents.options&&opts.agents.options.length>0){
+      var row=document.createElement('label');row.className='modal-agent-row';
+      var lbl=document.createElement('span');lbl.textContent='agent';
+      agentSel=document.createElement('select');agentSel.className='chrome-select';
+      opts.agents.options.forEach(function(id){
+        var o=document.createElement('option');o.value=id;o.textContent=id;
+        if(id===opts.agents.selected)o.selected=true;
+        agentSel.appendChild(o);
+      });
+      row.appendChild(lbl);row.appendChild(agentSel);
+      bodyEl.appendChild(row);
+    }
+    var urlInput;
+    if(fullURL){
+      urlInput=document.createElement('input');urlInput.type='text';urlInput.readOnly=true;
+      urlInput.className='history-url-input';urlInput.value=fullURL;
+      bodyEl.appendChild(urlInput);
+    }
+    var footer=document.createElement('div');footer.className='modal-footer';
+    if(fullURL){
+      var copyBtn=document.createElement('button');copyBtn.type='button';copyBtn.className='toggle';copyBtn.textContent='copy';
+      copyBtn.addEventListener('click',function(){
+        function ok(){copyBtn.textContent='copied';setTimeout(function(){copyBtn.textContent='copy'},1500)}
+        urlInput.focus();urlInput.select();
+        if(navigator.clipboard&&navigator.clipboard.writeText){
+          navigator.clipboard.writeText(fullURL).then(ok,function(){try{document.execCommand('copy');ok()}catch(e){}});
+        }else{try{document.execCommand('copy');ok()}catch(e){}}
+      });
+      footer.appendChild(copyBtn);
+    }
+    var goBtn=document.createElement('button');goBtn.type='button';goBtn.className='toggle send-btn';goBtn.textContent=opts.confirmLabel;
+    goBtn.addEventListener('click',function(){
+      goBtn.disabled=true;
+      opts.onConfirm(function(err){
+        goBtn.disabled=false;
+        if(err)window.alert(err.message);
+      },agentSel?agentSel.value:'');
+    });
+    footer.appendChild(goBtn);
+    modal.appendChild(header);modal.appendChild(bodyEl);modal.appendChild(footer);
+    backdrop.appendChild(modal);
+    backdrop.addEventListener('click',function(ev){if(ev.target===backdrop)backdrop.remove()});
+    document.body.appendChild(backdrop);
+    if(urlInput)setTimeout(function(){urlInput.focus();urlInput.select()},0);
+  }
+
+  // Worktree remove — rendered on both the worktree diff page and the
+  // stream page for a worktree's pane. The stream page returns early
+  // from the diff/listing flow below, so this has to be callable from
+  // both paths rather than living inline in one of them.
+  function setupWorktreeRemove(){
+    var btn=document.getElementById('wt-remove-btn');
+    if(!btn)return;
+    btn.addEventListener('click',function(){
+      var name=btn.dataset.name;
+      if(!name)return;
+      if(!window.confirm('Remove worktree "'+name+'"? Tmux session and uncommitted changes will be lost.'))return;
+      btn.disabled=true;
+      btn.textContent='removing…';
+      fetch('/api/worktrees/remove',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:name})
+      }).then(function(r){
+        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+        location.href='/';
+      }).catch(function(e){
+        btn.disabled=false;
+        btn.textContent='remove';
+        window.alert('remove failed: '+e.message);
+      });
+    });
+  }
 
   function setupStreamPage(root){
     var paneID=root.dataset.paneId;
@@ -19,7 +121,7 @@
     var jumpBtn=document.getElementById('jump-bottom');
     // Per-line buffer mirroring the server's `lastLines` state. Each
     // entry is one pre-wrapped <span class="line">...</span> string;
-    // we never reparse it, just join + assign to innerHTML.
+    // syncDOM reconciles it without replacing unchanged rows.
     var paneLines=[];
     // `follow` tracks whether we should auto-stick the viewport to the
     // bottom on each new snapshot. It's driven entirely by the user's
@@ -68,7 +170,26 @@
         }
       }
     }
+    // Record the first visible row before an update. Mobile browsers do
+    // their own scroll anchoring, but it is unreliable when a terminal TUI
+    // redraws several rows at once. If this node survives reconciliation,
+    // explicitly put it back at the same viewport position.
+    function viewportAnchor(){
+      if(follow)return null;
+      var rows=inner.children;
+      for(var i=0;i<rows.length;i++){
+        var rect=rows[i].getBoundingClientRect();
+        if(rect.bottom>0)return {node:rows[i],top:rect.top};
+      }
+      return null;
+    }
+    function restoreViewportAnchor(anchor){
+      if(!anchor||!anchor.node.isConnected)return;
+      var shift=anchor.node.getBoundingClientRect().top-anchor.top;
+      if(Math.abs(shift)>.5)window.scrollBy(0,shift);
+    }
     function applyUpdate(msg){
+      var anchor=viewportAnchor();
       if(msg.reset){
         paneLines=msg.append?msg.append.slice():[];
       }else{
@@ -76,27 +197,26 @@
         var append=msg.append||[];
         if(drop>0){
           paneLines.splice(0,drop);
-          // streamDelta on the server falls back to drop=oldLen,
-          // append=newLen whenever it can't align old to new — i.e.
-          // any time a row in the existing buffer changed in place
-          // (cursor blink, spinner, status redraw). Ripping out every
-          // child and regenerating would nuke the user's text
-          // selection on every blink. Instead, only physically remove
-          // children when this is a genuine top shift (drop strictly
-          // less than what's on screen); otherwise leave the DOM
-          // alone and let syncDOM swap only the rows that really
-          // differ.
+          // Remove a genuine shifted-off prefix now so syncDOM can retain
+          // the unchanged rows after it (including the viewport anchor).
+          // A full replacement stays in place until syncDOM swaps rows.
           if(drop<inner.children.length){
             for(var k=0;k<drop;k++){
               if(inner.firstChild)inner.firstChild.remove();
             }
           }
         }
+        // `keep` makes live-tail redraws incremental. Pi inserts completed
+        // output above its footer/status rows; the old drop+append protocol
+        // treated that as a full-screen replacement. Missing keep means an
+        // older server and retains the old drop+append semantics.
+        var keep=(typeof msg.keep==='number')?msg.keep:paneLines.length;
+        if(paneLines.length>keep)paneLines.splice(keep);
         if(append.length)paneLines.push.apply(paneLines,append);
       }
       syncDOM();
       tagDiffBgLines();
-      if(follow)scrollToBottom();
+      if(follow)scrollToBottom();else restoreViewportAnchor(anchor);
     }
     // Reconcile DOM children against paneLines: rows whose HTML hasn't
     // changed keep their existing DOM node (and therefore any active
@@ -162,14 +282,19 @@
       };
     }
     connectStream();
-    // Force-reconnect when the tab becomes visible again. Mobile
-    // browsers don't always flip EventSource.readyState from OPEN to
-    // CLOSED until the next failed read, so we can't trust it alone
-    // to notice that the suspended-tab connection has been killed.
-    // If readyState says OPEN we leave it alone — onerror will fire
-    // (and reconnect) on the next read attempt if it's actually dead.
+    // Close the stream while the tab is hidden and reconnect when it
+    // becomes visible again. webdiff is plain HTTP/1.1, so browsers cap
+    // us at 6 connections to the host; a few backgrounded tabs each
+    // holding an idle EventSource is enough to starve every new page
+    // load, which shows up as the next tab hanging forever. Dropping
+    // the stream on hide frees the slot, and the server's first message
+    // on reconnect is a full {reset:true} snapshot so we lose nothing.
     document.addEventListener('visibilitychange',function(){
-      if(document.visibilityState!=='visible')return;
+      if(document.visibilityState!=='visible'){
+        if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null}
+        if(es){try{es.close()}catch(e){}es=null}
+        return;
+      }
       if(es&&es.readyState===1)return;
       if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null}
       reconnectDelay=500;
@@ -409,65 +534,17 @@
     // (via /api/pane/restart) and navigates to /agent<refURL>, the same
     // handler the diff page's agent button hits, which spawns a fresh
     // session and 303s back to the stream view.
+    //
+    // The modal's agent drop-down decides what the respawn runs: the
+    // chosen id goes onto /agent<refURL> as ?agent=, which the server
+    // treats as an allowlist lookup. It opens on the agent currently in
+    // the pane (data-agent-id) — restarting without touching it keeps
+    // the same agent, which is the common case.
     var restartBtn=document.getElementById('restart-session');
     if(restartBtn){
-      function showRestartModal(historyURL,repoURL){
-        var fullURL=historyURL?(window.location.origin+historyURL):'';
-        var backdrop=document.createElement('div');backdrop.className='modal-backdrop';
-        var modal=document.createElement('div');modal.className='modal';
-        var header=document.createElement('div');header.className='modal-header';
-        var title=document.createElement('span');title.textContent='restart session';
-        var close=document.createElement('button');close.type='button';close.className='toggle';close.textContent='cancel';
-        close.addEventListener('click',function(){backdrop.remove()});
-        header.appendChild(title);header.appendChild(close);
-        var bodyEl=document.createElement('div');bodyEl.className='modal-body';
-        var note=document.createElement('p');note.className='modal-note';
-        note.textContent=fullURL
-          ?'The tmux session will be killed and a fresh one started. Its scrollback is archived first — copy this URL to give the next session its history:'
-          :'The tmux session will be killed and a fresh one started.';
-        bodyEl.appendChild(note);
-        var urlInput;
-        if(fullURL){
-          urlInput=document.createElement('input');urlInput.type='text';urlInput.readOnly=true;
-          urlInput.className='history-url-input';urlInput.value=fullURL;
-          bodyEl.appendChild(urlInput);
-        }
-        var footer=document.createElement('div');footer.className='modal-footer';
-        if(fullURL){
-          var copyBtn=document.createElement('button');copyBtn.type='button';copyBtn.className='toggle';copyBtn.textContent='copy';
-          copyBtn.addEventListener('click',function(){
-            function ok(){copyBtn.textContent='copied';setTimeout(function(){copyBtn.textContent='copy'},1500)}
-            urlInput.focus();urlInput.select();
-            if(navigator.clipboard&&navigator.clipboard.writeText){
-              navigator.clipboard.writeText(fullURL).then(ok,function(){try{document.execCommand('copy');ok()}catch(e){}});
-            }else{try{document.execCommand('copy');ok()}catch(e){}}
-          });
-          footer.appendChild(copyBtn);
-        }
-        var goBtn=document.createElement('button');goBtn.type='button';goBtn.className='toggle send-btn';goBtn.textContent='kill & start fresh';
-        goBtn.addEventListener('click',function(){
-          goBtn.disabled=true;
-          fetch('/api/pane/restart',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({paneID:paneID})
-          }).then(function(r){
-            if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
-            window.location.href='/agent'+repoURL;
-          }).catch(function(e){
-            goBtn.disabled=false;
-            window.alert('restart failed: '+e.message);
-          });
-        });
-        footer.appendChild(goBtn);
-        modal.appendChild(header);modal.appendChild(bodyEl);modal.appendChild(footer);
-        backdrop.appendChild(modal);
-        backdrop.addEventListener('click',function(ev){if(ev.target===backdrop)backdrop.remove()});
-        document.body.appendChild(backdrop);
-        if(urlInput)setTimeout(function(){urlInput.focus();urlInput.select()},0);
-      }
       restartBtn.addEventListener('click',function(){
         var repoURL=restartBtn.dataset.repoUrl||'/';
+        var choices=(restartBtn.dataset.agentChoices||'').split(',').filter(Boolean);
         restartBtn.disabled=true;
         fetch('/api/pane/history-url',{
           method:'POST',
@@ -478,7 +555,28 @@
           return r.json().catch(function(){return {}});
         }).then(function(j){
           restartBtn.disabled=false;
-          showRestartModal(j&&j.historyURL,repoURL);
+          var historyURL=j&&j.historyURL;
+          showHistoryModal({
+            title:'restart session',
+            note:historyURL
+              ?'The tmux session will be killed and a fresh one started. Its scrollback is archived first — copy this URL to give the next session its history:'
+              :'The tmux session will be killed and a fresh one started.',
+            confirmLabel:'kill & start fresh',
+            historyURL:historyURL,
+            agents:{options:choices,selected:restartBtn.dataset.agentId||''},
+            onConfirm:function(done,agent){
+              fetch('/api/pane/restart',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({paneID:paneID})
+              }).then(function(r){
+                if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+                window.location.href='/agent'+repoURL+(agent?'?agent='+encodeURIComponent(agent):'');
+              }).catch(function(e){
+                done(new Error('restart failed: '+e.message));
+              });
+            }
+          });
         }).catch(function(e){
           restartBtn.disabled=false;
           window.alert('restart failed: '+e.message);
@@ -493,6 +591,49 @@
       new ResizeObserver(syncPad).observe(toolbar);
     }
     syncPad();
+  }
+
+  // History entry page: resume spawns a fresh agent session for the repo
+  // this archive belongs to, showing the archived scrollback's URL first so
+  // it can be pasted into the new session as context. No kill involved —
+  // the old session is already gone, which is why the archive is offered.
+  var resumeBtn=document.getElementById('history-resume-btn');
+  if(resumeBtn){
+    resumeBtn.addEventListener('click',function(){
+      var repoURL=resumeBtn.dataset.repoUrl||'/';
+      showHistoryModal({
+        title:'resume session',
+        note:'A fresh '+AGENT_NAME+' session will be started for this repo — copy this URL to give it the previous session’s history:',
+        confirmLabel:'start '+AGENT_NAME,
+        historyURL:resumeBtn.dataset.historyUrl||'',
+        onConfirm:function(){window.location.href='/agent'+repoURL}
+      });
+    });
+  }
+
+  // Forget drops the archive's sticky flag so it stops being offered on the
+  // home page. The scrollback stays readable under /history/, so this is
+  // dismissal rather than deletion — hence no confirm prompt.
+  var forgetBtn=document.getElementById('history-forget-btn');
+  if(forgetBtn){
+    forgetBtn.addEventListener('click',function(){
+      var id=forgetBtn.dataset.id;
+      if(!id)return;
+      forgetBtn.disabled=true;
+      forgetBtn.textContent='forgetting…';
+      fetch('/api/history/forget',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({id:id})
+      }).then(function(r){
+        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+        forgetBtn.textContent='forgotten';
+      }).catch(function(e){
+        forgetBtn.disabled=false;
+        forgetBtn.textContent='forget';
+        window.alert('forget failed: '+e.message);
+      });
+    });
   }
 
   // Listing page: poll for spinning *-wd sessions and reflect that
@@ -546,6 +687,24 @@
       // 3-line diff, not whatever expanded view they had open before.
       u.searchParams.delete('context');
       location.href=u.toString();
+    });
+  }
+
+  // Agent picker beside the diff page's spawn button. Only rendered
+  // when no session is running yet, and it retargets the sibling
+  // anchor rather than navigating itself — the button stays a plain
+  // link, and the choice is only committed when it's clicked. Changing
+  // it doesn't reload, so the page's other agent labels keep naming the
+  // default until the session actually starts.
+  var agentSelect=document.getElementById('agent-select');
+  var agentBtn=document.getElementById('agent-btn');
+  if(agentSelect&&agentBtn){
+    agentSelect.addEventListener('change',function(){
+      var u=new URL(agentBtn.href,location.href);
+      u.searchParams.set('agent',agentSelect.value);
+      agentBtn.href=u.pathname+u.search;
+      agentBtn.textContent=agentSelect.value;
+      agentBtn.title='start a '+agentSelect.value+' session for this repo';
     });
   }
 
@@ -641,31 +800,7 @@
     }
   }
 
-  // Worktree remove — worktree diff page only. Confirm-then-POST; the
-  // server kills the tmux session and tears down the dir. On success
-  // we navigate home, where the worktree is now gone from the listing.
-  var wtRemoveBtn=document.getElementById('wt-remove-btn');
-  if(wtRemoveBtn){
-    wtRemoveBtn.addEventListener('click',function(){
-      var name=wtRemoveBtn.dataset.name;
-      if(!name)return;
-      if(!window.confirm('Remove worktree "'+name+'"? Tmux session and uncommitted changes will be lost.'))return;
-      wtRemoveBtn.disabled=true;
-      wtRemoveBtn.textContent='removing…';
-      fetch('/api/worktrees/remove',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({name:name})
-      }).then(function(r){
-        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
-        location.href='/';
-      }).catch(function(e){
-        wtRemoveBtn.disabled=false;
-        wtRemoveBtn.textContent='remove';
-        window.alert('remove failed: '+e.message);
-      });
-    });
-  }
+  setupWorktreeRemove();
 
   // Sticky stack: the page heading is pinned at top:0; the pillbar
   // sticks under it; each <details>' summary sticks under the pillbar.
@@ -689,6 +824,48 @@
     if(pillbar)stickyRO.observe(pillbar);
   }
   window.addEventListener('resize',syncStickyOffsets);
+
+  // File-browser breadcrumb: when the path overflows its scroller,
+  // start at the right end — the filename is where the user is; the
+  // repo root is a swipe away.
+  var crumbRow=document.querySelector('.crumb-row');
+  if(crumbRow)crumbRow.scrollLeft=crumbRow.scrollWidth;
+
+  // Fit-width (file viewer): scale .term-container's font down until the
+  // longest line fits the viewport. This is what pinch-zoom-out *feels*
+  // like it should do but can't: the wide content lives inside an
+  // overflow-x scroller while the page itself is clamped to the device
+  // width, so zooming out just shrinks a device-width column and leaves
+  // blank space. Scaling the font instead changes the actual laid-out
+  // width. The measure→scale loop runs a few passes because glyph
+  // metrics don't shrink perfectly linearly with font-size; the 6px
+  // floor keeps a pathological 500-column line from producing invisible
+  // text (at that point the horizontal scrollbar comes back, by design).
+  var fitBtn=document.getElementById('fit-width');
+  if(fitBtn){
+    var fitBox=document.querySelector('.term-container');
+    var fitOn=false;
+    function applyFit(){
+      if(!fitBox)return;
+      fitBox.style.fontSize='';
+      if(!fitOn)return;
+      for(var i=0;i<4;i++){
+        var avail=fitBox.clientWidth;
+        var need=fitBox.scrollWidth;
+        if(need<=avail)break;
+        var cur=parseFloat(getComputedStyle(fitBox).fontSize)||13;
+        var next=Math.max(6,cur*avail/need);
+        fitBox.style.fontSize=next+'px';
+        if(next<=6)break;
+      }
+    }
+    fitBtn.addEventListener('click',function(){
+      fitOn=!fitOn;
+      fitBtn.textContent=fitOn?'1:1':'fit';
+      applyFit();
+    });
+    window.addEventListener('resize',applyFit);
+  }
 
   var FILE_KEY='webdiff:fileState';
   var details=document.querySelectorAll('details[id]');
@@ -1209,35 +1386,64 @@
   if(sendBtn)sendBtn.addEventListener('click',openCommentsModal);
 })();
 
-// Home page: per-repo branch + diff stats are not rendered server-
-// side so the page itself returns instantly. Each <a class="dir-row">
-// for a git repo or worktree carries a `data-stats-url` pointing at
-// /stats/<kind>/<name>/; we fetch each in parallel and fill the empty
-// .dir-stats / .dir-branch spans as responses arrive. Failures are
-// silent — the row just stays blank, matching how a 0-files ref
-// looked before.
+// Copy-to-clipboard for any [data-copy] element (repo/worktree rows on the
+// home page, the file-browser breadcrumb). Runs on every page, so it's
+// outside the diff-page IIFE above and doesn't reuse that flashStatus —
+// feedback is the glyph itself swapping to ✓ for a moment, which needs no
+// anchor element to position against.
+//
+// webdiff serves plain HTTP on a tailscale IP, which is not a secure
+// context, so navigator.clipboard is undefined here and the execCommand
+// path is the one that actually runs — it's the fallback in name only.
+// execCommand('copy') copies the live selection, hence the offscreen
+// textarea. We restore the previous selection afterwards so copying a path
+// doesn't clobber a selection the user was building in the diff.
 (function(){
-  var rows=document.querySelectorAll('.dir-row[data-stats-url]');
-  if(!rows.length)return;
-  rows.forEach(function(row){
-    var url=row.getAttribute('data-stats-url');
-    fetch(url,{credentials:'same-origin'}).then(function(r){
-      if(!r.ok)throw new Error(r.statusText);
-      return r.json();
-    }).then(function(s){
-      var stats=row.querySelector('.dir-stats');
-      var branch=row.querySelector('.dir-branch');
-      if(stats&&s.files>0){
-        var noun=s.files===1?'file':'files';
-        var html='<span class="stats-files">'+s.files+' '+noun+'</span>';
-        // Counts go in data-stat and render via CSS pseudo-content so no
-        // digits sit in a text node for iOS to dial — see webdiff.go.
-        if(s.ins>0)html+=' <span class="stats-ins" data-stat="+'+s.ins+'"></span>';
-        if(s.del>0)html+=' <span class="stats-del" data-stat="-'+s.del+'"></span>';
-        stats.innerHTML=html;
+  var btns=document.querySelectorAll('[data-copy]');
+  if(!btns.length)return;
+
+  function legacyCopy(text){
+    var sel=window.getSelection();
+    var prev=sel&&sel.rangeCount>0?sel.getRangeAt(0):null;
+    var ta=document.createElement('textarea');
+    ta.value=text;
+    // Off-screen rather than hidden: display:none / visibility:hidden
+    // elements can't hold a selection, so the copy would silently no-op.
+    ta.style.position='fixed';ta.style.top='-1000px';ta.style.opacity='0';
+    ta.setAttribute('readonly','');
+    document.body.appendChild(ta);
+    var ok=false;
+    try{
+      ta.focus();ta.setSelectionRange(0,ta.value.length);
+      ok=document.execCommand('copy');
+    }catch(e){}
+    ta.remove();
+    if(prev&&sel){sel.removeAllRanges();sel.addRange(prev)}
+    return ok;
+  }
+
+  Array.prototype.forEach.call(btns,function(btn){
+    var text=btn.getAttribute('data-copy');
+    var revert=null;
+    function done(ok){
+      var orig=btn.dataset.origLabel||(btn.dataset.origLabel=btn.textContent);
+      btn.textContent=ok?'✓':'✗';
+      btn.classList.toggle('copy-ok',ok);
+      clearTimeout(revert);
+      revert=setTimeout(function(){
+        btn.textContent=orig;
+        btn.classList.remove('copy-ok');
+      },1200);
+    }
+    btn.addEventListener('click',function(ev){
+      // On the home page the button sits next to a row-wide <a>; stop the
+      // event before it can reach any ancestor handler and navigate.
+      ev.preventDefault();ev.stopPropagation();
+      if(navigator.clipboard&&navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(function(){done(true)},function(){done(legacyCopy(text))});
+        return;
       }
-      if(branch)branch.textContent=s.branch||'';
-      row.removeAttribute('data-stats-url');
-    }).catch(function(){});
+      done(legacyCopy(text));
+    });
   });
 })();

@@ -18,6 +18,9 @@ import (
 	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/alecthomas/chroma/v2/styles"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/parser"
 )
 
 // File-viewer limits. Generous enough that almost all source files in a
@@ -40,6 +43,29 @@ var fileFormatter = chromahtml.New(
 	chromahtml.WithLineNumbers(true),
 	chromahtml.WithLinkableLineNumbers(true, "L"),
 )
+
+// mdRenderer converts markdown to HTML for the file viewer's rendered
+// view. GFM because that's the dialect repo docs are written in
+// (tables, strikethrough, autolinks); auto heading IDs so #fragment
+// links into a doc land somewhere. Raw HTML blocks are dropped
+// (goldmark's default) — repo content shouldn't be able to inject
+// markup into the page.
+var mdRenderer = goldmark.New(
+	goldmark.WithExtensions(extension.GFM),
+	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
+)
+
+// isMarkdownFile gates the rendered-markdown default in the file
+// viewer. Extension-based rather than lexer-based on purpose: chroma
+// would also happily claim e.g. .txt via analysis, and we only want the
+// rendered view where the author intended markdown.
+func isMarkdownFile(p string) bool {
+	switch strings.ToLower(filepath.Ext(p)) {
+	case ".md", ".markdown":
+		return true
+	}
+	return false
+}
 
 // renderFileBrowser serves /file/<kind>/<name>/<subpath>. Directories
 // render as a `.dir-list` (same chrome as the home page); regular
@@ -105,7 +131,7 @@ func renderFileBrowser(w http.ResponseWriter, r *http.Request) {
 	case info.IsDir():
 		renderFileDir(w, ref, subpath, resolved)
 	case info.Mode().IsRegular():
-		renderFileContent(w, ref, subpath, resolved, info.Size())
+		renderFileContent(w, r, ref, subpath, resolved, info.Size())
 	default:
 		http.NotFound(w, r)
 	}
@@ -178,7 +204,7 @@ func renderFileDir(w http.ResponseWriter, ref repoRef, subpath, abs string) {
 	})
 
 	var body strings.Builder
-	writeFileHeading(&body, ref, subpath, false)
+	writeFileHeading(&body, ref, subpath, headingOpts{})
 	body.WriteString(`<div class="dir-list">`)
 	if subpath != "" {
 		parent := path.Dir(subpath)
@@ -209,10 +235,14 @@ func renderFileDir(w http.ResponseWriter, ref repoRef, subpath, abs string) {
 	writePage(w, body.String())
 }
 
-// renderFileContent renders a regular file via chroma. Oversized and
+// renderFileContent renders a regular file via chroma, or — for
+// markdown, unless ?view=source — via goldmark as rendered prose.
+// Rendered is the markdown default because docs are the case where the
+// source view hurts most (long unwrapped paragraphs force a horizontal
+// scroll on mobile); prose reflows to any viewport. Oversized and
 // non-text files short-circuit to a placeholder with a "raw" link so
 // the user can still pull the bytes if they need to.
-func renderFileContent(w http.ResponseWriter, ref repoRef, subpath, abs string, size int64) {
+func renderFileContent(w http.ResponseWriter, r *http.Request, ref repoRef, subpath, abs string, size int64) {
 	if size > fileMaxRenderBytes {
 		renderFilePlaceholder(w, ref, subpath, fmt.Sprintf("file is %.1f MiB — too large to view inline", float64(size)/(1024*1024)))
 		return
@@ -231,6 +261,11 @@ func renderFileContent(w http.ResponseWriter, ref repoRef, subpath, abs string, 
 		return
 	}
 
+	if isMarkdownFile(abs) && r.URL.Query().Get("view") != "source" {
+		renderMarkdownFile(w, ref, subpath, src)
+		return
+	}
+
 	lexer := lexers.Match(abs)
 	if lexer == nil {
 		lexer = lexers.Analyse(string(src))
@@ -246,7 +281,15 @@ func renderFileContent(w http.ResponseWriter, ref repoRef, subpath, abs string, 
 	}
 
 	var body strings.Builder
-	writeFileHeading(&body, ref, subpath, true)
+	mdView := ""
+	if isMarkdownFile(abs) {
+		mdView = "source"
+	}
+	writeFileHeading(&body, ref, subpath, headingOpts{
+		raw:    true,
+		mdView: mdView,
+		fit:    true,
+	})
 	body.WriteString(`<div class="term-container"><div class="term-inner">`)
 	// styles.Fallback is unused when Classes(true) is set — chroma picks
 	// class names from the standard token taxonomy regardless of style
@@ -259,13 +302,38 @@ func renderFileContent(w http.ResponseWriter, ref repoRef, subpath, abs string, 
 	writePage(w, body.String())
 }
 
+// renderMarkdownFile serves the rendered-prose view of a markdown file.
+// The body lives in .md-body rather than .term-container: it's
+// reflowing prose, not columnar terminal output, so it must not inherit
+// the pre/nowrap/max-content layout. Wide embedded content (tables,
+// code blocks) gets its own local horizontal scroll via CSS instead of
+// widening the page.
+func renderMarkdownFile(w http.ResponseWriter, ref repoRef, subpath string, src []byte) {
+	var html bytes.Buffer
+	if err := mdRenderer.Convert(src, &html); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var body strings.Builder
+	writeFileHeading(&body, ref, subpath, headingOpts{
+		raw:    true,
+		mdView: "rendered",
+	})
+	body.WriteString(`<div class="md-body">`)
+	body.Write(html.Bytes())
+	body.WriteString(`</div>`)
+	writePage(w, body.String())
+}
+
 // renderFilePlaceholder is the bail-out view for files we won't tokenise
 // (oversized, binary). Still shows the page chrome (so navigation back
 // up the tree works) and offers a `raw` link so the bytes are reachable
 // for download.
 func renderFilePlaceholder(w http.ResponseWriter, ref repoRef, subpath, msg string) {
 	var body strings.Builder
-	writeFileHeading(&body, ref, subpath, true)
+	writeFileHeading(&body, ref, subpath, headingOpts{
+		raw: true,
+	})
 	fmt.Fprintf(&body, `<p class="empty">%s</p>`, template.HTMLEscapeString(msg))
 	writePage(w, body.String())
 }
@@ -297,11 +365,26 @@ func serveRawFile(w http.ResponseWriter, _ *http.Request, abs string, info os.Fi
 	io.Copy(w, f)
 }
 
+// headingOpts selects the per-view extras on the file-browser heading.
+// raw adds the "?raw=1" link (any regular file); mdView is "" for
+// non-markdown, else "rendered"/"source" and adds the view toggle; fit
+// adds the fit-width text-scaling button (source views only — rendered
+// prose reflows on its own).
+type headingOpts struct {
+	raw    bool
+	mdView string
+	fit    bool
+}
+
 // writeFileHeading renders the sticky title row + nav row for the file
 // browser. Row 1 is a breadcrumb of clickable path segments. Row 2 has
-// home / diff / (raw) buttons matching the diff and stream pages.
-func writeFileHeading(b *strings.Builder, ref repoRef, subpath string, includeRaw bool) {
-	b.WriteString(`<div class="page-heading"><div class="page-heading-row">`)
+// home / diff / copy / (raw) buttons matching the diff and stream pages.
+func writeFileHeading(b *strings.Builder, ref repoRef, subpath string, opts headingOpts) {
+	// The breadcrumb can easily outgrow a phone viewport (worktree names
+	// plus a nested path), so row 1 gets the same scroll-instead-of-
+	// overflow treatment as the buttons row. app.js starts it scrolled to
+	// the right end so the current file is the visible part.
+	b.WriteString(`<div class="page-heading"><div class="page-heading-row page-heading-row-scroll crumb-row">`)
 	b.WriteString(`<span class="branch">`)
 	fmt.Fprintf(b, `<a class="crumb" href="%s">%s</a>`,
 		template.HTMLEscapeString(fileBrowseURL(ref, "")),
@@ -324,9 +407,22 @@ func writeFileHeading(b *strings.Builder, ref repoRef, subpath string, includeRa
 	b.WriteString(`<div class="page-heading-row page-heading-row-scroll"><div class="header-buttons">`)
 	b.WriteString(`<a class="toggle" href="/">home</a>`)
 	fmt.Fprintf(b, `<a class="toggle" href="%s">diff</a>`, template.HTMLEscapeString(ref.url))
-	if includeRaw {
-		fmt.Fprintf(b, `<a class="toggle" href="%s?raw=1">raw</a>`,
-			template.HTMLEscapeString(fileBrowseURL(ref, subpath)))
+	// The copy button belongs to the breadcrumb above, but it lives in the
+	// controls row because app.js scrolls the crumb row to its right end —
+	// anything trailing the crumbs would start life off-screen.
+	writeCopyButton(b, filepath.Join(ref.abs, subpath), "toggle")
+	fileURL := template.HTMLEscapeString(fileBrowseURL(ref, subpath))
+	if opts.raw {
+		fmt.Fprintf(b, `<a class="toggle" href="%s?raw=1">raw</a>`, fileURL)
+	}
+	switch opts.mdView {
+	case "rendered":
+		fmt.Fprintf(b, `<a class="toggle" href="%s?view=source">source</a>`, fileURL)
+	case "source":
+		fmt.Fprintf(b, `<a class="toggle" href="%s">rendered</a>`, fileURL)
+	}
+	if opts.fit {
+		b.WriteString(`<button class="toggle" type="button" id="fit-width" title="scale text so the longest line fits the viewport">fit</button>`)
 	}
 	b.WriteString(`</div></div></div>`)
 }

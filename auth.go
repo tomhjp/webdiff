@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/netip"
+	"strings"
 
 	"tailscale.com/client/local"
 	"tailscale.com/tailcfg"
@@ -20,6 +21,10 @@ type ownerAuth struct {
 	lc      *local.Client
 	ownerID tailcfg.UserID
 	ips     []netip.Addr
+	// dnsName is this node's MagicDNS name, carried here only because
+	// the startup status read already has it and main wants it for the
+	// SSH hand-off links. Not used for auth decisions.
+	dnsName string
 }
 
 // newOwnerAuth returns an ownerAuth backed by the default Tailscale
@@ -46,6 +51,8 @@ func newOwnerAuth(ctx context.Context) (*ownerAuth, error) {
 	}
 	a.ownerID = st.Self.UserID
 	a.ips = st.Self.TailscaleIPs
+	// DNSName is fully qualified with a trailing dot ("host.tail.ts.net.").
+	a.dnsName = strings.TrimSuffix(st.Self.DNSName, ".")
 	return a, nil
 }
 

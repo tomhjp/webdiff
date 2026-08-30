@@ -302,12 +302,16 @@ func handleGitHTTPBackend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PATH_INFO has to be the basename under projectRoot, not the URL
+	// name: a worktree's slug flattens `<repo>/<leaf>` into one segment,
+	// so the two differ and http-backend would look for a repo that
+	// isn't there.
 	projectRoot := filepath.Dir(ref.abs)
 
 	env := append(os.Environ(),
 		"GIT_PROJECT_ROOT="+projectRoot,
 		"GIT_HTTP_EXPORT_ALL=1",
-		"PATH_INFO=/"+name+gitPath,
+		"PATH_INFO=/"+filepath.Base(ref.abs)+gitPath,
 		"REQUEST_METHOD="+r.Method,
 		"QUERY_STRING="+r.URL.RawQuery,
 		"CONTENT_TYPE="+r.Header.Get("Content-Type"),
@@ -382,7 +386,7 @@ func streamCGI(w http.ResponseWriter, r io.Reader) error {
 }
 
 var (
-	gitHTTPConfigMu sync.Mutex
+	gitHTTPConfigMu   sync.Mutex
 	gitHTTPConfigDone = map[string]bool{}
 )
 

@@ -64,7 +64,7 @@ type localWatcher struct {
 	w      *fsnotify.Watcher
 
 	mu       sync.Mutex
-	watching map[string]repoIdent // watched dir path → owning repo
+	watching map[string]repoIdent   // watched dir path → owning repo
 	timers   map[string]*time.Timer // repo key → debounce timer
 }
 
@@ -79,6 +79,7 @@ const (
 //     packfile writes that happen during push/fetch).
 //   - .git/refs/webdiff/sync is updated by buildSyncRef itself, which
 //     would deadlock-style loop us back into another push.
+//
 // We rely on the working-tree changes that accompany git operations
 // (e.g. `git checkout` rewrites the tracked files) to surface as
 // regular file events.
@@ -97,10 +98,7 @@ func (lw *localWatcher) rescan() error {
 	if err := lw.scanRoot("repos", lw.engine.root); err != nil {
 		return err
 	}
-	if err := lw.scanRoot("worktrees", lw.engine.worktreesRoot); err != nil {
-		return err
-	}
-	return nil
+	return lw.scanWorktrees()
 }
 
 func (lw *localWatcher) scanRoot(kind, root string) error {
@@ -122,6 +120,43 @@ func (lw *localWatcher) scanRoot(kind, root string) error {
 		ident := repoIdent{kind: kind, name: ent.Name(), abs: abs}
 		if err := lw.addRepoWatches(ident); err != nil {
 			log.Printf("watcher add %s/%s: %v", kind, ent.Name(), err)
+		}
+	}
+	return nil
+}
+
+// scanWorktrees is scanRoot one level deeper: worktrees mirror the
+// sandbox's `<worktreesRoot>/<repo>/<leaf>` layout, and the sync key is
+// the flattened "<repo>-<leaf>" slug the sandbox uses in its URLs.
+func (lw *localWatcher) scanWorktrees() error {
+	repos, err := os.ReadDir(lw.engine.worktreesRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, repo := range repos {
+		if !repo.IsDir() || strings.HasPrefix(repo.Name(), ".") {
+			continue
+		}
+		leaves, err := os.ReadDir(filepath.Join(lw.engine.worktreesRoot, repo.Name()))
+		if err != nil {
+			continue
+		}
+		for _, leaf := range leaves {
+			if !leaf.IsDir() || strings.HasPrefix(leaf.Name(), ".") {
+				continue
+			}
+			abs := filepath.Join(lw.engine.worktreesRoot, repo.Name(), leaf.Name())
+			if !isLocalGitRepo(abs) {
+				continue
+			}
+			name := repo.Name() + "-" + leaf.Name()
+			ident := repoIdent{kind: "worktrees", name: name, abs: abs}
+			if err := lw.addRepoWatches(ident); err != nil {
+				log.Printf("watcher add worktrees/%s: %v", name, err)
+			}
 		}
 	}
 	return nil

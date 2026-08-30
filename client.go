@@ -32,7 +32,7 @@ func runClient(args []string) error {
 	listenPort := fs.String("port", "9418", "local port to listen on")
 	open := fs.Bool("open", false, "open the URL in the default browser on startup")
 	rootFlag := fs.String("root", "", "local directory containing the same repos as the sandbox root; defaults to cwd")
-	worktreesFlag := fs.String("worktrees-root", "", "local directory mirroring the sandbox's managed worktrees; default <UserCacheDir>/webdiff/worktrees")
+	worktreesFlag := fs.String("worktrees-root", "", "local directory mirroring the sandbox's managed worktrees; defaults to <root>/wt")
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: webdiff client [-port N] [-open] [-root DIR] [-worktrees-root DIR] [<sandbox-host[:port]>]")
 		fmt.Fprintln(fs.Output(), "  with no host, auto-discovers the user's LLM sandbox VM")
@@ -67,7 +67,7 @@ func runClient(args []string) error {
 	if err != nil {
 		return err
 	}
-	localWorktreesRoot, err := resolveLocalWorktreesRoot(*worktreesFlag)
+	localWorktreesRoot, err := resolveLocalWorktreesRoot(*worktreesFlag, localRoot)
 	if err != nil {
 		return err
 	}
@@ -231,22 +231,18 @@ func resolveLocalRoot(flagVal string) (string, error) {
 	return abs, nil
 }
 
-func resolveLocalWorktreesRoot(flagVal string) (string, error) {
+// resolveLocalWorktreesRoot defaults to `<localRoot>/wt`, mirroring the
+// sandbox layout so a worktree's local path reads the same as its remote
+// one.
+func resolveLocalWorktreesRoot(flagVal, localRoot string) (string, error) {
+	dir := filepath.Join(localRoot, "wt")
 	if flagVal != "" {
 		abs, err := filepath.Abs(flagVal)
 		if err != nil {
 			return "", err
 		}
-		if err := os.MkdirAll(abs, 0700); err != nil {
-			return "", err
-		}
-		return abs, nil
+		dir = abs
 	}
-	ucd, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("user cache dir: %w", err)
-	}
-	dir := filepath.Join(ucd, "webdiff", "worktrees")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
 	}

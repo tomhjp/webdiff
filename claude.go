@@ -121,18 +121,21 @@ func broadcastTurnEvent(ev turnEvent) {
 func recordRepoSession(sessionName, repoPath string) {
 	var kind string
 	switch {
-	case rootDir != "" && strings.HasPrefix(repoPath, rootDir+string(os.PathSeparator)):
-		kind = "repos"
+	// worktreesRoot is inside rootDir, so it has to be tested first or
+	// every worktree would register as the repo "wt".
 	case worktreesRoot != "" && strings.HasPrefix(repoPath, worktreesRoot+string(os.PathSeparator)):
 		kind = "worktrees"
+	case rootDir != "" && strings.HasPrefix(repoPath, rootDir+string(os.PathSeparator)):
+		kind = "repos"
 	default:
 		return // not under either root — nothing to broadcast for
 	}
+	slug := worktreeSlug(repoPath)
 	ref := repoRef{
 		abs:  repoPath,
 		kind: kind,
-		name: filepath.Base(repoPath),
-		url:  "/" + kind + "/" + filepath.Base(repoPath) + "/",
+		name: slug,
+		url:  "/" + kind + "/" + slug + "/",
 	}
 	wdSessionsMu.Lock()
 	wdSessionRepo[sessionName] = ref
@@ -158,7 +161,7 @@ func startSessionWatcher(ctx context.Context) {
 }
 
 func pollWdSessions(ctx context.Context) {
-	out, err := tmuxOut(ctx, "list-sessions", "-F", "#{session_name}\t#{session_created}")
+	out, err := tmuxOut(ctx, "list-sessions", "-F", "#{session_name}\t#{session_created}\t#{pane_current_path}")
 	if err != nil {
 		if isTmuxDown(err) {
 			wdSessionsMu.Lock()
@@ -172,23 +175,47 @@ func pollWdSessions(ctx context.Context) {
 	type snap struct {
 		name    string
 		created int64
+		path    string
 		raw     string
 	}
 	var snaps []snap
 	active := map[string]bool{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		name, createdStr, _ := strings.Cut(line, "\t")
+		name, rest, _ := strings.Cut(line, "\t")
 		if !strings.HasSuffix(name, "-wd") {
 			continue
 		}
+		createdStr, path, _ := strings.Cut(rest, "\t")
 		active[name] = true
 		raw, err := tmuxOut(ctx, "capture-pane", "-p", "-t", name+":0.0")
 		if err != nil {
 			continue
 		}
 		created, _ := strconv.ParseInt(strings.TrimSpace(createdStr), 10, 64)
-		snaps = append(snaps, snap{name: name, created: created, raw: raw})
+		snaps = append(snaps, snap{name: name, created: created, path: path, raw: raw})
 	}
+
+	// Re-register any session missing from wdSessionRepo. The map is
+	// in-memory, so a webdiff restart leaves it empty while the tmux
+	// sessions it described are still running — without this, turn events
+	// never fire for them again (and the sync client's auto-pull stays
+	// dead) until someone hits /agent for that repo. The pane's cwd
+	// avoids reverse-deriving the repo from the session name — that scan
+	// can't tell a repo from a worktree sharing its basename. Use
+	// pane_current_path, not session_path: the latter is frozen at
+	// creation and doesn't follow a directory rename.
+	wdSessionsMu.RLock()
+	var unregistered []snap
+	for _, s := range snaps {
+		if _, ok := wdSessionRepo[s.name]; !ok && s.path != "" {
+			unregistered = append(unregistered, s)
+		}
+	}
+	wdSessionsMu.RUnlock()
+	for _, s := range unregistered {
+		recordRepoSession(s.name, s.path)
+	}
+
 	now := time.Now()
 	var transitions []turnEvent
 	// changed / wentIdle drive the history capture below; collected under
@@ -270,6 +297,7 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/sessions/turn-events", handleTurnEvents)
 	mux.HandleFunc("/api/worktrees/create", handleWorktreeCreate)
 	mux.HandleFunc("/api/worktrees/remove", handleWorktreeRemove)
+	mux.HandleFunc("/api/history/forget", handleHistoryForget)
 }
 
 // maxAttachmentBytes is the upper bound on a single attachment after
@@ -440,15 +468,35 @@ func handleTurnEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleWorktreeCreate creates a managed worktree under worktreesRoot
-// for a named branch of a repo under rootDir. The on-disk name is
-// `<repoBasename>-<sanitizedLastBranchSegment>` — taking only the last
-// `/`-separated piece of the branch keeps the convention `tongue/foo`
-// → `foo` rather than `tongue-foo`, matching the user's local branch
-// naming. If the branch already exists locally git just checks it out
-// into the new worktree; otherwise it's created via `-b` from the
-// fetched origin/main (when "from main" is set), the current HEAD, or
-// origin/<branch> if the branch already exists on the remote.
+// defaultRemote returns the name of the remote to fetch from. It prefers
+// "origin" when present, else falls back to the sole remote when exactly
+// one is configured (repos like tailscale name their only remote "ro").
+// Returns ("", false) when there's no unambiguous choice.
+func defaultRemote(repo string) (string, bool) {
+	out, err := exec.Command("git", "-C", repo, "remote").Output()
+	if err != nil {
+		return "", false
+	}
+	remotes := strings.Fields(strings.TrimSpace(string(out)))
+	for _, r := range remotes {
+		if r == "origin" {
+			return "origin", true
+		}
+	}
+	if len(remotes) == 1 {
+		return remotes[0], true
+	}
+	return "", false
+}
+
+// handleWorktreeCreate creates a managed worktree at
+// `<worktreesRoot>/<repo>/<leaf>` for a named branch of a repo under
+// rootDir, and reports it under the flattened `<repo>-<leaf>` slug (see
+// worktreeSlug). If the branch already exists locally git just checks it
+// out into the new worktree; otherwise it's created via `-b` from the
+// fetched <remote>/main (when "from main" is set), the current HEAD, or
+// <remote>/<branch> if the branch already exists on the remote. The
+// remote is resolved via defaultRemote rather than hardcoding "origin".
 func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -474,33 +522,52 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown repo", http.StatusNotFound)
 		return
 	}
-	slug := sanitizeBranchName(req.Branch)
-	if slug == "" {
+	leaf := worktreeLeaf(req.Branch)
+	if leaf == "" {
 		http.Error(w, "branch name has no usable characters", http.StatusBadRequest)
 		return
 	}
-	name := ref.name + "-" + slug
-	wtPath := filepath.Join(worktreesRoot, name)
+	name := ref.name + "-" + leaf
+	wtPath := filepath.Join(worktreesRoot, ref.name, leaf)
 	if _, err := os.Stat(wtPath); err == nil {
-		writeJSON(w, http.StatusOK, map[string]string{"url": "/worktrees/" + name + "/"})
+		writeJSON(w, http.StatusOK, map[string]string{"url": "/worktrees/" + name + "/", "path": wtPath})
+		return
+	}
+	// Slugs flatten two path segments, so distinct paths can collide.
+	// Refuse rather than shadow an existing worktree, which resolveRepoRef
+	// would then resolve to whichever sorts first.
+	for _, wt := range listManagedWorktrees() {
+		if wt.Name == name {
+			http.Error(w, "worktree slug "+name+" is already taken by "+wt.Path, http.StatusConflict)
+			return
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(wtPath), 0700); err != nil {
+		http.Error(w, "cannot create worktree parent dir: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	exec.Command("git", "-C", ref.abs, "fetch", "origin", req.Branch).Run()
+	remote, hasRemote := defaultRemote(ref.abs)
+	if hasRemote {
+		exec.Command("git", "-C", ref.abs, "fetch", remote, req.Branch).Run()
+	}
 
 	localExists := exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/heads/"+req.Branch).Run() == nil
-	remoteExists := exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/remotes/origin/"+req.Branch).Run() == nil
+	remoteBranch := "refs/remotes/" + remote + "/" + req.Branch
+	remoteExists := hasRemote && exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", remoteBranch).Run() == nil
 
 	var addCmd *exec.Cmd
 	if localExists {
 		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", wtPath, req.Branch)
 	} else if remoteExists {
-		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath, "refs/remotes/origin/"+req.Branch)
+		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath, remoteBranch)
 	} else if req.FromMain {
-		exec.Command("git", "-C", ref.abs, "fetch", "origin", "main").Run()
 		base := "main"
-		if exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/remotes/origin/main").Run() == nil {
-			base = "refs/remotes/origin/main"
+		if hasRemote {
+			exec.Command("git", "-C", ref.abs, "fetch", remote, "main").Run()
+			if exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/remotes/"+remote+"/main").Run() == nil {
+				base = "refs/remotes/" + remote + "/main"
+			}
 		}
 		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath, base)
 	} else {
@@ -510,7 +577,11 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "git worktree add failed: "+strings.TrimSpace(string(out)), http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"url": "/worktrees/" + name + "/"})
+	if err := statsManager.RefreshDiscovery(r.Context()); err != nil {
+		http.Error(w, "refresh worktree stats: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": "/worktrees/" + name + "/", "path": wtPath})
 }
 
 // handleWorktreeRemove tears down a managed worktree: kills its tmux
@@ -547,6 +618,12 @@ func handleWorktreeRemove(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Outside the branch above: the usual order is that the session died on
+	// its own (leaving its archive flagged live) and only later did the
+	// user remove the worktree. Removing the worktree is unambiguously
+	// deliberate either way, and once the directory is gone there's nothing
+	// left to resume into.
+	clearSessionLive(sessName)
 
 	// `git worktree remove` needs to run from inside the parent repo, not
 	// the worktree itself (the worktree's git common dir tells us where).
@@ -563,13 +640,22 @@ func handleWorktreeRemove(w http.ResponseWriter, r *http.Request) {
 	// Belt-and-braces: ensure both the worktree dir and its diff cache
 	// are gone regardless of how `git worktree remove` fared.
 	_ = os.RemoveAll(ref.abs)
-	_ = os.RemoveAll(filepath.Join(repoCacheRoot, ref.name))
+	_ = indexCache.Remove("worktrees-" + ref.name)
+	// Don't leave an empty `wt/<repo>` behind. Remove, not RemoveAll, so
+	// it no-ops while sibling worktrees are still there.
+	if grouping := filepath.Dir(ref.abs); grouping != worktreesRoot {
+		_ = os.Remove(grouping)
+	}
 	// If the worktree was already broken before we touched it, git's
 	// remove command was skipped above and any registered worktree
 	// metadata in some parent repo's .git/worktrees/ is now stale.
 	// Prune every known repo so future `git worktree list` calls stay
 	// clean. Cheap — one tiny git call per repo.
 	pruneAllRepos()
+	if err := statsManager.RefreshDiscovery(ctx); err != nil {
+		http.Error(w, "refresh repo stats: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -616,15 +702,21 @@ func worktreeParentGitDir(wtPath string) (string, bool) {
 	return filepath.Dir(common), true
 }
 
-// sanitizeBranchName lowercases a full branch name and reduces it to
-// characters safe in a single directory component, folding the path
-// separators a branch may carry (e.g. "feature/foo") into dashes
-// rather than stripping the prefix — the worktree dir keeps the whole
-// branch so two branches sharing a leaf don't collide. Empty input or
-// input that reduces to nothing returns "" — the caller rejects that
-// case so we don't end up with `<repo>-` worktree dirs.
-func sanitizeBranchName(s string) string {
-	s = strings.ToLower(s)
+// ownerBranchPrefix is stripped from a branch when naming its worktree
+// dir: every branch here is prefixed with it, so keeping it would just
+// pad every path with the same seven characters.
+const ownerBranchPrefix = "tomhjp/"
+
+// worktreeLeaf reduces a branch name to the leaf directory its worktree
+// lives in, e.g. "tomhjp/fix-x" → "fix-x" and "gabriel/queue-metrics" →
+// "gabriel-queue-metrics". Any remaining path separator folds to a dash
+// rather than nesting deeper, since worktreeSlug expects exactly one
+// level below the repo. Empty input or input that reduces to nothing
+// returns "" — the caller rejects that case so we never create a
+// worktree dir with an empty name.
+func worktreeLeaf(branch string) string {
+	s := strings.ToLower(branch)
+	s = strings.TrimPrefix(s, ownerBranchPrefix)
 	var b strings.Builder
 	for _, r := range s {
 		switch {
@@ -636,7 +728,8 @@ func sanitizeBranchName(s string) string {
 			b.WriteRune('-')
 		}
 	}
-	return b.String()
+	// A leading dot would make the dir invisible to managedWorktreePaths.
+	return strings.TrimLeft(b.String(), ".")
 }
 
 // allowedPaneKeys is the whitelist for /api/pane/input's `key` field.
@@ -789,6 +882,10 @@ func handlePaneRestart(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, "tmux kill-session failed: "+err.Error(), nil)
 		return
 	}
+	// Only after the kill succeeded: a failed kill leaves the session
+	// running, and clearing early would drop it off the home page while
+	// it's still alive.
+	clearSessionLive(name)
 	resp := struct {
 		HistoryURL string `json:"historyURL,omitempty"`
 	}{}
@@ -826,7 +923,10 @@ func handleCommentsSend(w http.ResponseWriter, r *http.Request) {
 	}
 	prompt := formatPrompt(repoPath, req.Comments)
 
-	pane, err := ensureRepoSession(ctx, repoPath)
+	// No agent id: sending comments only spawns when the session has
+	// died, and there's no reviewer choice attached to a send. That
+	// respawn gets the default agent.
+	pane, err := ensureRepoSession(ctx, repoPath, "")
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, err.Error(), nil)
 		return
@@ -844,7 +944,11 @@ func handleCommentsSend(w http.ResponseWriter, r *http.Request) {
 // successful send so the reviewer can watch the agent's output without
 // switching to tmux. There's no idle detection — the browser closes the
 // stream when the user clicks "stop" (or navigates away, which cancels
-// the request context).
+// the request context). An idle pane emits nothing, so we send a
+// periodic SSE comment as a keepalive; without it a peer that vanished
+// without a FIN (suspended mobile browser, dropped VPN path) leaves the
+// connection established forever, since a stream with no writes never
+// notices the other end is gone.
 //
 // Each event's data is a JSON object: {"html": "..."} with the rendered
 // pane content, or {"error": "..."} if a capture failed (after which we
@@ -902,8 +1006,9 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 	// that brings the client up to date:
 	//
 	//   • first tick / unalignable redraw → {reset: true, append: all}
-	//   • shifted history + new tail      → {drop: k, append: tail}
-	//   • pure append                     → {drop: 0, append: tail}
+	//   • shifted history + new tail      → {drop: k, keep: n, append: tail}
+	//   • pure append                     → {drop: 0, keep: oldLen, append: tail}
+	//   • in-place tail redraw            → {drop: 0, keep: prefix, append: tail}
 	//
 	// The drop/append framing handles the common tmux case (history
 	// fills up, oldest lines fall off the top while new ones append
@@ -919,20 +1024,24 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 	// (the agent's spinners / typing) emits fire at a steady ~750 ms
 	// cadence so mobile clients don't pay for every cursor blink.
 	//
-	// `-S -` starts the capture at the top of the pane history rather
-	// than the top of the visible area, so the reviewer sees the
-	// scrollback the agent has produced too — without it, anything that
-	// has scrolled off-screen in the tmux pane is invisible here.
+	// `-S` starts the capture above the visible area, so the reviewer
+	// sees the scrollback the agent has produced too — without it,
+	// anything that has scrolled off-screen in the tmux pane is
+	// invisible here. But `-S -` (the whole history) makes each poll
+	// cost O(history): with the default 100k-line history-limit the
+	// tmux server ends up pinned serializing hundreds of KB per tick,
+	// so cap the capture at the most recent streamCaptureLines lines.
 	const (
-		streamPollInterval    = 100 * time.Millisecond
+		streamPollInterval    = 250 * time.Millisecond
 		streamEmitMinInterval = 750 * time.Millisecond
+		streamCaptureLines    = 2000
 	)
 	var lastRaw string
 	var pending []string
 	var lastSent []string
 	var lastEmit time.Time
 	snapshot := func() bool {
-		out, err := tmuxOut(ctx, "capture-pane", "-p", "-e", "-S", "-", "-t", paneID)
+		out, err := tmuxOut(ctx, "capture-pane", "-p", "-e", "-S", strconv.Itoa(-streamCaptureLines), "-t", paneID)
 		if err != nil {
 			send(map[string]string{"error": err.Error()})
 			return false
@@ -968,14 +1077,14 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 		if lastSent == nil {
 			ok = send(map[string]any{"reset": true, "append": pending})
 		} else {
-			drop, appendLines := streamDelta(lastSent, pending)
-			if drop == 0 && len(appendLines) == 0 {
+			drop, keep, appendLines := streamDelta(lastSent, pending)
+			if drop == 0 && keep == len(lastSent) && len(appendLines) == 0 {
 				lastSent = pending
 				pending = nil
 				lastEmit = time.Now()
 				return true
 			}
-			ok = send(map[string]any{"drop": drop, "append": appendLines})
+			ok = send(map[string]any{"drop": drop, "keep": keep, "append": appendLines})
 		}
 		if !ok {
 			return false
@@ -991,10 +1100,20 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 	}
 	ticker := time.NewTicker(streamPollInterval)
 	defer ticker.Stop()
+	// 30s matches handleTurnEvents. The write itself only errors once
+	// TCP gives up on retransmits, but each keepalive restarts that
+	// clock, so a dead peer is reaped within minutes rather than never.
+	keepalive := time.NewTicker(30 * time.Second)
+	defer keepalive.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-keepalive.C:
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		case <-ticker.C:
 			if !snapshot() {
 				return
@@ -1003,36 +1122,43 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// streamDelta finds the smallest drop+append patch that turns the
-// client's last-known buffer (`old`) into the new buffer (`new`). It
-// scans for the smallest k such that old[k:] is a prefix of new — the
-// idea being that tmux history shifts up by k lines as oldest lines
-// fall off the top, and any remaining new content lands at the
-// bottom. If no such k exists the buffer was redrawn (banner repaint,
-// pager exit, screen clear), and we fall back to "drop everything,
-// append everything" — correct, just not minimal.
+// streamDelta finds a drop+keep+append patch that turns the client's
+// last-known buffer (`old`) into `new`:
 //
-// The scan is O(N²) worst case but in practice exits at the first or
-// second iteration: typical k is 0 (append-only) or a single-digit
-// shift.
-func streamDelta(old, new []string) (drop int, appendLines []string) {
-	for drop = 0; drop <= len(old); drop++ {
-		remaining := old[drop:]
-		if len(remaining) > len(new) {
-			continue
+//	new = old[drop : drop+keep] + appendLines
+//
+// Besides ordinary terminal output, this handles full-screen agents such as
+// Pi. Pi keeps a live footer at the bottom and inserts completed output just
+// above it, so the old buffer is not a prefix of the new one even though most
+// of its rows are unchanged. Keeping the longest old suffix that matches the
+// new prefix lets the browser retain those DOM nodes and its scroll anchor;
+// only the live tail is replaced.
+//
+// The scan is O(N²) worst case, but normal candidates fail on their first row
+// and the winning candidate then consumes almost the entire capture.
+func streamDelta(old, new []string) (drop, keep int, appendLines []string) {
+	bestDrop, bestKeep := len(old), 0
+	for candidate := 0; candidate < len(old); candidate++ {
+		n := min(len(old)-candidate, len(new))
+		matched := 0
+		for matched < n && old[candidate+matched] == new[matched] {
+			matched++
 		}
-		match := true
-		for i := range remaining {
-			if remaining[i] != new[i] {
-				match = false
-				break
-			}
+		if matched > bestKeep {
+			bestDrop, bestKeep = candidate, matched
 		}
-		if match {
-			return drop, new[len(remaining):]
+		// No later suffix can beat this one.
+		if bestKeep >= len(old)-candidate-1 {
+			break
 		}
 	}
-	return len(old), new
+	// A lone matching row in an otherwise redrawn screen is more likely a
+	// coincidental blank/separator than a useful anchor. Preserve the previous
+	// all-replace behaviour in that case.
+	if bestKeep < 2 && bestKeep < len(old) {
+		bestDrop, bestKeep = len(old), 0
+	}
+	return bestDrop, bestKeep, new[bestKeep:]
 }
 
 // ensureRepoSession returns the agent pane in the tmux session
@@ -1043,7 +1169,11 @@ func streamDelta(old, new []string) (drop int, appendLines []string) {
 // up its initial pane (window 0, pane 0) — webdiff always puts the
 // agent there, and ignoring later splits the user might have made
 // keeps the behaviour predictable.
-func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
+//
+// agentID selects which agent to spawn (see resolveAgent); it only
+// matters on the creating call, since an existing session is already
+// running whatever it was started with.
+func ensureRepoSession(ctx context.Context, repoPath, agentID string) (Pane, error) {
 	name := repoSessionName(repoPath)
 	recordRepoSession(name, repoPath)
 	if sessionExists(ctx, name) {
@@ -1053,11 +1183,12 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 		}
 		return Pane{ID: strings.TrimSpace(out), Label: name}, nil
 	}
+	wantName, wantCmd := resolveAgent(agentID)
 
-	// `bash -lc <agentCmd>` (rather than execing the agent directly) so
+	// `bash -lc <cmd>` (rather than execing the agent directly) so
 	// the new pane picks up the user's login PATH — the agent binary
 	// typically lives in ~/.local/bin which isn't on the systemd unit's
-	// inherited PATH. agentCmd is passed as a single string so any
+	// inherited PATH. The command is passed as a single string so any
 	// flags configured by the operator are honoured. `-c repoPath` so
 	// the agent starts already cd'd to the repo.
 	//
@@ -1073,7 +1204,7 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 	if _, err := tmuxOut(ctx, "set-option", "-t", name, "history-limit", "100000"); err != nil {
 		return Pane{}, fmt.Errorf("tmux set-option history-limit: %w", err)
 	}
-	out, err := tmuxOut(ctx, "new-window", "-t", name, "-c", repoPath, "-P", "-F", "#{pane_id}", "bash", "-lc", agentCmd)
+	out, err := tmuxOut(ctx, "new-window", "-t", name, "-c", repoPath, "-P", "-F", "#{pane_id}", "bash", "-lc", wantCmd)
 	if err != nil {
 		return Pane{}, fmt.Errorf("tmux new-window: %w", err)
 	}
@@ -1089,7 +1220,7 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 	}
 
 	// Wait until pane_current_command matches the agent's binary name
-	// (the first token of agentCmd) AND the pane content has been
+	// (the first token of its command) AND the pane content has been
 	// visually stable for stableFor. The TUI plays an animated banner
 	// while initialising; the static input prompt that follows is the
 	// reliable signal that it's ready to receive bracketed paste.
@@ -1109,7 +1240,7 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 		default:
 		}
 		cmd, err := tmuxOut(ctx, "display", "-t", paneID, "-p", "#{pane_current_command}")
-		if err != nil || strings.TrimSpace(cmd) != agentName {
+		if err != nil || strings.TrimSpace(cmd) != wantName {
 			time.Sleep(pollInterval)
 			continue
 		}
@@ -1126,7 +1257,7 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 		}
 		time.Sleep(pollInterval)
 	}
-	return Pane{}, fmt.Errorf("%s didn't start within 15 s", agentName)
+	return Pane{}, fmt.Errorf("%s didn't start within 15 s", wantName)
 }
 
 // handleStartSession ensures the ref's webdiff-<base> tmux session
@@ -1136,6 +1267,10 @@ func ensureRepoSession(ctx context.Context, repoPath string) (Pane, error) {
 // diff page's agent header button uses this so a single button works
 // whether the session is already running (fast lookup) or needs to
 // be spawned (~5 s for the bash → agent exec to settle).
+//
+// `?agent=<id>` picks which agent to spawn, and is echoed onto the
+// redirect so a reload of the stream page still shows which one is
+// running.
 func handleStartSession(w http.ResponseWriter, r *http.Request) {
 	repoURL := strings.TrimPrefix(r.URL.Path, "/agent")
 	ref, ok := resolveRepoRef(repoURL)
@@ -1143,39 +1278,66 @@ func handleStartSession(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if _, err := ensureRepoSession(r.Context(), ref.abs); err != nil {
+	agentID := r.URL.Query().Get("agent")
+	if _, err := ensureRepoSession(r.Context(), ref.abs, agentID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	http.Redirect(w, r, "/stream"+ref.url, http.StatusSeeOther)
+	http.Redirect(w, r, "/stream"+ref.url+agentQuery(agentID), http.StatusSeeOther)
 }
 
-// repoStreamPane returns the pane id and session label for the repo's
-// webdiff tmux session if it already exists. Returns ("", "") when the
-// session hasn't been spawned yet (the diff page hides the stream link
-// in that case — readers don't need a "stream" link before there's
-// anything to stream). Failures past existence (the display lookup
-// erroring out) are also reported as not-running so a transient tmux
-// hiccup just removes the link rather than breaking page render.
-func repoStreamPane(ctx context.Context, repoPath string) (paneID, label string) {
+// repoStreamPane returns the pane id, session label and running agent
+// id for the repo's webdiff tmux session if it already exists. Returns
+// zero values when the session hasn't been spawned yet (the diff page
+// hides the stream link in that case — readers don't need a "stream"
+// link before there's anything to stream). Failures past existence (the
+// display lookup erroring out) are also reported as not-running so a
+// transient tmux hiccup just removes the link rather than breaking page
+// render.
+func repoStreamPane(ctx context.Context, repoPath string) (paneID, label, agentID string) {
 	name := repoSessionName(repoPath)
 	if !sessionExists(ctx, name) {
-		return "", ""
+		return "", "", ""
 	}
-	out, err := tmuxOut(ctx, "display", "-t", name+":0.0", "-p", "#{pane_id}")
+	out, err := tmuxOut(ctx, "display", "-t", name+":0.0", "-p", "#{pane_id}\t#{pane_start_command}")
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
-	return strings.TrimSpace(out), name
+	id, start, _ := strings.Cut(strings.TrimSpace(out), "\t")
+	return id, name, agentFromStartCommand(start)
 }
 
-// repoSessionName derives the tmux session name for a repo path.
-// The basename gives something readable in `tmux list-sessions` and
-// the `-wd` suffix scopes it to this tool without burying the repo
-// name at the end of a long prefix. Characters tmux disallows in
-// session names (`.`, `:`) are squashed to dashes.
+// agentFromStartCommand extracts the agent id from a pane's
+// pane_start_command, which for a webdiff-spawned pane is the
+// `bash -lc <cmd>` wrapper ensureRepoSession used. Returns "" when the
+// command names something we don't recognise — a user's own pane, or a
+// session left over from a differently configured -agent flag — so
+// callers fall back to the default rather than showing a bogus label.
+func agentFromStartCommand(start string) string {
+	cmd := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(start), "bash -lc "))
+	if cmd == "" {
+		return ""
+	}
+	// Compare against the whole command so an -agent value carrying
+	// flags still matches, then fall back to its first token, which is
+	// what a knownAgents id is.
+	if cmd == agentCmd {
+		return agentName
+	}
+	name, _, _ := strings.Cut(cmd, " ")
+	if _, ok := knownAgents[name]; ok {
+		return name
+	}
+	return ""
+}
+
+// repoSessionName derives the tmux session name for a repo path. The
+// slug gives something readable in `tmux list-sessions` and the `-wd`
+// suffix scopes it to this tool without burying the repo name at the
+// end of a long prefix. Characters tmux disallows in session names
+// (`.`, `:`) are squashed to dashes.
 func repoSessionName(repoPath string) string {
-	base := filepath.Base(filepath.Clean(repoPath))
+	base := worktreeSlug(repoPath)
 	if base == "" || base == "." || base == "/" {
 		base = "default"
 	}
@@ -1403,11 +1565,18 @@ func rewriteFileHrefs(s string) string {
 // startup and the cost is a couple of stat-free Clean calls per OSC 8
 // link, which is negligible at the SSE emit cadence.
 func mapFilePathToWebdiff(absPath, fragment string) string {
+	sep := string(filepath.Separator)
+	// worktreesRoot sits inside rootDir, so it has to be tried first —
+	// otherwise every worktree path matches the repos scope as the repo
+	// "wt". A worktree also spends two path segments (<repo>/<leaf>) on
+	// its identity where a repo spends one.
 	for _, scope := range []struct {
-		kind, root string
+		kind    string
+		root    string
+		nameLen int
 	}{
-		{"repos", rootDir},
-		{"worktrees", worktreesRoot},
+		{"worktrees", worktreesRoot, 2},
+		{"repos", rootDir, 1},
 	} {
 		if scope.root == "" {
 			continue
@@ -1417,20 +1586,32 @@ func mapFilePathToWebdiff(absPath, fragment string) string {
 			continue
 		}
 		rootAbs = filepath.Clean(rootAbs)
-		prefix := rootAbs + string(filepath.Separator)
+		prefix := rootAbs + sep
 		if !strings.HasPrefix(absPath, prefix) {
 			continue
 		}
 		rest := strings.TrimPrefix(absPath, prefix)
-		parts := strings.SplitN(rest, string(filepath.Separator), 2)
-		repoName := parts[0]
-		if repoName == "" || strings.HasPrefix(repoName, ".") {
+		parts := strings.SplitN(rest, sep, scope.nameLen+1)
+		if len(parts) < scope.nameLen {
 			continue
 		}
-		out := "/file/" + scope.kind + "/" + url.PathEscape(repoName) + "/"
-		if len(parts) == 2 && parts[1] != "" {
+		var bad bool
+		for _, p := range parts[:scope.nameLen] {
+			if p == "" || strings.HasPrefix(p, ".") {
+				bad = true
+			}
+		}
+		if bad {
+			continue
+		}
+		name := strings.Join(parts[:scope.nameLen], "-")
+		if scope.kind == "repos" && filepath.Join(rootAbs, name) == worktreesRoot {
+			continue
+		}
+		out := "/file/" + scope.kind + "/" + url.PathEscape(name) + "/"
+		if len(parts) > scope.nameLen && parts[scope.nameLen] != "" {
 			var encoded []string
-			for seg := range strings.SplitSeq(parts[1], string(filepath.Separator)) {
+			for seg := range strings.SplitSeq(parts[scope.nameLen], sep) {
 				if seg == "" {
 					continue
 				}
