@@ -172,6 +172,10 @@ func TestAllManagedRefs(t *testing.T) {
 }
 
 func TestWorktreeLeaf(t *testing.T) {
+	oldPrefix := defaultBranchPrefix
+	defaultBranchPrefix = "tomhjp/"
+	t.Cleanup(func() { defaultBranchPrefix = oldPrefix })
+
 	cases := []struct{ branch, want string }{
 		{"tomhjp/fix-x", "fix-x"},
 		{"tomhjp/Fix-X", "fix-x"},
@@ -187,6 +191,26 @@ func TestWorktreeLeaf(t *testing.T) {
 	for _, tc := range cases {
 		if got := worktreeLeaf(tc.branch); got != tc.want {
 			t.Errorf("worktreeLeaf(%q) = %q, want %q", tc.branch, got, tc.want)
+		}
+	}
+}
+
+func TestHomeBranchName(t *testing.T) {
+	oldPrefix := defaultBranchPrefix
+	defaultBranchPrefix = "tomhjp/"
+	t.Cleanup(func() { defaultBranchPrefix = oldPrefix })
+
+	cases := []struct {
+		branch string
+		want   string
+	}{
+		{"tomhjp/fix-x", "fix-x"},
+		{"other/fix-x", "other/fix-x"},
+		{"main", "main"},
+	}
+	for _, tc := range cases {
+		if got := homeBranchName(tc.branch); got != tc.want {
+			t.Errorf("homeBranchName(%q) = %q, want %q", tc.branch, got, tc.want)
 		}
 	}
 }

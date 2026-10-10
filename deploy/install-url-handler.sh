@@ -9,9 +9,9 @@
 # where <ssh-host> is the same value the server was started with
 # (-ssh-host), i.e. whatever `ssh <host>` you'd type by hand.
 #
-# Zed needs none of this — it registers zed:// itself and the buttons use
-# its documented zed://ssh/<host>/<path> hotlink form. Ghostty has no
-# inbound URL scheme, so this bridges the gap.
+# Zed and VS Code need none of this — they register their own URL schemes
+# and the buttons use their SSH remote link forms. Ghostty has no inbound
+# URL scheme, so this bridges the gap.
 #
 # Safe to re-run; it replaces the previously installed handler.
 set -euo pipefail

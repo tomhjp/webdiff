@@ -36,6 +36,42 @@ func TestStreamDelta(t *testing.T) {
 	}
 }
 
+func TestSortSessionPanes(t *testing.T) {
+	panes := []SessionPane{
+		{
+			Session:  "z-old",
+			Index:    "0.0",
+			LastUsed: 100,
+		},
+		{
+			Session:  "b-new",
+			Index:    "1.0",
+			LastUsed: 300,
+		},
+		{
+			Session:  "a-new",
+			Index:    "1.1",
+			LastUsed: 300,
+		},
+		{
+			Session:  "a-new",
+			Index:    "0.0",
+			LastUsed: 300,
+		},
+	}
+
+	sortSessionPanes(panes)
+
+	got := make([]string, 0, len(panes))
+	for _, pane := range panes {
+		got = append(got, pane.Session+":"+pane.Index)
+	}
+	want := []string{"a-new:0.0", "a-new:1.1", "b-new:1.0", "z-old:0.0"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("sorted panes = %v, want %v", got, want)
+	}
+}
+
 func TestRewriteFileHrefs(t *testing.T) {
 	rootDir = "/tmp/webdiff-test"
 	worktreesRoot = "/tmp/webdiff-test/wt"

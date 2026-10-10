@@ -9,9 +9,11 @@ Type=simple
 WorkingDirectory=__CODE_DIR__
 # __SSH_HOST_ARG__ is either empty or "-ssh-host=<alias>", templated in by
 # deploy/install.sh. It names how your *laptop* SSHes here, which the
-# Zed/Ghostty buttons need and the server can't infer; without it they
-# fall back to this node's MagicDNS name.
-ExecStart=__CODE_DIR__/webdiff/webdiff __SSH_HOST_ARG__ 80
+# Zed/VS Code/Ghostty buttons need and the server can't infer; without it they
+# fall back to this node's MagicDNS name. The local deployment defaults new
+# agent sessions to pi and new branches to the tomhjp/ prefix; individual
+# sessions can still select another agent.
+ExecStart=__CODE_DIR__/webdiff/webdiff -agent=pi -branch-prefix=tomhjp/ __SSH_HOST_ARG__ 80
 Restart=on-failure
 RestartSec=2
 KillMode=process

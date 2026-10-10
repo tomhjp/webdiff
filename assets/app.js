@@ -119,6 +119,25 @@
     var paneID=root.dataset.paneId;
     var inner=root.querySelector('.term-inner');
     var jumpBtn=document.getElementById('jump-bottom');
+    var favicon=document.getElementById('favicon');
+    var agentSession=root.dataset.agentSession;
+    var faviconWasSpinning=false;
+    function setFavicon(path){
+      if(favicon)favicon.href=path;
+    }
+    function pollFaviconStatus(){
+      if(!agentSession)return;
+      fetch('/api/sessions/spinning')
+        .then(function(r){return r.json()})
+        .then(function(spinning){
+          var nowSpinning=!!spinning[agentSession];
+          if(nowSpinning)setFavicon('/favicon-progress.svg');
+          else if(faviconWasSpinning)setFavicon('/favicon-complete.svg');
+          faviconWasSpinning=nowSpinning;
+        }).catch(function(){});
+    }
+    pollFaviconStatus();
+    if(agentSession)setInterval(pollFaviconStatus,2000);
     // Per-line buffer mirroring the server's `lastLines` state. Each
     // entry is one pre-wrapped <span class="line">...</span> string;
     // syncDOM reconciles it without replacing unchanged rows.
@@ -323,6 +342,79 @@
     });
     var msgInput=document.getElementById('pane-msg');
     var sendMsgBtn=document.getElementById('pane-send');
+
+    // Add the selected stream text at the saved message cursor position.
+    var quoteBtn=document.getElementById('pane-quote');
+    var selectedQuote='';
+    var draggedQuote='';
+    function streamSelection(){
+      var sel=window.getSelection();
+      if(!sel||sel.rangeCount===0||sel.isCollapsed)return null;
+      if(!inner.contains(sel.anchorNode)||!inner.contains(sel.focusNode))return null;
+      var text=sel.toString().replace(/\r\n?/g,'\n').replace(/\u00a0/g,' ');
+      if(!text.trim())return null;
+      return {text:text};
+    }
+    function refreshQuoteButton(){
+      var selected=streamSelection();
+      selectedQuote=selected?selected.text:'';
+      quoteBtn.disabled=!selectedQuote;
+      quoteBtn.title=selectedQuote
+        ?'quote selected text in the message (or drag it into the input)'
+        :'select text in the pane to quote it';
+    }
+    function quoteText(text){
+      var quote=text.replace(/\n+$/,'').split('\n').map(function(line){return '> '+line}).join('\n');
+      var start=msgInput.selectionStart;
+      var end=msgInput.selectionEnd;
+      var before=msgInput.value.slice(0,start);
+      var after=msgInput.value.slice(end);
+      var prefix=before&&!/\n\n$/.test(before)?(/\n$/.test(before)?'\n':'\n\n'):'';
+      var suffix=after&&!/^\n\n/.test(after)?(/^\n/.test(after)?'\n':'\n\n'):'\n\n';
+      var insertion=prefix+quote+suffix;
+      msgInput.setRangeText(insertion,start,end,'end');
+      msgInput.focus();
+      resizeMsg();
+    }
+    function clearQuoteSelection(){
+      window.getSelection().removeAllRanges();
+      refreshQuoteButton();
+    }
+    document.addEventListener('selectionchange',refreshQuoteButton);
+    quoteBtn.addEventListener('mousedown',function(ev){ev.preventDefault()});
+    quoteBtn.addEventListener('click',function(){
+      if(!selectedQuote)return;
+      quoteText(selectedQuote);
+      clearQuoteSelection();
+    });
+    refreshQuoteButton();
+
+    // Handle only text dragged from this pane. Keep other drops unchanged.
+    inner.addEventListener('dragstart',function(ev){
+      var selected=streamSelection();
+      if(!selected||!ev.dataTransfer)return;
+      draggedQuote=selected.text;
+      ev.dataTransfer.effectAllowed='copy';
+      msgInput.classList.add('stream-msg-quote-drop');
+    });
+    function clearQuoteDrag(){
+      draggedQuote='';
+      msgInput.classList.remove('stream-msg-quote-drop');
+    }
+    msgInput.addEventListener('dragover',function(ev){
+      if(!draggedQuote)return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect='copy';
+    });
+    msgInput.addEventListener('drop',function(ev){
+      if(!draggedQuote)return;
+      ev.preventDefault();
+      quoteText(draggedQuote);
+      clearQuoteDrag();
+      clearQuoteSelection();
+    });
+    document.addEventListener('dragend',clearQuoteDrag);
+
     // resizeMsg keeps the textarea sized to its content up to the CSS
     // max-height (120px). We toggle overflow-y here rather than leaving it
     // `auto` in CSS because desktop browsers paint a scrollbar gutter for
@@ -449,20 +541,19 @@
       header.appendChild(title);header.appendChild(close);
       var bodyEl=document.createElement('div');bodyEl.className='modal-body';
 
-      // Drop zone doubles as the paste target so the user can either
-      // click "choose file", drop one onto the box, or paste text
-      // straight in. The textarea inside it captures pasted text.
+      // Use the drop zone to choose files, drop files, or paste text.
+      // The textarea captures pasted text.
       var drop=document.createElement('div');drop.className='attach-drop';
       var hint=document.createElement('div');hint.className='attach-hint';
-      hint.textContent='paste a large blob of text here, or drop / choose a file';
+      hint.textContent='paste a large blob of text here, or drop / choose files';
       var ta=document.createElement('textarea');ta.className='attach-text';ta.placeholder='(paste text here)';ta.rows=8;
       var nameRow=document.createElement('div');nameRow.className='attach-name-row';
       var nameLabel=document.createElement('label');nameLabel.textContent='filename:';nameLabel.className='attach-name-label';
       var nameInput=document.createElement('input');nameInput.type='text';nameInput.className='attach-name-input';
       nameInput.placeholder=pickFileName('paste');
       nameRow.appendChild(nameLabel);nameRow.appendChild(nameInput);
-      var picker=document.createElement('input');picker.type='file';picker.className='attach-file-input';
-      var pickBtn=document.createElement('button');pickBtn.type='button';pickBtn.className='toggle';pickBtn.textContent='choose file…';
+      var picker=document.createElement('input');picker.type='file';picker.multiple=true;picker.className='attach-file-input';
+      var pickBtn=document.createElement('button');pickBtn.type='button';pickBtn.className='toggle';pickBtn.textContent='choose files…';
       pickBtn.addEventListener('click',function(){picker.click()});
       drop.appendChild(hint);drop.appendChild(ta);drop.appendChild(nameRow);drop.appendChild(pickBtn);drop.appendChild(picker);
       bodyEl.appendChild(drop);
@@ -475,14 +566,31 @@
       function setBusy(msg){
         status.textContent=msg||'';addBtn.disabled=!!msg;pickBtn.disabled=!!msg;
       }
-      function handleFile(file){
-        setBusy('uploading '+file.name+'…');
-        readFileBytes(file).then(function(bytes){
-          return uploadAttachment(file.name,bytes);
-        }).then(function(){
-          backdrop.remove();
-        }).catch(function(e){
-          setBusy('');window.alert('attach failed: '+(e&&e.message||e));
+      function handleFiles(files){
+        if(addBtn.disabled)return;
+        var selected=Array.from(files||[]);
+        if(!selected.length)return;
+        picker.value='';
+        var errors=[];
+        setBusy('uploading…');
+        // Upload one file at a time to limit memory use.
+        var pending=Promise.resolve();
+        selected.forEach(function(file,idx){
+          pending=pending.then(function(){
+            setBusy('uploading '+file.name+' ('+(idx+1)+'/'+selected.length+')…');
+            return readFileBytes(file).then(function(bytes){
+              return uploadAttachment(file.name,bytes);
+            }).catch(function(e){
+              errors.push(file.name+': '+(e&&e.message||e));
+            });
+          });
+        });
+        pending.then(function(){
+          if(errors.length){
+            setBusy('');window.alert('attach failed:\n'+errors.join('\n'));
+          }else{
+            backdrop.remove();
+          }
         });
       }
       function handleText(){
@@ -498,11 +606,11 @@
         });
       }
       addBtn.addEventListener('click',function(){
-        if(picker.files&&picker.files[0]){handleFile(picker.files[0]);return}
+        if(picker.files&&picker.files.length){handleFiles(picker.files);return}
         handleText();
       });
       picker.addEventListener('change',function(){
-        if(picker.files&&picker.files[0])handleFile(picker.files[0]);
+        handleFiles(picker.files);
       });
       // Drop anywhere on the .attach-drop region. preventDefault on
       // dragover is what tells the browser the region accepts a drop.
@@ -513,8 +621,7 @@
         drop.addEventListener(t,function(ev){ev.preventDefault();drop.classList.remove('attach-drop-over')});
       });
       drop.addEventListener('drop',function(ev){
-        var f=ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files[0];
-        if(f)handleFile(f);
+        handleFiles(ev.dataTransfer&&ev.dataTransfer.files);
       });
 
       modal.appendChild(header);modal.appendChild(bodyEl);modal.appendChild(footer);
@@ -653,39 +760,67 @@
     setInterval(pollSpinning,2000);
   }
 
-  // Diff-mode persistence lives entirely client-side: localStorage
-  // remembers the user's last pick, and we redirect-on-load when the URL
-  // doesn't already have a `?mode=…` so the rendered page matches.
-  // Server defaults to HEAD (working) when the URL has no mode, which
-  // means a fresh URL paste / external link sees the simple default.
-  var MODE_KEY='webdiff:diffMode';
-  function loadStoredMode(){try{return localStorage.getItem(MODE_KEY)||''}catch(e){return ''}}
-  function saveStoredMode(m){
-    try{
-      if(!m||m==='working')localStorage.removeItem(MODE_KEY);
-      else localStorage.setItem(MODE_KEY,m);
-    }catch(e){}
-  }
-  var pageURL=new URL(location.href);
-  var urlMode=pageURL.searchParams.get('mode');
-  var storedMode=loadStoredMode();
-  if(!urlMode&&storedMode&&storedMode!=='working'){
-    pageURL.searchParams.set('mode',storedMode);
-    location.replace(pageURL.toString());
-    return;
-  }
-  if(urlMode)saveStoredMode(urlMode);
-  var modeSelect=document.getElementById('diff-mode-select');
-  if(modeSelect){
-    modeSelect.addEventListener('change',function(){
-      saveStoredMode(modeSelect.value);
+  // Store exclusions per checkout. Select new commits by default.
+  var diffPicker=document.getElementById('diff-picker');
+  if(diffPicker){
+    var pickerToggle=document.getElementById('diff-picker-toggle');
+    var pickerMenu=document.getElementById('diff-picker-menu');
+    var choices=pickerMenu.querySelectorAll('input[type="checkbox"]');
+    var selectionKey='webdiff:changes:'+location.pathname;
+    function saveSelection(){
+      var excluded=[];
+      choices.forEach(function(c){if(!c.checked)excluded.push(c.value)});
+      try{
+        if(excluded.length)localStorage.setItem(selectionKey,JSON.stringify(excluded));
+        else localStorage.removeItem(selectionKey);
+      }catch(e){}
+    }
+    var selectionURL=new URL(location.href);
+    if(selectionURL.searchParams.has('changes')){
+      saveSelection();
+    }else{
+      var excluded=[];
+      try{
+        var saved=JSON.parse(localStorage.getItem(selectionKey)||'[]');
+        if(Array.isArray(saved))excluded=saved;
+      }catch(e){}
+      var restored=[];
+      choices.forEach(function(c){if(excluded.indexOf(c.value)===-1)restored.push(c.value)});
+      if(restored.length!==choices.length)selectionURL.searchParams.set('changes',restored.join(','));
+    }
+    selectionURL.searchParams.delete('mode');
+    if(selectionURL.toString()!==location.href){
+      location.replace(selectionURL.toString());
+      return;
+    }
+    // Keep the menu outside the toolbar's touch-scroll container.
+    document.body.appendChild(pickerMenu);
+    function closePicker(){pickerMenu.hidden=true;pickerToggle.setAttribute('aria-expanded','false')}
+    pickerToggle.addEventListener('click',function(){
+      if(!pickerMenu.hidden){closePicker();return}
+      var rect=pickerToggle.getBoundingClientRect();
+      var top=rect.bottom+4;
+      pickerMenu.style.top=top+'px';
+      pickerMenu.style.maxHeight=Math.max(44,window.innerHeight-top-12)+'px';
+      pickerMenu.hidden=false;
+      pickerToggle.setAttribute('aria-expanded','true');
+    });
+    document.addEventListener('click',function(ev){
+      if(!diffPicker.contains(ev.target)&&!pickerMenu.contains(ev.target))closePicker();
+    });
+    document.addEventListener('keydown',function(ev){if(ev.key==='Escape')closePicker()});
+    window.addEventListener('resize',closePicker);
+    document.getElementById('diff-picker-all').addEventListener('click',function(){choices.forEach(function(c){c.checked=true})});
+    document.getElementById('diff-picker-none').addEventListener('click',function(){choices.forEach(function(c){c.checked=false})});
+    document.getElementById('diff-picker-apply').addEventListener('click',function(){
+      var selected=[];
+      choices.forEach(function(c){if(c.checked)selected.push(c.value)});
       var u=new URL(location.href);
-      if(modeSelect.value==='working')u.searchParams.delete('mode');
-      else u.searchParams.set('mode',modeSelect.value);
-      // Switching modes resets the per-view "full context" toggle —
-      // most users picking a different base want to see the default
-      // 3-line diff, not whatever expanded view they had open before.
+      u.searchParams.delete('mode');
       u.searchParams.delete('context');
+      saveSelection();
+      if(selected.length===choices.length)u.searchParams.delete('changes');
+      else u.searchParams.set('changes',selected.join(','));
       location.href=u.toString();
     });
   }
@@ -752,7 +887,8 @@
     });
   });
 
-  // Worktree create — repo diff page only. Clicking "+ worktree"
+  // Worktree creation is available on repo and worktree diff pages.
+  // Clicking "+ worktree"
   // reveals an inline form; submitting POSTs to /api/worktrees/create
   // and navigates to the new worktree's diff page. The form stays
   // visually attached to the page heading rather than floating as a
@@ -767,9 +903,13 @@
   if(wtNewBtn&&wtRow){
     function openWt(){
       wtRow.hidden=false;
-      if(wtBranch){wtBranch.focus();wtBranch.select()}
+      if(wtBranch){
+        wtBranch.focus();
+        wtBranch.setSelectionRange(wtBranch.value.length,wtBranch.value.length);
+      }
     }
-    function closeWt(){wtRow.hidden=true;if(wtBranch)wtBranch.value=''}
+    var wtDefaultBranch=wtBranch?wtBranch.value:'';
+    function closeWt(){wtRow.hidden=true;if(wtBranch)wtBranch.value=wtDefaultBranch}
     wtNewBtn.addEventListener('click',function(){wtRow.hidden?openWt():closeWt()});
     if(wtCancel)wtCancel.addEventListener('click',closeWt);
     function submitWt(){
@@ -780,7 +920,7 @@
       fetch('/api/worktrees/create',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({repo:repo,branch:branch,fromMain:wtFromMain&&wtFromMain.checked})
+        body:JSON.stringify({repo:repo,kind:wtRow.dataset.kind,branch:branch,fromMain:wtFromMain&&wtFromMain.checked})
       }).then(function(r){
         if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
         return r.json();
@@ -1331,6 +1471,7 @@
       var c={file:'',oldLine:'',newLine:'',text:t,ts:Date.now()};
       var arr=loadComments();arr.push(c);saveComments(arr);
       overallTa.value='';
+      overallTa.blur();
       appendRow(c);refreshSendBtn();refreshState();
     }
     addBtn.addEventListener('click',commitOverall);

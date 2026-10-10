@@ -9,16 +9,18 @@ func TestWriteOpenButtons(t *testing.T) {
 	saved := sshHost
 	defer func() { sshHost = saved }()
 
-	t.Run("emits both schemes", func(t *testing.T) {
+	t.Run("emits all schemes", func(t *testing.T) {
 		sshHost = "slop"
 		var b strings.Builder
 		writeOpenButtons(&b, "/home/ubuntu/ai/webdiff", "dir-open")
 		got := b.String()
 		for _, want := range []string{
 			`href="zed://ssh/slop/home/ubuntu/ai/webdiff"`,
+			`href="vscode://vscode-remote/ssh-remote+slop/home/ubuntu/ai/webdiff"`,
 			`href="webdiff://ghostty?host=slop&amp;dir=%2Fhome%2Fubuntu%2Fai%2Fwebdiff"`,
 			`class="dir-open open-link"`,
 			`<use href="#icon-zed"/>`,
+			`<use href="#icon-vscode"/>`,
 			`<use href="#icon-ghostty"/>`,
 		} {
 			if !strings.Contains(got, want) {
@@ -33,7 +35,7 @@ func TestWriteOpenButtons(t *testing.T) {
 		sshHost = "slop"
 		var b strings.Builder
 		writeOpenButtons(&b, "/tmp/x", "dir-open")
-		for _, id := range []string{"icon-zed", "icon-ghostty"} {
+		for _, id := range []string{"icon-zed", "icon-vscode", "icon-ghostty"} {
 			if !strings.Contains(b.String(), `href="#`+id+`"`) {
 				t.Fatalf("no button references %s", id)
 			}

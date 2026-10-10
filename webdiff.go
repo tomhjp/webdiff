@@ -35,6 +35,15 @@ var pageTmplSrc string
 //go:embed assets/app.js
 var appJS string
 
+//go:embed assets/favicon.svg
+var faviconSVG string
+
+//go:embed assets/favicon-progress.svg
+var faviconProgressSVG string
+
+//go:embed assets/favicon-complete.svg
+var faviconCompleteSVG string
+
 // iconSprite holds the <symbol> definitions the icon() helper points `<use>`
 // at. It has to be inlined into each page rather than served as its own file:
 // `<use href="external.svg#id">` is blocked cross-document in Safari and
@@ -66,6 +75,11 @@ var paletteCSS string
 // rootDir is the directory the server was started in. All requests resolve
 // repo paths relative to this.
 var rootDir string
+
+// defaultBranchPrefix is prepopulated when the user creates a worktree. It is
+// also hidden from branch names on the home page and from managed worktree
+// directory names.
+var defaultBranchPrefix string
 
 // agentCmd is the full shell command spawned in each repo's tmux pane
 // (e.g. "claude" or "opencode --foo --bar"); set from the -agent flag in
@@ -115,7 +129,7 @@ func agentChoices() []string {
 }
 
 // writeAgentSelect emits the agent drop-down with selected pre-picked.
-// Shares #diff-mode-select's styling via .chrome-select so the two read
+// Uses .chrome-select for the same style as other header controls. Both read
 // as the same kind of control.
 func writeAgentSelect(b *strings.Builder, id, selected string) {
 	fmt.Fprintf(b, `<select class="chrome-select" id="%s" title="which agent to start">`, id)
@@ -130,9 +144,8 @@ func writeAgentSelect(b *strings.Builder, id, selected string) {
 	b.WriteString(`</select>`)
 }
 
-// agentQuery returns the "?agent=<id>" suffix for a non-default agent,
-// mirroring modeQuery. Unlike the diff mode this isn't threaded onto
-// general navigation links — it's a one-shot choice for the session
+// agentQuery returns the "?agent=<id>" suffix for a non-default agent.
+// This is not added to general navigation links. It is a choice for the session
 // about to be spawned, carried only far enough that a reload of the
 // stream page still shows which agent is running.
 func agentQuery(id string) string {
@@ -252,20 +265,6 @@ func resolveRepoRef(urlPath string) (repoRef, bool) {
 	return repoRef{abs: abs, kind: kind, name: name, url: "/" + kind + "/" + name + "/"}, true
 }
 
-// diffEnv acquires the same private warm index used by the background stats
-// manager. Detailed diff pages therefore never touch the checkout's real
-// index or race a stats refresh against the shared private index.
-func diffEnv(repo string) (env []string, cleanup func()) {
-	if indexCache == nil {
-		return os.Environ(), func() {}
-	}
-	env, cleanup, err := indexCache.Acquire(context.Background(), repo, indexKey(repo))
-	if err != nil {
-		return os.Environ(), func() {}
-	}
-	return env, cleanup
-}
-
 func indexKey(repo string) string {
 	kind := "repos"
 	if root, err := filepath.Abs(worktreesRoot); err == nil {
@@ -298,68 +297,6 @@ func branchBase(repo string) (sha, label string) {
 		}
 	}
 	return "HEAD", ""
-}
-
-// modeQuery returns the "?mode=<mode>" suffix for non-default diff
-// modes, used when emitting in-app navigation links so a user's
-// selected mode survives switching between the home and diff pages.
-// Returns "" for the default ("working") mode so plain URLs stay clean.
-func modeQuery(mode string) string {
-	if mode == "" || mode == "working" {
-		return ""
-	}
-	return "?mode=" + url.QueryEscape(mode)
-}
-
-// upstreamRef returns the symbolic name of the upstream tracking branch
-// (e.g. "origin/feature") if one is configured for HEAD, or if there is
-// exactly one remote and the current branch exists on it.
-func upstreamRef(repo string) (ref string, ok bool) {
-	out, err := exec.Command("git", "-C", repo, "rev-parse",
-		"--abbrev-ref", "--symbolic-full-name", "@{u}").Output()
-	if err == nil {
-		ref = strings.TrimSpace(string(out))
-		if ref != "" && ref != "@{u}" {
-			return ref, true
-		}
-	}
-	// No configured upstream: if there is exactly one remote and the
-	// current branch exists on it, use <remote>/<branch>.
-	remoteOut, err := exec.Command("git", "-C", repo, "remote").Output()
-	if err != nil {
-		return "", false
-	}
-	remotes := strings.Fields(strings.TrimSpace(string(remoteOut)))
-	if len(remotes) != 1 {
-		return "", false
-	}
-	branch := currentBranch(repo)
-	if branch == "" || branch == "HEAD" {
-		return "", false
-	}
-	candidate := remotes[0] + "/" + branch
-	if _, err := exec.Command("git", "-C", repo, "rev-parse", "--verify", candidate).Output(); err != nil {
-		return "", false
-	}
-	return candidate, true
-}
-
-// diffBase returns the git ref and display label to diff against for the
-// given mode. "working" diffs against HEAD (all uncommitted changes),
-// "branch" against the merge-base with main (full branch diff), and
-// "remote" against the upstream tracking branch (what a push would add).
-func diffBase(repo, mode string) (sha, label string) {
-	switch mode {
-	case "working":
-		return "HEAD", ""
-	case "remote":
-		if ref, ok := upstreamRef(repo); ok {
-			return ref, ref
-		}
-		return branchBase(repo)
-	default:
-		return branchBase(repo)
-	}
 }
 
 // currentBranch returns the current git branch name for repo.
@@ -846,31 +783,13 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := r.URL.Query().Get("mode")
-	if mode != "working" && mode != "branch" && mode != "remote" {
-		mode = "working"
-	}
-	modeQS := modeQuery(mode)
-
 	var body strings.Builder
 	body.WriteString(`<div class="header"><div class="header-left">`)
 	fmt.Fprintf(&body, `<span class="branch">%s</span>`, template.HTMLEscapeString(filepath.Base(rootDir)))
 	fmt.Fprintf(&body, `<span class="workdir">%s</span>`, template.HTMLEscapeString(tildePath(rootDir)))
 	body.WriteString(`</div><div class="header-right">`)
 	body.WriteString(`<a class="toggle" href="/history/" title="archived agent sessions">history</a>`)
-	body.WriteString(`<select id="diff-mode-select">`)
-	for _, opt := range []struct{ val, label string }{
-		{"working", "uncommitted"},
-		{"branch", "branch"},
-		{"remote", "remote"},
-	} {
-		sel := ""
-		if opt.val == mode {
-			sel = ` selected`
-		}
-		fmt.Fprintf(&body, `<option value="%s"%s>%s</option>`, opt.val, sel, opt.label)
-	}
-	body.WriteString(`</select></div></div>`)
+	body.WriteString(`</div></div>`)
 
 	body.WriteString(`<h2 class="section-title">repos</h2><div class="dir-list">`)
 	repos := 0
@@ -879,7 +798,7 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		repos++
-		writeDirRow(&body, target, target.Name, mode, modeQS)
+		writeDirRow(&body, target, target.Name)
 	}
 	if repos == 0 {
 		body.WriteString(`<p class="empty">No git repos under this directory.</p>`)
@@ -902,7 +821,7 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 			if label == "" {
 				label = target.Name
 			}
-			writeDirRow(&body, target, label, mode, modeQS)
+			writeDirRow(&body, target, label)
 		}
 		body.WriteString(`</div>`)
 	}
@@ -918,6 +837,7 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 // for a worktree, so every row reads "repo … branch"); dir is the
 // checkout's full path, shown in place of label on wide viewports. The
 // branch and diff stats come from the authoritative repostats snapshot.
+// A failed query hides stale stats and adds an unavailable label to that row.
 // Broken worktrees get the dir-broken class so they're greyed out but
 // still clickable through to the diff page where the
 // remove button lives.
@@ -928,8 +848,8 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 // navigating. The .dir-row-wrap flex row carries the border the anchor
 // would otherwise draw, so the rule runs the full width underneath all
 // of them.
-func writeDirRow(b *strings.Builder, target repostats.Target, label, mode, modeQS string) {
-	url := "/" + string(target.Kind) + "/" + target.Name + "/" + modeQS
+func writeDirRow(b *strings.Builder, target repostats.Target, label string) {
+	url := "/" + string(target.Kind) + "/" + target.Name + "/"
 	cls := "dir-row repo-row"
 	if target.Broken {
 		cls += " dir-broken"
@@ -938,23 +858,27 @@ func writeDirRow(b *strings.Builder, target repostats.Target, label, mode, modeQ
 	fmt.Fprintf(b, `<a class="%s" href="%s"><span class="dir-name">`, cls, template.HTMLEscapeString(url))
 	writeTitle(b, label, target.Path)
 	b.WriteString(`</span><span class="dir-stats">`)
-	if mode != "remote" && !target.Broken {
-		s := target.Working
-		if mode == "branch" {
-			s = target.BranchDiff
-		}
-		writeSummary(b, s)
+	if !target.Broken && target.Error == "" {
+		writeSummary(b, target.AllChanges)
 	}
 	b.WriteString(`</span>`)
 	if target.Broken {
 		b.WriteString(`<span class="dir-branch dir-folder-tag">broken</span>`)
+	} else if target.Error != "" {
+		fmt.Fprintf(b, `<span class="dir-branch dir-folder-tag" title="%s">unavailable</span>`, template.HTMLEscapeString(target.Error))
 	} else {
-		fmt.Fprintf(b, `<span class="dir-branch">%s</span>`, template.HTMLEscapeString(target.Branch))
+		fmt.Fprintf(b, `<span class="dir-branch">%s</span>`, template.HTMLEscapeString(homeBranchName(target.Branch)))
 	}
 	b.WriteString(`</a>`)
 	writeOpenButtons(b, target.Path, "dir-open")
 	writeCopyButton(b, target.Path, "dir-copy")
 	b.WriteString(`</div>`)
+}
+
+// homeBranchName removes the configured prefix from a branch shown on the
+// home page. Other branch labels remain complete.
+func homeBranchName(branch string) string {
+	return strings.TrimPrefix(branch, defaultBranchPrefix)
 }
 
 func writeSummary(b *strings.Builder, s repostats.Summary) {
@@ -989,16 +913,16 @@ func writeCopyButton(b *strings.Builder, dir, cls string) {
 		cls, short, short)
 }
 
-// writeOpenButtons emits links that open dir in Zed and in Ghostty on the
-// machine running the browser. They have to be plain anchors to a custom
+// writeOpenButtons emits links that open dir in Zed, VS Code, and Ghostty on
+// the machine running the browser. They have to be plain anchors to a custom
 // scheme rather than a fetch: this page comes straight off the sandbox, so
 // a request would land back here instead of on the desktop, and only a
 // top-level navigation reaches the client's OS at all.
 //
-// Zed registers zed:// itself and documents the zed://ssh/<host>/<path>
-// hotlink form, so it needs nothing installed. Ghostty has no inbound
-// scheme, hence webdiff:// and deploy/install-url-handler.sh. Neither
-// resolves on iOS, so .open-link hides both below 900px.
+// Zed and VS Code register their own schemes and support SSH remote links.
+// Ghostty has no inbound scheme, hence webdiff:// and
+// deploy/install-url-handler.sh. None resolve on iOS, so .open-link hides
+// them below 900px.
 //
 // Without an sshHost there's no host to name, and we'd rather emit nothing
 // than a link that can't connect.
@@ -1008,11 +932,14 @@ func writeOpenButtons(b *strings.Builder, dir, cls string) {
 	}
 	// dir is absolute, so it supplies the separator after the host.
 	zed := template.HTMLEscapeString("zed://ssh/" + sshHost + dir)
+	vscode := template.HTMLEscapeString("vscode://vscode-remote/ssh-remote+" + sshHost + dir)
 	ghostty := template.HTMLEscapeString("webdiff://ghostty?host=" +
 		url.QueryEscape(sshHost) + "&dir=" + url.QueryEscape(dir))
 	short := template.HTMLEscapeString(tildePath(dir))
 	fmt.Fprintf(b, `<a class="%s open-link" href="%s" title="open %s in Zed">%s</a>`,
 		cls, zed, short, icon("icon-zed"))
+	fmt.Fprintf(b, `<a class="%s open-link" href="%s" title="open %s in VS Code">%s</a>`,
+		cls, vscode, short, icon("icon-vscode"))
 	fmt.Fprintf(b, `<a class="%s open-link" href="%s" title="open a shell in %s">%s</a>`,
 		cls, ghostty, short, icon("icon-ghostty"))
 }
@@ -1313,24 +1240,19 @@ func formatLastUsed(ts int64, now time.Time) string {
 }
 
 // renderRepo renders the diff view for one repoRef (a regular repo or
-// a managed worktree). The kind on the ref drives the small chrome
-// differences between the two: only repos get the "+ worktree"
-// button; only worktrees get the "remove" button.
+// a managed worktree). Both support worktree creation. Only managed
+// worktrees have a remove button.
 func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	repo := ref.abs
-	_, hasUpstream := upstreamRef(repo)
-
-	// The chosen diff mode lives in the URL (?mode=working|branch|remote).
-	// Default is HEAD (working). app.js handles persistence via
-	// localStorage + redirect-on-load when no mode is set in the URL but
-	// one is stored — so within an in-app navigation flow the URL always
-	// carries the user's choice without us needing a server-side state file.
-	mode := r.URL.Query().Get("mode")
-	if mode == "remote" && !hasUpstream {
-		mode = "branch"
+	commits, err := branchCommits(r.Context(), repo)
+	if err != nil {
+		http.Error(w, "list branch commits: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
-	if mode != "working" && mode != "branch" && mode != "remote" {
-		mode = "working"
+	selected, err := selectedChanges(r.URL.Query(), commits)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	// `context=full` switches git diff to -U<MAX> so each file diff shows
@@ -1339,12 +1261,12 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// navigating somewhere else.
 	fullContext := r.URL.Query().Get("context") == "full"
 
-	base, baseLabel := diffBase(repo, mode)
-
-	env, cleanup := diffEnv(repo)
+	env, base, cleanup, selectionErr := selectionIndex(r.Context(), repo, commits, selected)
 	defer cleanup()
-
-	files := changedFiles(env, repo, base)
+	var files []string
+	if selectionErr == nil {
+		files = changedFiles(env, repo, base)
+	}
 
 	cols := 120
 	if c := r.URL.Query().Get("cols"); c != "" {
@@ -1352,7 +1274,6 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	}
 
 	urlPath := ref.url
-	modeQS := modeQuery(mode)
 
 	// Agent header button — always visible. When the repo's
 	// webdiff-<base> session is already running it short-circuits
@@ -1444,7 +1365,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// space runs out.
 	body.WriteString(`<div class="page-heading-row page-heading-row-scroll">`)
 	body.WriteString(`<div class="header-buttons">`)
-	fmt.Fprintf(&body, `<a class="toggle" href="/%s">home</a>`, modeQS)
+	body.WriteString(`<a class="toggle" href="/">home</a>`)
 	fmt.Fprintf(&body, `<a class="%s" id="agent-btn" href="%s" title="%s">%s</a>`,
 		agentClass, template.HTMLEscapeString(agentHref), template.HTMLEscapeString(agentTitle), template.HTMLEscapeString(pageAgent))
 	// The picker only makes sense before a session exists: once one is
@@ -1457,33 +1378,15 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	fmt.Fprintf(&body, `<a class="toggle" href="/file/%s/%s/" title="browse repo files">files</a>`,
 		ref.kind, template.HTMLEscapeString(ref.name))
 	writeOpenButtons(&body, ref.abs, "toggle")
-	switch ref.kind {
-	case "repos":
-		fmt.Fprintf(&body, `<button class="toggle add-comment-btn" type="button" id="wt-new-btn" data-repo="%s" title="create a worktree of this repo">+ worktree</button>`,
-			template.HTMLEscapeString(ref.name))
-	case "worktrees":
+	body.WriteString(`<button class="toggle add-comment-btn" type="button" id="wt-new-btn" title="create a worktree from this checkout">+ worktree</button>`)
+	if ref.kind == "worktrees" {
 		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
 			template.HTMLEscapeString(ref.name))
 	}
 	body.WriteString(`</div>`)
 
 	body.WriteString(`<div class="header-buttons">`)
-	body.WriteString(`<select id="diff-mode-select">`)
-	for _, opt := range []struct{ val, label string }{
-		{"working", "uncommitted"},
-		{"branch", "branch"},
-		{"remote", "remote"},
-	} {
-		sel, dis := "", ""
-		if opt.val == mode {
-			sel = ` selected`
-		}
-		if opt.val == "remote" && !hasUpstream {
-			dis = ` disabled`
-		}
-		fmt.Fprintf(&body, `<option value="%s"%s%s>%s</option>`, opt.val, sel, dis, opt.label)
-	}
-	body.WriteString(`</select>`)
+	writeDiffPicker(&body, commits, selected)
 	if len(files) > 0 {
 		body.WriteString(`<button class="toggle" type="button" id="toggle-all">expand all</button>`)
 		ctxLabel := "full context"
@@ -1513,11 +1416,16 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// as on desktop, and stays visually attached to the button that
 	// reveals it. data-repo on the form picks up which repo the
 	// worktree-add call should target.
-	if ref.kind == "repos" {
-		fmt.Fprintf(&body, `<div class="page-heading-row wt-create-row" id="wt-create-row" data-repo="%s" hidden>`,
-			template.HTMLEscapeString(ref.name))
-		body.WriteString(`<input type="text" id="wt-branch" class="wt-branch-input" placeholder="branch name (e.g. tongue/foo)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">`)
-		body.WriteString(`<label class="wt-from-main"><input type="checkbox" id="wt-from-main" checked> from main</label>`)
+	{
+		fmt.Fprintf(&body, `<div class="page-heading-row wt-create-row" id="wt-create-row" data-repo="%s" data-kind="%s" hidden>`,
+			template.HTMLEscapeString(ref.name), ref.kind)
+		fmt.Fprintf(&body, `<input type="text" id="wt-branch" class="wt-branch-input" value="%s" placeholder="branch name (e.g. tongue/foo)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">`,
+			template.HTMLEscapeString(defaultBranchPrefix))
+		checked := ""
+		if ref.kind == "repos" {
+			checked = " checked"
+		}
+		fmt.Fprintf(&body, `<label class="wt-from-main"><input type="checkbox" id="wt-from-main"%s> from main (otherwise this HEAD)</label>`, checked)
 		body.WriteString(`<button type="button" class="toggle send-btn" id="wt-create-submit">create</button>`)
 		body.WriteString(`<button type="button" class="toggle" id="wt-create-cancel">cancel</button>`)
 		body.WriteString(`</div>`)
@@ -1533,11 +1441,11 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	fmt.Fprintf(&body, `<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments">send to %s (<span class="send-count">0</span>)</button></div>`, template.HTMLEscapeString(pageAgent))
 
 	if len(files) == 0 {
-		msg := "No uncommitted changes."
-		if baseLabel != "" {
-			msg = "No changes since " + baseLabel + "."
+		msg := "No changes selected, or the selected changes are empty."
+		if selectionErr != nil {
+			msg = selectionErr.Error()
 		}
-		fmt.Fprintf(&body, `<p style="color:#6c7086;padding:16px">%s</p>`, msg)
+		fmt.Fprintf(&body, `<p class="empty">%s</p>`, template.HTMLEscapeString(msg))
 		writePageForAgent(w, body.String(), pageAgent)
 		return
 	}
@@ -1636,6 +1544,21 @@ func serveAppJS(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(appJS))
 }
 
+func serveFavicon(w http.ResponseWriter, r *http.Request) {
+	var svg string
+	switch r.URL.Path {
+	case "/favicon-progress.svg":
+		svg = faviconProgressSVG
+	case "/favicon-complete.svg":
+		svg = faviconCompleteSVG
+	default:
+		svg = faviconSVG
+	}
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	_, _ = w.Write([]byte(svg))
+}
+
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	gz *gzip.Writer
@@ -1714,7 +1637,7 @@ func renderRepoStreamPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	paneID, _, liveAgent := repoStreamPane(r.Context(), ref.abs)
+	paneID, session, liveAgent := repoStreamPane(r.Context(), ref.abs)
 	if paneID == "" {
 		http.Redirect(w, r, "/agent"+ref.url+agentQuery(r.URL.Query().Get("agent")), http.StatusSeeOther)
 		return
@@ -1724,7 +1647,7 @@ func renderRepoStreamPage(w http.ResponseWriter, r *http.Request) {
 	if liveAgent == "" {
 		liveAgent = r.URL.Query().Get("agent")
 	}
-	writeStreamPage(w, paneID, ref.url, "", liveAgent)
+	writeStreamPage(w, paneID, ref.url, "", session, liveAgent)
 }
 
 // renderArbitraryPanePage is the streaming view for tmux panes that
@@ -1744,10 +1667,10 @@ func renderArbitraryPanePage(w http.ResponseWriter, r *http.Request) {
 	out, err := tmuxOut(r.Context(), "display-message", "-t", paneID, "-p", "#{session_name}\t#{pane_start_command}")
 	session, start, _ := strings.Cut(strings.TrimSpace(out), "\t")
 	if err != nil || session == "" {
-		writeStreamPage(w, paneID, "", paneID, "")
+		writeStreamPage(w, paneID, "", paneID, "", "")
 		return
 	}
-	writeStreamPage(w, paneID, paneRepoURL(session), session, agentFromStartCommand(start))
+	writeStreamPage(w, paneID, paneRepoURL(session), session, session, agentFromStartCommand(start))
 }
 
 // writeStreamPage derives the heading from repoURL (so the title is the
@@ -1755,7 +1678,7 @@ func renderArbitraryPanePage(w http.ResponseWriter, r *http.Request) {
 // point routed us here. fallbackTitle is only used for arbitrary panes
 // that don't resolve to a known repo. liveAgent is the agent detected
 // in the pane, "" when it isn't one we recognise.
-func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, liveAgent string) {
+func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, session, liveAgent string) {
 	title := strings.Trim(repoURL, "/")
 	if title == "" {
 		title = fallbackTitle
@@ -1773,6 +1696,10 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, live
 		dir = ref.abs
 	}
 	pageAgent, _ := resolveAgent(liveAgent)
+	agentSession := ""
+	if liveAgent != "" {
+		agentSession = session
+	}
 	var body strings.Builder
 	body.WriteString(`<div class="page-heading"><div class="page-heading-row">`)
 	body.WriteString(`<span class="branch">`)
@@ -1804,14 +1731,17 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, live
 			template.HTMLEscapeString(strings.Join(agentChoices(), ",")))
 	}
 	body.WriteString(`</div></div></div>`)
-	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" class="term-container"><div class="term-inner"></div></div>`,
-		template.HTMLEscapeString(paneID))
+	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" data-agent-session="%s" class="term-container"><div class="term-inner"></div></div>`,
+		template.HTMLEscapeString(paneID), template.HTMLEscapeString(agentSession))
 	body.WriteString(`<div class="stream-toolbar">`)
 	body.WriteString(`<div class="stream-toolbar-row">`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Escape" title="send Escape">esc</button>`)
+	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Left" title="send left arrow">←</button>`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Up" title="send up arrow">↑</button>`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Down" title="send down arrow">↓</button>`)
+	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Right" title="send right arrow">→</button>`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Enter" title="send Enter">enter</button>`)
+	body.WriteString(`<button class="toggle stream-quote" type="button" id="pane-quote" title="select text in the pane to quote it" disabled>quote</button>`)
 	body.WriteString(`</div>`)
 	body.WriteString(`<div class="stream-attachments" id="stream-attachments" hidden></div>`)
 	body.WriteString(`<div class="stream-toolbar-row">`)
@@ -1850,6 +1780,7 @@ func computeXterm256CSS() string {
 
 func main() {
 	agentFlag := flag.String("agent", "claude", "agent command spawned in each repo's tmux pane; the first whitespace-separated token is used as the display name")
+	branchPrefixFlag := flag.String("branch-prefix", "", "default branch prefix to prepopulate when creating worktrees and hide on the home page")
 	sshHostFlag := flag.String("ssh-host", "", "how the browser's machine reaches this one over SSH (e.g. an ~/.ssh/config alias); defaults to this node's MagicDNS name")
 	flag.Parse()
 	args := flag.Args()
@@ -1868,6 +1799,8 @@ func main() {
 		}
 		return
 	}
+
+	defaultBranchPrefix = strings.TrimSpace(*branchPrefixFlag)
 
 	agentCmd = strings.TrimSpace(*agentFlag)
 	if agentCmd == "" {
@@ -1943,6 +1876,9 @@ func main() {
 
 	browserMux := http.NewServeMux()
 	browserMux.HandleFunc("/app.js", serveAppJS)
+	browserMux.HandleFunc("/favicon.svg", serveFavicon)
+	browserMux.HandleFunc("/favicon-progress.svg", serveFavicon)
+	browserMux.HandleFunc("/favicon-complete.svg", serveFavicon)
 	browserMux.HandleFunc("/stream/", renderRepoStreamPage)
 	browserMux.HandleFunc("/pane", renderArbitraryPanePage)
 	browserMux.HandleFunc("/agent/", handleStartSession)

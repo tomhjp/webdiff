@@ -1,10 +1,9 @@
 // Package repostats discovers Git checkouts, watches them for changes, and
-// maintains fresh working and branch diff summaries in memory.
+// keeps branch and working-tree diff totals current in memory.
 package repostats
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -35,9 +34,9 @@ type Target struct {
 	Path       string
 	ParentRepo string
 	Broken     bool
+	Error      string
 	Branch     string
-	Working    Summary
-	BranchDiff Summary
+	AllChanges Summary
 }
 
 type Config struct {
@@ -52,7 +51,6 @@ type state struct {
 	dirty, queued, refreshing bool
 	firstDirty                time.Time
 	timer                     *time.Timer
-	err                       error
 }
 
 type Manager struct {
@@ -133,6 +131,8 @@ func (m *Manager) Close() error {
 
 // Current returns one coherent, fresh snapshot. A read flushes pending
 // debounce timers and waits for dirty or active refreshes to finish.
+// A target query failure sets Target.Error and preserves its last good stats.
+// Only a cancelled context returns an error for the complete snapshot.
 func (m *Manager) Current(ctx context.Context) ([]Target, error) {
 	for {
 		m.mu.Lock()
@@ -147,12 +147,8 @@ func (m *Manager) Current(ctx context.Context) ([]Target, error) {
 		}
 		if !waiting {
 			out := make([]Target, 0, len(m.targets))
-			var errs []error
 			for _, s := range m.targets {
 				out = append(out, s.target)
-				if s.err != nil && !s.target.Broken {
-					errs = append(errs, fmt.Errorf("%s/%s: %w", s.target.Kind, s.target.Name, s.err))
-				}
 			}
 			slices.SortFunc(out, func(a, b Target) int {
 				if a.Kind != b.Kind {
@@ -161,7 +157,7 @@ func (m *Manager) Current(ctx context.Context) ([]Target, error) {
 				return strings.Compare(a.Name, b.Name)
 			})
 			m.mu.Unlock()
-			return out, errors.Join(errs...)
+			return out, nil
 		}
 		changed := m.changed
 		m.mu.Unlock()
@@ -263,9 +259,14 @@ func (m *Manager) worker() {
 			m.mu.Lock()
 			if current := m.targets[k]; current == s {
 				s.refreshing = false
-				s.err = err
 				if err == nil {
+					updated.Error = ""
 					s.target = updated
+				} else {
+					if s.target.Error != err.Error() {
+						log.Printf("repo stats %s/%s: %v", target.Kind, target.Name, err)
+					}
+					s.target.Error = err.Error()
 				}
 				if s.dirty {
 					m.markDirtyLocked(s)
@@ -322,22 +323,18 @@ func (m *Manager) calculate(ctx context.Context, t Target) (Target, error) {
 			break
 		}
 	}
-	working, err := stat(ctx, env, t.Path, "HEAD")
-	if err != nil {
-		return t, err
-	}
-	branchStat, err := stat(ctx, env, t.Path, base)
+	all, err := stat(ctx, env, t.Path, "--cached", base)
 	if err != nil {
 		return t, err
 	}
 	t.Branch = branch
-	t.Working = working
-	t.BranchDiff = branchStat
+	t.AllChanges = all
 	return t, nil
 }
 
-func stat(ctx context.Context, env []string, dir, base string) (Summary, error) {
-	cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--shortstat", base)
+func stat(ctx context.Context, env []string, dir string, refs ...string) (Summary, error) {
+	args := append([]string{"diff", "--shortstat"}, refs...)
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = env
 	out, err := cmd.Output()

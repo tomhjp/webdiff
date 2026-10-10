@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -489,9 +490,21 @@ func defaultRemote(repo string) (string, bool) {
 	return "", false
 }
 
+// fetchRemoteMain updates the tracking ref without moving the local main
+// branch. Do not force the update: a rewritten remote must not replace
+// the diff base without an explicit decision.
+func fetchRemoteMain(repo, remote string) error {
+	ref := "refs/heads/main:refs/remotes/" + remote + "/main"
+	out, err := exec.Command("git", "-C", repo, "fetch", remote, ref).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // handleWorktreeCreate creates a managed worktree at
-// `<worktreesRoot>/<repo>/<leaf>` for a named branch of a repo under
-// rootDir, and reports it under the flattened `<repo>-<leaf>` slug (see
+// `<worktreesRoot>/<repo>/<leaf>` from a repo or managed worktree,
+// and reports it under the flattened `<repo>-<leaf>` slug (see
 // worktreeSlug). If the branch already exists locally git just checks it
 // out into the new worktree; otherwise it's created via `-b` from the
 // fetched <remote>/main (when "from main" is set), the current HEAD, or
@@ -504,6 +517,7 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Repo     string `json:"repo"`
+		Kind     string `json:"kind"`
 		Branch   string `json:"branch"`
 		FromMain bool   `json:"fromMain"`
 	}
@@ -517,8 +531,11 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "repo and branch required", http.StatusBadRequest)
 		return
 	}
-	ref, ok := resolveRepoRef("/repos/" + req.Repo + "/")
-	if !ok || ref.kind != "repos" || !isGitRepo(ref.abs) {
+	if req.Kind == "" {
+		req.Kind = "repos"
+	}
+	ref, ok := resolveRepoRef("/" + req.Kind + "/" + req.Repo + "/")
+	if !ok || !isGitRepo(ref.abs) {
 		http.Error(w, "unknown repo", http.StatusNotFound)
 		return
 	}
@@ -527,8 +544,17 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "branch name has no usable characters", http.StatusBadRequest)
 		return
 	}
-	name := ref.name + "-" + leaf
-	wtPath := filepath.Join(worktreesRoot, ref.name, leaf)
+	parent := ref.name
+	if ref.kind == "worktrees" {
+		var found bool
+		parent, found = worktreeParentRepo(ref.abs)
+		if !found {
+			http.Error(w, "worktree has no parent repo", http.StatusBadRequest)
+			return
+		}
+	}
+	name := parent + "-" + leaf
+	wtPath := filepath.Join(worktreesRoot, parent, leaf)
 	if _, err := os.Stat(wtPath); err == nil {
 		writeJSON(w, http.StatusOK, map[string]string{"url": "/worktrees/" + name + "/", "path": wtPath})
 		return
@@ -549,6 +575,10 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 
 	remote, hasRemote := defaultRemote(ref.abs)
 	if hasRemote {
+		if err := fetchRemoteMain(ref.abs, remote); err != nil {
+			http.Error(w, "fetch remote main: "+err.Error(), http.StatusBadGateway)
+			return
+		}
 		exec.Command("git", "-C", ref.abs, "fetch", remote, req.Branch).Run()
 	}
 
@@ -564,7 +594,6 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 	} else if req.FromMain {
 		base := "main"
 		if hasRemote {
-			exec.Command("git", "-C", ref.abs, "fetch", remote, "main").Run()
 			if exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/remotes/"+remote+"/main").Run() == nil {
 				base = "refs/remotes/" + remote + "/main"
 			}
@@ -577,9 +606,11 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "git worktree add failed: "+strings.TrimSpace(string(out)), http.StatusBadGateway)
 		return
 	}
-	if err := statsManager.RefreshDiscovery(r.Context()); err != nil {
-		http.Error(w, "refresh worktree stats: "+err.Error(), http.StatusInternalServerError)
-		return
+	if statsManager != nil {
+		if err := statsManager.RefreshDiscovery(r.Context()); err != nil {
+			http.Error(w, "refresh worktree stats: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"url": "/worktrees/" + name + "/", "path": wtPath})
 }
@@ -702,21 +733,18 @@ func worktreeParentGitDir(wtPath string) (string, bool) {
 	return filepath.Dir(common), true
 }
 
-// ownerBranchPrefix is stripped from a branch when naming its worktree
-// dir: every branch here is prefixed with it, so keeping it would just
-// pad every path with the same seven characters.
-const ownerBranchPrefix = "tomhjp/"
-
 // worktreeLeaf reduces a branch name to the leaf directory its worktree
-// lives in, e.g. "tomhjp/fix-x" → "fix-x" and "gabriel/queue-metrics" →
-// "gabriel-queue-metrics". Any remaining path separator folds to a dash
+// lives in. It removes the configured default branch prefix first. For
+// example, with "tomhjp/" configured, "tomhjp/fix-x" becomes "fix-x" and
+// "gabriel/queue-metrics" becomes "gabriel-queue-metrics". Any remaining
+// path separator folds to a dash
 // rather than nesting deeper, since worktreeSlug expects exactly one
 // level below the repo. Empty input or input that reduces to nothing
 // returns "" — the caller rejects that case so we never create a
 // worktree dir with an empty name.
 func worktreeLeaf(branch string) string {
 	s := strings.ToLower(branch)
-	s = strings.TrimPrefix(s, ownerBranchPrefix)
+	s = strings.TrimPrefix(s, strings.ToLower(defaultBranchPrefix))
 	var b strings.Builder
 	for _, r := range s {
 		switch {
@@ -739,8 +767,10 @@ func worktreeLeaf(branch string) string {
 // to send freeform input. The set is small on purpose: extend it only
 // when there's a concrete UI need.
 var allowedPaneKeys = map[string]bool{
+	"Left":   true,
 	"Up":     true,
 	"Down":   true,
+	"Right":  true,
 	"Escape": true,
 	"Enter":  true,
 }
@@ -1384,10 +1414,10 @@ type SessionPane struct {
 	LastUsed int64  // window_activity unix seconds; 0 if unknown
 }
 
-// listAllPanes returns every tmux pane on the host, sorted by session
-// then window.pane index. Used by the root listing's "tmux sessions"
-// section to surface the full tmux state, independent of any
-// webdiff-managed session.
+// listAllPanes returns every tmux pane on the host, ordered by most
+// recent activity. Used by the root listing's "tmux sessions" section
+// to surface the full tmux state, independent of any webdiff-managed
+// session.
 //
 // LastUsed comes from `window_activity` rather than `pane_last_used`:
 // the latter would be per-pane but only landed in tmux 3.5, and we want
@@ -1426,7 +1456,20 @@ func listAllPanes(ctx context.Context) ([]SessionPane, error) {
 		}
 		panes = append(panes, sp)
 	}
+	sortSessionPanes(panes)
 	return panes, nil
+}
+
+func sortSessionPanes(panes []SessionPane) {
+	sort.Slice(panes, func(i, j int) bool {
+		if panes[i].LastUsed != panes[j].LastUsed {
+			return panes[i].LastUsed > panes[j].LastUsed
+		}
+		if panes[i].Session != panes[j].Session {
+			return panes[i].Session < panes[j].Session
+		}
+		return panes[i].Index < panes[j].Index
+	})
 }
 
 // isTmuxDown reports whether an error from tmuxOut means the daemon

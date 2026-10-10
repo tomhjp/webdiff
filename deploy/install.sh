@@ -12,7 +12,7 @@ unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 code_dir="$(cd "${1:-$repo_root/..}" && pwd)"
 
 # Optional second arg: how your laptop reaches this host over SSH, for the
-# diff page's "open in Zed / Ghostty" buttons. An ~/.ssh/config alias is the
+# diff page's "open in Zed / VS Code / Ghostty" buttons. An ~/.ssh/config alias is the
 # usual answer. Omit it to fall back to this node's MagicDNS name.
 ssh_host_arg=""
 if [[ -n "${2:-}" ]]; then
@@ -23,7 +23,7 @@ fi
 export PATH=/usr/local/go/bin:$PATH
 
 echo "==> Building webdiff"
-( cd "$repo_root" && go build -o webdiff ./... )
+( cd "$repo_root" && go build -o webdiff . )
 
 # Port 80 is privileged; grant the binary the capability to bind it rather
 # than running the whole service as root. setcap needs sudo but the service

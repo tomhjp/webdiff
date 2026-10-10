@@ -165,7 +165,7 @@ a { color: var(--accent) }
    viewports the full path is free disambiguation between repos and
    their worktrees. Emitted by writeTitle in webdiff.go. */
 .title-full { display: none }
-/* The Zed/Ghostty hand-off links go to custom schemes that only resolve
+/* The Zed/VS Code/Ghostty hand-off links go to custom schemes that only resolve
    on a desktop with those apps installed, so they'd be dead taps on a
    phone. Same breakpoint as the title, for one less thing to reason
    about. Emitted by writeOpenButtons in webdiff.go. */
@@ -272,7 +272,16 @@ a { color: var(--accent) }
 .toggle.sync-ok   { color: var(--added);  border-color: var(--added) }
 .toggle.sync-err  { color: var(--removed); border-color: var(--removed) }
 
-#diff-mode-select, .chrome-select { font: inherit; font-size: 12px; background: var(--chrome-bg); color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 4px; cursor: pointer }
+.diff-picker-menu { position: fixed; right: 12px; z-index: 100; box-sizing: border-box; width: min(520px, calc(100vw - 24px)); max-height: 60vh; overflow: auto; background: var(--chrome-bg); color: var(--accent); border: 1px solid var(--border); padding: 8px; box-shadow: 0 4px 16px #0006; font-size: 12px }
+.diff-picker-menu[hidden] { display: none }
+.diff-picker-menu label { display: flex; align-items: baseline; gap: 6px; padding: 5px 0; overflow-wrap: anywhere; cursor: pointer }
+.diff-picker-menu .header-buttons { margin-top: 8px }
+@media (pointer: coarse) {
+  .diff-picker-menu label { min-height: 44px; box-sizing: border-box; align-items: center }
+  .diff-picker-menu input { flex-shrink: 0; width: 20px; height: 20px }
+  .diff-picker-menu .toggle { min-height: 44px; min-width: 44px }
+}
+.chrome-select { font: inherit; font-size: 12px; background: var(--chrome-bg); color: var(--accent); border: 1px solid var(--border); border-radius: 0; padding: 2px 4px; cursor: pointer }
 
 /* Pillbar and summary stickies stack below the sticky page heading.
    The offsets come from --page-heading-h and --pillbar-h, set by
@@ -412,6 +421,8 @@ details .term-container { margin: 0 }
 .stream-key { min-width: 36px; text-align: center }
 .stream-msg { flex: 1; min-width: 0; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box; resize: none; overflow-y: hidden; max-height: 120px; line-height: 1.4 }
 .stream-msg:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
+.stream-quote:disabled { opacity: 0.4; cursor: default }
+.stream-msg-quote-drop { outline: 1px dashed var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg)) }
 
 /* iOS Safari auto-zooms the viewport whenever a focused input has a
    font-size below 16px. Bump back to 16px only where the primary input
