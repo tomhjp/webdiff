@@ -146,14 +146,21 @@ a { color: var(--accent) }
    on narrow viewports — buttons always sit on a single line. */
 .page-heading-row-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch }
 .page-heading-row-scroll > * { flex-shrink: 0 }
-/* Worktree create row: appears below the controls row when the
-   user clicks "+ worktree". Stays single-line so the iOS keyboard
-   sliding up doesn't reflow it. */
-.wt-create-row { gap: 6px }
+/* Keep the branch input readable when the controls do not fit on one row. */
+.wt-create-row { gap: 6px; flex-wrap: wrap }
 .wt-create-row[hidden] { display: none }
-.wt-branch-input { flex: 1; min-width: 0; font: inherit; font-size: 13px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box }
+.wt-branch-input { flex: 1 1 20ch; min-width: min(100%, 20ch); font: inherit; font-size: 13px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 4px 8px; box-sizing: border-box }
 .wt-branch-input:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
 .wt-from-main { font-size: 13px; white-space: nowrap; display: flex; align-items: center; gap: 4px }
+.wt-create-row > .toggle { flex-shrink: 0 }
+@media (max-width: 600px) {
+  .wt-create-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) }
+  /* Use 16px text to prevent Safari from zooming when the input gets focus. */
+  .wt-branch-input { grid-column: 1 / -1; width: 100%; min-width: 0; font-size: 16px; min-height: 44px }
+  .wt-from-main { grid-column: 1 / -1; white-space: normal; min-height: 44px }
+  .wt-from-main > input { flex-shrink: 0 }
+  .wt-create-row > .toggle { min-height: 44px }
+}
 .header { padding: 10px 12px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 4px }
 .header-left { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-width: 0 }
 .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
@@ -169,11 +176,12 @@ a { color: var(--accent) }
    on a desktop with those apps installed, so they'd be dead taps on a
    phone. Same breakpoint as the title, for one less thing to reason
    about. Emitted by writeOpenButtons in webdiff.go. */
-.open-link { display: none }
+/* Show path-copy buttons at the same breakpoint as the tool links. */
+.open-link, [data-copy] { display: none }
 @media (min-width: 900px) {
   .title-short { display: none }
   .title-full { display: inline }
-  .open-link { display: inline-flex; align-items: center }
+  .open-link, [data-copy] { display: inline-flex; align-items: center }
 }
 /* The sprite is hidden by size rather than display:none, which in some
    engines stops <use> resolving against it. Emitted from assets/icons.svg
