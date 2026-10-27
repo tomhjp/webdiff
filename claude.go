@@ -298,6 +298,7 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/sessions/turn-events", handleTurnEvents)
 	mux.HandleFunc("/api/worktrees/create", handleWorktreeCreate)
 	mux.HandleFunc("/api/worktrees/remove", handleWorktreeRemove)
+	mux.HandleFunc("/api/worktrees/rename", handleWorktreeRename)
 	mux.HandleFunc("/api/history/forget", handleHistoryForget)
 }
 

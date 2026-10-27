@@ -11,7 +11,7 @@
   // logic below shouldn't run here — there are no <details> on this
   // page anyway, but bailing early keeps the two flows independent.
   var streamRoot=document.getElementById('pane-tail');
-  if(streamRoot){setupStreamPage(streamRoot);setupWorktreeRemove();return}
+  if(streamRoot){setupStreamPage(streamRoot);setupWorktreeRemove();setupWorktreeRename();return}
 
   // showHistoryModal is the shared "confirm, and here's the scrollback URL
   // to hand the next session" dialog. Both entry points need it: restart
@@ -87,10 +87,35 @@
     if(urlInput)setTimeout(function(){urlInput.focus();urlInput.select()},0);
   }
 
-  // Worktree remove — rendered on both the worktree diff page and the
-  // stream page for a worktree's pane. The stream page returns early
-  // from the diff/listing flow below, so this has to be callable from
-  // both paths rather than living inline in one of them.
+  // Set up worktree actions on diff and pane pages. The pane page
+  // returns early, so both paths must call these functions.
+  function setupWorktreeRename(){
+    var btn=document.getElementById('wt-rename-btn');
+    if(!btn)return;
+    btn.addEventListener('click',function(){
+      var branch=window.prompt('New branch name (the worktree directory will also change):',btn.dataset.branch);
+      if(branch===null||!branch.trim())return;
+      btn.disabled=true;
+      btn.textContent='renaming…';
+      fetch('/api/worktrees/rename',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:btn.dataset.name,branch:branch.trim()})
+      }).then(function(r){
+        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+        return r.json();
+      }).then(function(data){
+        var url=new URL((streamRoot?'/stream':'')+data.url,location.href);
+        if(!streamRoot)url.search=location.search;
+        location.href=url.href;
+      }).catch(function(e){
+        btn.disabled=false;
+        btn.textContent='rename';
+        window.alert('rename failed: '+e.message);
+      });
+    });
+  }
+
   function setupWorktreeRemove(){
     var btn=document.getElementById('wt-remove-btn');
     if(!btn)return;
@@ -843,6 +868,43 @@
     });
   }
 
+  function setupDiffMore(){
+    var toggle=document.getElementById('diff-more-toggle');
+    var menu=document.getElementById('diff-more-menu');
+    if(!toggle||!menu)return;
+    // Keep the menu outside the sticky heading.
+    document.body.appendChild(menu);
+    function close(restoreFocus){
+      menu.hidden=true;
+      toggle.setAttribute('aria-expanded','false');
+      if(restoreFocus)toggle.focus();
+    }
+    toggle.addEventListener('click',function(){
+      if(!menu.hidden){close(false);return}
+      var top=toggle.getBoundingClientRect().bottom+4;
+      menu.style.top=top+'px';
+      menu.style.maxHeight=Math.max(44,window.innerHeight-top-12)+'px';
+      menu.hidden=false;
+      toggle.setAttribute('aria-expanded','true');
+      menu.querySelector('a, button').focus();
+    });
+    document.addEventListener('click',function(ev){
+      if(!toggle.contains(ev.target)&&!menu.contains(ev.target))close(false);
+    });
+    menu.addEventListener('click',function(ev){
+      if(ev.target.closest('a, button'))close(true);
+    });
+    document.addEventListener('keydown',function(ev){
+      if(ev.key==='Escape'&&!menu.hidden){ev.preventDefault();close(true)}
+    });
+    document.addEventListener('focusin',function(ev){
+      if(!toggle.contains(ev.target)&&!menu.contains(ev.target))close(false);
+    });
+    window.addEventListener('resize',function(){close(false)});
+    window.addEventListener('scroll',function(){close(false)});
+  }
+  setupDiffMore();
+
   // "full context" toggle: re-renders the current diff page with
   // git's -U99999 flag (server side) so each file shows its full
   // contents with hunks inlined. State lives in the URL; not
@@ -941,6 +1003,7 @@
   }
 
   setupWorktreeRemove();
+  setupWorktreeRename();
 
   // Sticky stack: the page heading is pinned at top:0; the pillbar
   // sticks under it; each <details>' summary sticks under the pillbar.

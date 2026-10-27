@@ -166,6 +166,19 @@ a { color: var(--accent) }
 .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
 .header-buttons { display: flex; gap: 4px; flex-wrap: wrap }
 .header-buttons-right { display: flex; gap: 4px; margin-left: auto }
+/* Put the main diff actions first on narrow screens. */
+.diff-toolbar { flex-wrap: wrap; gap: 6px }
+.diff-primary { margin-left: auto; align-items: center }
+.diff-more-menu { position: fixed; right: 12px; z-index: 100; display: flex; flex-direction: column; gap: 4px; width: min(200px, calc(100vw - 24px)); box-sizing: border-box; overflow: auto; padding: 8px; background: var(--chrome-bg); border: 1px solid var(--border); box-shadow: 0 4px 16px #0006 }
+.diff-more-menu[hidden] { display: none }
+.diff-more-menu .toggle { text-align: left; text-decoration: none }
+@media (max-width: 700px) {
+  .diff-primary { order: -1; flex-basis: 100%; margin-left: 0 }
+  .diff-remove { margin-left: auto }
+}
+@media (pointer: coarse) {
+  .diff-more-menu .toggle { min-height: 44px; display: flex; align-items: center }
+}
 .branch { color: var(--branch); font-weight: bold }
 /* Titles come in a short form (repo basename) and a full form (the
    checkout's absolute path). Phones get the short one; on wide

@@ -1358,12 +1358,8 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	body.WriteString(stats)
 	body.WriteString(`</span></div>`)
 
-	// Row 2 scrolls horizontally on narrow viewports rather than
-	// wrapping. Order on the right side puts mode-select first
-	// (most-used), then expand-all, then full-context — full-context is
-	// the rare button so it's the one that drops off-screen first when
-	// space runs out.
-	body.WriteString(`<div class="page-heading-row page-heading-row-scroll">`)
+	// Keep diff controls on a separate row on narrow screens.
+	body.WriteString(`<div class="page-heading-row diff-toolbar">`)
 	body.WriteString(`<div class="header-buttons">`)
 	body.WriteString(`<a class="toggle" href="/">home</a>`)
 	fmt.Fprintf(&body, `<a class="%s" id="agent-btn" href="%s" title="%s">%s</a>`,
@@ -1375,20 +1371,23 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	if paneID == "" {
 		writeAgentSelect(&body, "agent-select", pageAgent)
 	}
-	fmt.Fprintf(&body, `<a class="toggle" href="/file/%s/%s/" title="browse repo files">files</a>`,
-		ref.kind, template.HTMLEscapeString(ref.name))
 	writeOpenButtons(&body, ref.abs, "toggle")
 	body.WriteString(`<button class="toggle add-comment-btn" type="button" id="wt-new-btn" title="create a worktree from this checkout">+ worktree</button>`)
-	if ref.kind == "worktrees" {
-		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
-			template.HTMLEscapeString(ref.name))
-	}
 	body.WriteString(`</div>`)
 
-	body.WriteString(`<div class="header-buttons">`)
+	body.WriteString(`<div class="header-buttons diff-primary">`)
 	writeDiffPicker(&body, commits, selected)
 	if len(files) > 0 {
 		body.WriteString(`<button class="toggle" type="button" id="toggle-all">expand all</button>`)
+	}
+	body.WriteString(`<button class="toggle" type="button" id="diff-more-toggle" aria-expanded="false" aria-controls="diff-more-menu">more &#x25be;</button>`)
+	body.WriteString(`<div class="diff-more-menu" id="diff-more-menu" hidden>`)
+	fmt.Fprintf(&body, `<a class="toggle" href="/file/%s/%s/" title="browse repo files">files</a>`,
+		ref.kind, template.HTMLEscapeString(ref.name))
+	if ref.kind == "worktrees" {
+		writeWorktreeRenameButton(&body, ref.name, ref.abs)
+	}
+	if len(files) > 0 {
 		ctxLabel := "full context"
 		if fullContext {
 			ctxLabel = "diff only"
@@ -1396,6 +1395,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		fmt.Fprintf(&body, `<button class="toggle" type="button" id="toggle-context" data-full="%t">%s</button>`,
 			fullContext, ctxLabel)
 	}
+	body.WriteString(`</div>`)
 	// Sync buttons: hand-off to the desktop client's /_local/sync mux.
 	// The browser is reverse-proxied through the client, so a relative
 	// POST lands on the desktop, never on the sandbox. data-sync-dir
@@ -1409,7 +1409,12 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="push" data-kind="%s" data-name="%s" title="push this desktop repo into the sandbox">&#x2191; push</button>`,
 			template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
 	}
-	body.WriteString(`</div></div>`)
+	body.WriteString(`</div>`)
+	if ref.kind == "worktrees" {
+		fmt.Fprintf(&body, `<button class="toggle danger diff-remove" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
+			template.HTMLEscapeString(ref.name))
+	}
+	body.WriteString(`</div>`)
 
 	// Worktree create form — hidden until "+ worktree" is clicked.
 	// Inline rather than modal so it works the same on mobile Safari
@@ -1711,6 +1716,7 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		fmt.Fprintf(&body, `<a class="toggle" href="%s">diff</a>`, template.HTMLEscapeString(repoURL))
 	}
 	if worktreeName != "" {
+		writeWorktreeRenameButton(&body, worktreeName, dir)
 		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
 			template.HTMLEscapeString(worktreeName))
 	}
