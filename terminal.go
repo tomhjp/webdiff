@@ -144,6 +144,18 @@ func sendToPane(ctx context.Context, paneID, prompt string) error {
 	return sendToTmuxPane(ctx, paneID, prompt)
 }
 
+// resizePane sets the terminal of a Rex pane to size and makes webdiff
+// its owner. It reports false for a tmux pane, which it doesn't change:
+// a tmux window has one size for all clients, so a phone would also
+// shrink the pane for an attached laptop.
+func resizePane(ctx context.Context, paneID string, size rexTermSize) (bool, error) {
+	sessionID, blockID, ok := parseRexPaneID(paneID)
+	if !ok {
+		return false, nil
+	}
+	return true, rexc.resize(ctx, sessionID, blockID, size)
+}
+
 // sendPaneKey presses one key, named as tmux names it (see
 // allowedPaneKeys).
 func sendPaneKey(ctx context.Context, paneID, key string) error {

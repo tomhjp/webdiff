@@ -723,6 +723,86 @@
       new ResizeObserver(syncPad).observe(toolbar);
     }
     syncPad();
+    setupPaneFit(root,paneID,toolbar);
+  }
+
+  // Size the pane's terminal to fit this browser, as the Rex iOS app
+  // does for its screen. The agent then draws for our width, so its
+  // output wraps to the screen and doesn't scroll sideways. The page
+  // sends its size when it loads, when it becomes visible again and
+  // when the device turns. The last client to resize the pane sets its
+  // size, so a page that becomes visible takes the pane back from
+  // Rex.app on the laptop. Window resize and focus on the message box
+  // do not send a resize.
+  function setupPaneFit(root,paneID,toolbar){
+    var heading=document.querySelector('.page-heading');
+    // A hidden row in the pane's font measures one cell. The box around
+    // it has no size and clips it, so the row can't make the page wider.
+    var probeBox=document.createElement('div');
+    probeBox.setAttribute('aria-hidden','true');
+    probeBox.style.cssText='position:absolute;width:0;height:0;overflow:hidden;visibility:hidden';
+    var probe=document.createElement('span');
+    probe.className='line';
+    probe.style.cssText='display:inline-block;padding:0';
+    probe.textContent=new Array(101).join('M');
+    probeBox.appendChild(probe);
+    root.appendChild(probeBox);
+    // The scrollback arrives on the event stream after the first fit.
+    // Before it arrives, the page has no vertical scrollbar, so
+    // root.clientWidth includes the scrollbar gutter. style.css sets
+    // scrollbar-gutter: stable to keep the gutter. If the browser does
+    // not support that, remove the width of the scrollbar that the
+    // scrollback will add.
+    function missingScrollbarWidth(){
+      if(window.CSS&&CSS.supports&&CSS.supports('scrollbar-gutter','stable'))return 0;
+      var de=document.documentElement;
+      if(de.scrollHeight>de.clientHeight)return 0;
+      var box=document.createElement('div');
+      box.style.cssText='position:absolute;top:-9999px;width:100px;height:100px;overflow-y:scroll';
+      document.body.appendChild(box);
+      var w=box.offsetWidth-box.clientWidth;
+      box.remove();
+      return w;
+    }
+    function measure(){
+      var rect=probe.getBoundingClientRect();
+      var cellW=rect.width/100,cellH=rect.height;
+      if(!(cellW>0&&cellH>0))return null;
+      // A .line has 8px of padding at each side.
+      var width=root.clientWidth-16-missingScrollbarWidth();
+      var height=window.innerHeight-(heading?heading.offsetHeight:0)-(toolbar?toolbar.offsetHeight:0)-8;
+      var dpr=window.devicePixelRatio||1;
+      return {
+        columns:Math.max(1,Math.floor(width/cellW)),
+        rows:Math.max(1,Math.floor(height/cellH)),
+        cellWidthPx:Math.round(cellW*dpr),
+        cellHeightPx:Math.round(cellH*dpr)
+      };
+    }
+    var timer=null;
+    function fit(){
+      if(document.visibilityState!=='visible')return;
+      var size=measure();
+      if(!size)return;
+      fetch('/api/pane/resize',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(Object.assign({paneID:paneID},size))
+      }).then(function(r){
+        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+      }).catch(function(e){console.warn('pane resize failed:',e)});
+    }
+    // Wait for the layout to become stable after the event.
+    function fitSoon(){
+      if(timer)clearTimeout(timer);
+      timer=setTimeout(function(){timer=null;fit()},250);
+    }
+    var ready=(document.fonts&&document.fonts.ready)||Promise.resolve();
+    ready.then(fit);
+    window.addEventListener('orientationchange',fitSoon);
+    document.addEventListener('visibilitychange',function(){
+      if(document.visibilityState==='visible')fitSoon();
+    });
   }
 
   // History entry page: resume spawns a fresh agent session for the repo

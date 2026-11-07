@@ -252,6 +252,19 @@ read -r rest
 		t.Fatalf("sessionByLabel = %+v, %v", got, ok)
 	}
 
+	want := rexTermSize{
+		Columns:      47,
+		Rows:         31,
+		CellWidthPx:  24,
+		CellHeightPx: 55,
+	}
+	if err := c.resize(ctx, s.ID, s.Agent, want); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.termSize(ctx, s.ID, s.Agent); err != nil || got != want {
+		t.Errorf("termSize = %+v, %v; want %+v", got, err, want)
+	}
+
 	changes, stop := c.watchBlock(s.ID, s.Agent)
 	defer stop()
 	if err := c.paste(ctx, s.ID, s.Agent, "hello", true); err != nil {

@@ -431,6 +431,12 @@ details .term-container { margin: 0 }
   .modal-overall textarea { font-size: 16px }
 }
 
+/* The stream page sizes the agent's terminal to the page width one
+   time, when the page loads. At that time the scrollback is not loaded
+   yet, so the page has no vertical scrollbar. Keep the scrollbar gutter
+   always, so the width does not change when the scrollback arrives. */
+html:has(#pane-tail) { scrollbar-gutter: stable }
+
 /* Stream-page footer toolbar. Two flex rows so the key buttons and
    the message input never have to compete for space on a narrow
    viewport; `#pane-tail`'s extra bottom padding keeps the live tail

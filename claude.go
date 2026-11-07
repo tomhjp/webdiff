@@ -351,6 +351,7 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/comments/send", handleCommentsSend)
 	mux.HandleFunc("/api/pane/stream", handlePaneStream)
 	mux.HandleFunc("/api/pane/input", handlePaneInput)
+	mux.HandleFunc("/api/pane/resize", handlePaneResize)
 	mux.HandleFunc("/api/pane/restart", handlePaneRestart)
 	mux.HandleFunc("/api/pane/history-url", handlePaneHistoryURL)
 	mux.HandleFunc("/api/pane/attach", handlePaneAttach)
@@ -881,6 +882,71 @@ func handlePaneInput(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "key or text required", http.StatusBadRequest)
 	}
+}
+
+type paneResizeRequest struct {
+	PaneID       string `json:"paneID"`
+	Columns      int    `json:"columns"`
+	Rows         int    `json:"rows"`
+	CellWidthPx  int    `json:"cellWidthPx,omitempty"`
+	CellHeightPx int    `json:"cellHeightPx,omitempty"`
+}
+
+// Limits for /api/pane/resize. Pi needs some columns to draw its UI,
+// and a size much larger than any screen is a client bug.
+const (
+	minPaneColumns = 20
+	maxPaneColumns = 500
+	minPaneRows    = 5
+	maxPaneRows    = 300
+	maxCellPx      = 1000
+)
+
+// handlePaneResize sets a pane's terminal to the size that fits the
+// browser that shows it, as the Rex iOS app does for its screen. The
+// stream page calls it when it opens, when it becomes visible again,
+// and when the device turns. The agent then draws its output for that
+// width. The last client to resize the pane sets its size.
+func handlePaneResize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req paneResizeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.PaneID == "" {
+		http.Error(w, "paneID required", http.StatusBadRequest)
+		return
+	}
+	if req.Columns <= 0 || req.Rows <= 0 {
+		http.Error(w, "columns and rows must be positive", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	if _, status, msg := webdiffSessionForPane(ctx, req.PaneID); status != 0 {
+		http.Error(w, msg, status)
+		return
+	}
+	size := rexTermSize{
+		Columns: min(max(req.Columns, minPaneColumns), maxPaneColumns),
+		Rows:    min(max(req.Rows, minPaneRows), maxPaneRows),
+	}
+	if req.CellWidthPx > 0 && req.CellWidthPx <= maxCellPx && req.CellHeightPx > 0 && req.CellHeightPx <= maxCellPx {
+		size.CellWidthPx, size.CellHeightPx = req.CellWidthPx, req.CellHeightPx
+	}
+	resized, err := resizePane(ctx, req.PaneID, size)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "resize: "+err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resized": resized,
+		"columns": size.Columns,
+		"rows":    size.Rows,
+	})
 }
 
 // webdiffSessionForPane resolves the session that owns paneID and

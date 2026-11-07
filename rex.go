@@ -951,6 +951,50 @@ func (c *rexClient) key(ctx context.Context, sessionID, blockID, key string) err
 	}, nil)
 }
 
+// rexTermSize is a terminal size in cells. CellWidthPx and CellHeightPx
+// are the size of one cell in device pixels, or 0 if they are not known.
+type rexTermSize struct {
+	Columns      int `json:"columns"`
+	Rows         int `json:"rows"`
+	CellWidthPx  int `json:"cell_width_px,omitempty"`
+	CellHeightPx int `json:"cell_height_px,omitempty"`
+}
+
+// resize makes webdiff the owner of the block and sets the terminal to
+// size. A terminal follows the size of its owner, so the claim must come
+// first. Another client, such as Rex.app, can take the block back. This
+// is the same thing that the Rex iOS app does when it shows a pane.
+func (c *rexClient) resize(ctx context.Context, sessionID, blockID string, size rexTermSize) error {
+	// session.own_block needs a connection attached to the session.
+	if err := c.call(ctx, "session.attach", map[string]string{"session_id": sessionID}, nil); err != nil {
+		return err
+	}
+	if err := c.call(ctx, "session.own_block", map[string]any{
+		"session_id": sessionID,
+		"block_ids":  []string{blockID},
+		"mode":       "take",
+	}, nil); err != nil {
+		return err
+	}
+	args := map[string]int{
+		"columns": size.Columns,
+		"rows":    size.Rows,
+	}
+	// Rex wants both cell dimensions or neither.
+	if size.CellWidthPx > 0 && size.CellHeightPx > 0 {
+		args["cell_width_px"] = size.CellWidthPx
+		args["cell_height_px"] = size.CellHeightPx
+	}
+	return c.blockCall(ctx, sessionID, blockID, "resize", args, nil)
+}
+
+// termSize returns the current size of the block's terminal.
+func (c *rexClient) termSize(ctx context.Context, sessionID, blockID string) (rexTermSize, error) {
+	var out rexTermSize
+	err := c.blockCall(ctx, sessionID, blockID, "size", nil, &out)
+	return out, err
+}
+
 // destroy ends a session and the agent in it.
 func (c *rexClient) destroy(ctx context.Context, sessionID string) error {
 	if err := c.call(ctx, "session.destroy", map[string]string{"session_id": sessionID}, nil); err != nil {
