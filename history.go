@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -59,6 +60,10 @@ type historyMeta struct {
 	Started int64  `json:"started"` // session creation time, unix seconds
 	Updated int64  `json:"updated"` // unix seconds of the last capture
 	Live    bool   `json:"live"`
+	// PiSession is the ID of the Pi session that ran in this instance,
+	// or "" for another agent or an archive from before webdiff chose
+	// the IDs. See pi_session.go.
+	PiSession string `json:"piSession,omitempty"`
 }
 
 const historySnapInterval = 2 * time.Second
@@ -158,6 +163,11 @@ func writeHistoryMeta(id, session string, created int64) {
 			return
 		}
 	}
+	writeMetaFile(metaPath, newHistoryMeta(id, session, created, now))
+}
+
+// newHistoryMeta returns the metadata for an instance that has none yet.
+func newHistoryMeta(id, session string, created, now int64) historyMeta {
 	// The fallback Name works out to the same thing sessionRepoRef would
 	// have returned, but only because session names are the flat slug
 	// plus "-wd" — see worktreeSlug.
@@ -174,7 +184,49 @@ func writeHistoryMeta(id, session string, created int64) {
 		m.Branch = currentBranch(ref.abs)
 		m.Live = true
 	}
+	return m
+}
+
+// recordPiSession records which Pi session runs in the live session
+// named session. webdiff calls it when it starts the agent, before the
+// first capture, so the metadata can exist before the .ansi file does.
+// The record must not wait for a capture: if webdiff restarts first, it
+// can't learn the ID again, because Rex doesn't report a program's
+// arguments.
+func recordPiSession(ctx context.Context, session, piSession string) {
+	if historyRoot == "" || !strings.HasSuffix(session, "-wd") || !piSessionIDRE.MatchString(piSession) {
+		return
+	}
+	created, ok := sessionCreated(ctx, session)
+	if !ok {
+		return
+	}
+	setHistoryPiSession(historyID(created, session), session, created, piSession)
+}
+
+// setHistoryPiSession sets PiSession in the metadata of instance id, and
+// makes the metadata if it doesn't exist.
+func setHistoryPiSession(id, session string, created int64, piSession string) {
+	historyMu.Lock()
+	defer historyMu.Unlock()
+	metaPath := filepath.Join(historyRoot, id+".json")
+	var m historyMeta
+	if b, err := os.ReadFile(metaPath); err != nil || json.Unmarshal(b, &m) != nil {
+		m = newHistoryMeta(id, session, created, time.Now().Unix())
+	}
+	m.PiSession = piSession
 	writeMetaFile(metaPath, m)
+}
+
+// readHistoryANSI returns the archived scrollback of an instance. An
+// instance whose agent was recorded but not captured yet has no .ansi
+// file, and its scrollback is empty.
+func readHistoryANSI(id string) ([]byte, error) {
+	b, err := os.ReadFile(filepath.Join(historyRoot, id+".ansi"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	return b, err
 }
 
 // writeMetaFile writes <id>.json via a temp file and rename so a reader
@@ -467,7 +519,7 @@ func renderHistoryText(w http.ResponseWriter, id string) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	ansi, err := os.ReadFile(filepath.Join(historyRoot, id+".ansi"))
+	ansi, err := readHistoryANSI(id)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -541,7 +593,7 @@ func renderHistoryEntry(w http.ResponseWriter, ctx context.Context, id string) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	ansi, err := os.ReadFile(filepath.Join(historyRoot, id+".ansi"))
+	ansi, err := readHistoryANSI(id)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -568,7 +620,12 @@ func renderHistoryEntry(w http.ResponseWriter, ctx context.Context, id string) {
 		// Resume needs somewhere to start the agent: the ref has to still
 		// exist on disk, which it won't for a worktree that's been removed.
 		if m.Kind != "" {
-			if ref, ok := resolveRepoRef("/" + m.Kind + "/" + m.Name + "/"); ok && isGitRepo(ref.abs) {
+			if ref, ok := resolveRepoRef("/" + m.Kind + "/" + m.Name + "/"); ok && isGitRepo(ref.abs) && m.PiSession != "" {
+				// Pi continues the conversation from its session file, so
+				// there is no scrollback to paste.
+				fmt.Fprintf(&body, `<a class="toggle" id="history-continue-btn" href="%s" title="continue this pi conversation in a new session">resume</a>`,
+					template.HTMLEscapeString("/agent"+ref.url+"?"+url.Values{"resume": {m.ID}}.Encode()))
+			} else if ok && isGitRepo(ref.abs) {
 				fmt.Fprintf(&body, `<button class="toggle" type="button" id="history-resume-btn" data-repo-url="%s" data-history-url="%s" title="start a new %s session for this repo">resume</button>`,
 					template.HTMLEscapeString(ref.url),
 					template.HTMLEscapeString("/history/"+m.ID+".txt"),

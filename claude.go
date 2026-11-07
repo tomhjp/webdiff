@@ -1012,7 +1012,7 @@ func handleCommentsSend(w http.ResponseWriter, r *http.Request) {
 	// No agent id: sending comments only spawns when the session has
 	// died, and there's no reviewer choice attached to a send. That
 	// respawn gets the default agent.
-	pane, err := ensureRepoSession(ctx, repoPath, "")
+	pane, err := ensureRepoSession(ctx, repoPath, "", "")
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, err.Error(), nil)
 		return
@@ -1281,7 +1281,11 @@ func streamDelta(old, new []string) (drop, keep int, appendLines []string) {
 // agentID selects which agent to spawn (see resolveAgent); it only
 // matters on the creating call, since an existing session is already
 // running whatever it was started with.
-func ensureRepoSession(ctx context.Context, repoPath, agentID string) (Pane, error) {
+//
+// A new Pi agent gets a session ID that webdiff chooses, and webdiff
+// records the ID in the history metadata (see pi_session.go). If
+// piSession is set, Pi continues that session, and agentID is ignored.
+func ensureRepoSession(ctx context.Context, repoPath, agentID, piSession string) (Pane, error) {
 	name := repoSessionName(repoPath)
 	recordRepoSession(name, repoPath)
 	if s, ok := rexc.sessionByLabel(name); ok {
@@ -1294,15 +1298,36 @@ func ensureRepoSession(ctx context.Context, repoPath, agentID string) (Pane, err
 		wantName, wantCmd := resolveAgent(agentID)
 		return ensureTmuxSession(ctx, name, repoPath, wantName, wantCmd)
 	}
+	if piSession != "" {
+		agentID = piAgentName
+	}
 	wantName, wantCmd := resolveAgent(agentID)
+	if wantName == piAgentName {
+		if piSession == "" {
+			piSession = newPiSessionID()
+		}
+		wantCmd = piCommand(wantCmd, piSession)
+	} else {
+		piSession = ""
+	}
+	var pane Pane
 	if rexSpawn {
 		s, err := rexc.createAgentSession(ctx, name, repoPath, wantName, wantName, wantCmd)
 		if err != nil {
 			return Pane{}, err
 		}
-		return Pane{ID: rexPaneID(s.ID, s.Agent), Label: name + " (just spawned)"}, nil
+		pane = Pane{ID: rexPaneID(s.ID, s.Agent), Label: name + " (just spawned)"}
+	} else {
+		p, err := ensureTmuxSession(ctx, name, repoPath, wantName, wantCmd)
+		if err != nil {
+			return Pane{}, err
+		}
+		pane = p
 	}
-	return ensureTmuxSession(ctx, name, repoPath, wantName, wantCmd)
+	if piSession != "" {
+		recordPiSession(ctx, name, piSession)
+	}
+	return pane, nil
 }
 
 // ensureTmuxSession is ensureRepoSession for tmux. When the session
@@ -1412,11 +1437,42 @@ func handleStartSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agentID := r.URL.Query().Get("agent")
-	if _, err := ensureRepoSession(r.Context(), ref.abs, agentID); err != nil {
+	var piSession string
+	if histID := r.URL.Query().Get("resume"); histID != "" {
+		var status int
+		var msg string
+		piSession, status, msg = resumablePiSession(histID, ref)
+		if status != 0 {
+			http.Error(w, msg, status)
+			return
+		}
+		agentID = piAgentName
+	}
+	if _, err := ensureRepoSession(r.Context(), ref.abs, agentID, piSession); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	http.Redirect(w, r, "/stream"+ref.url+agentQuery(agentID), http.StatusSeeOther)
+}
+
+// resumablePiSession returns the Pi session recorded for the history
+// instance histID, which must belong to ref. A non-zero status is an
+// HTTP error code with a matching message.
+func resumablePiSession(histID string, ref repoRef) (piSession string, status int, msg string) {
+	if !historyIDRE.MatchString(histID) {
+		return "", http.StatusBadRequest, "bad history id"
+	}
+	m, ok := readHistoryMeta(histID)
+	if !ok {
+		return "", http.StatusNotFound, "unknown history entry"
+	}
+	if !piSessionIDRE.MatchString(m.PiSession) {
+		return "", http.StatusConflict, "history entry has no pi session to resume"
+	}
+	if m.Kind != ref.kind || m.Name != ref.name {
+		return "", http.StatusBadRequest, "history entry belongs to another repo"
+	}
+	return m.PiSession, 0, ""
 }
 
 // repoStreamPane returns the pane id, session label and running agent
