@@ -1655,10 +1655,10 @@ func renderRepoStreamPage(w http.ResponseWriter, r *http.Request) {
 	writeStreamPage(w, paneID, ref.url, "", session, liveAgent)
 }
 
-// renderArbitraryPanePage is the streaming view for tmux panes that
-// aren't paired with a repo — opened from the home page's "tmux
-// sessions" listing. The session name is looked up from paneID via
-// tmux so the URL stays at just /pane?paneID=... (no label query
+// renderArbitraryPanePage is the streaming view for panes that
+// aren't paired with a repo — opened from the home page's
+// "sessions" listing. The session name is looked up from paneID
+// so the URL stays at just /pane?paneID=... (no label query
 // param). The "diff" back-link is still shown when the pane's session
 // matches a known webdiff repo or worktree (paneRepoURL), so clicking
 // a `<base>-wd` row from the listing still gets the same chrome as
@@ -1669,13 +1669,12 @@ func renderArbitraryPanePage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "paneID required", http.StatusBadRequest)
 		return
 	}
-	out, err := tmuxOut(r.Context(), "display-message", "-t", paneID, "-p", "#{session_name}\t#{pane_start_command}")
-	session, start, _ := strings.Cut(strings.TrimSpace(out), "\t")
-	if err != nil || session == "" {
+	session, agent, err := paneSession(r.Context(), paneID)
+	if err != nil {
 		writeStreamPage(w, paneID, "", paneID, "", "")
 		return
 	}
-	writeStreamPage(w, paneID, paneRepoURL(session), session, session, agentFromStartCommand(start))
+	writeStreamPage(w, paneID, paneRepoURL(session), session, session, agent)
 }
 
 // writeStreamPage derives the heading from repoURL (so the title is the
@@ -1785,7 +1784,9 @@ func computeXterm256CSS() string {
 }
 
 func main() {
-	agentFlag := flag.String("agent", "claude", "agent command spawned in each repo's tmux pane; the first whitespace-separated token is used as the display name")
+	agentFlag := flag.String("agent", "claude", "agent command spawned in each repo's agent session; the first whitespace-separated token is used as the display name")
+	terminalFlag := flag.String("terminal", "auto", "where new agent sessions run: rex, tmux, or auto (rex if the rex command is installed); sessions already running in tmux keep working either way")
+	rexSocketFlag := flag.String("rex-socket", defaultRexSocket(), "Unix socket of the Rex server")
 	branchPrefixFlag := flag.String("branch-prefix", "", "default branch prefix to prepopulate when creating worktrees and hide on the home page")
 	sshHostFlag := flag.String("ssh-host", "", "how the browser's machine reaches this one over SSH (e.g. an ~/.ssh/config alias); defaults to this node's MagicDNS name")
 	flag.Parse()
@@ -1894,6 +1895,20 @@ func main() {
 	browserMux.HandleFunc("/history/", handleHistory)
 	browserMux.HandleFunc("/", renderHomeHandler)
 
+	switch *terminalFlag {
+	case "rex", "tmux", "auto":
+	default:
+		fmt.Fprintf(os.Stderr, "-terminal must be rex, tmux, or auto, not %q\n", *terminalFlag)
+		os.Exit(2)
+	}
+	_, rexErr := exec.LookPath("rex")
+	if *terminalFlag == "rex" || rexErr == nil {
+		// Rex sessions are followed even when new ones go to tmux, so
+		// that switching the flag doesn't hide running sessions.
+		rexc = newRexClient(*rexSocketFlag)
+		go rexc.run(context.Background())
+		rexSpawn = *terminalFlag != "tmux"
+	}
 	startSessionWatcher(context.Background())
 
 	apiMux := http.NewServeMux()

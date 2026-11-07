@@ -92,7 +92,7 @@ func renameWorktree(ctx context.Context, ref repoRef, branch string) (string, in
 	oldSession, newSession := repoSessionName(ref.abs), repoSessionName(newPath)
 	live := sessionExists(ctx, oldSession)
 	if oldSession != newSession && sessionExists(ctx, newSession) {
-		return fail(http.StatusConflict, "tmux session already exists")
+		return fail(http.StatusConflict, "agent session already exists")
 	}
 	git := func(dir string, args ...string) error {
 		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
@@ -123,7 +123,7 @@ func renameWorktree(ctx context.Context, ref repoRef, branch string) (string, in
 		}
 	}
 	if live && oldSession != newSession {
-		if _, err := tmuxOut(ctx, "rename-session", "-t", "="+oldSession, newSession); err != nil {
+		if err := renameSession(ctx, oldSession, newSession); err != nil {
 			if moveErr := git(newPath, "worktree", "move", newPath, ref.abs); moveErr != nil {
 				return fail(http.StatusBadGateway, fmt.Sprintf("rename session: %v; rollback move failed: %v", err, moveErr))
 			}

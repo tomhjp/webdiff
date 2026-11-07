@@ -24,11 +24,11 @@ import (
 // other cache roots.
 var historyRoot string
 
-// Session history persists the full scrollback of every *-wd tmux
+// Session history persists the full scrollback of every *-wd agent
 // session so it survives a restart, a worktree removal, or the agent
 // process simply exiting — all of which otherwise lose the pane's
 // scrollback for good. Each archived *instance* is the pair of a
-// session name and its tmux session_created time, so a restart (which
+// session name and its creation time, so a restart (which
 // gives the new session a fresh creation time) starts a new entry
 // rather than overwriting the old one. An instance is two flat files
 // keyed by a deterministic id `<created>-<session>`:
@@ -56,7 +56,7 @@ type historyMeta struct {
 	Kind    string `json:"kind"`    // "repos" or "worktrees" ("" if unresolved)
 	Name    string `json:"name"`    // repo / worktree URL slug
 	Branch  string `json:"branch"`  // git branch at first capture ("" if unknown)
-	Started int64  `json:"started"` // tmux session_created, unix seconds
+	Started int64  `json:"started"` // session creation time, unix seconds
 	Updated int64  `json:"updated"` // unix seconds of the last capture
 	Live    bool   `json:"live"`
 }
@@ -112,12 +112,12 @@ func captureHistory(ctx context.Context, session string, created int64, force bo
 	}
 	historyMu.Unlock()
 
-	// -e keeps ANSI colour, -S - starts at the top of the scrollback so
-	// we archive everything the pane has produced, not just the visible
-	// area. Unlike handlePaneStream's capped live capture, the archive
-	// must stay complete — it's the durable record the history page
-	// serves after the tmux session is gone.
-	out, err := tmuxOut(ctx, "capture-pane", "-p", "-e", "-S", "-", "-t", session+":0.0")
+	// The capture keeps ANSI colour and starts at the top of the
+	// scrollback, so we archive everything the pane has produced, not
+	// just the visible area. Unlike handlePaneStream's capped live
+	// capture, the archive must stay complete — it's the durable record
+	// the history page serves after the session is gone.
+	out, err := captureScrollback(ctx, session)
 	if err != nil {
 		return
 	}
@@ -265,12 +265,8 @@ func snapshotSessionHistory(ctx context.Context, session string) string {
 	if !strings.HasSuffix(session, "-wd") {
 		return ""
 	}
-	out, err := tmuxOut(ctx, "display-message", "-t", session, "-p", "#{session_created}")
-	if err != nil {
-		return ""
-	}
-	created, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-	if err != nil {
+	created, ok := sessionCreated(ctx, session)
+	if !ok {
 		return ""
 	}
 	captureHistory(ctx, session, created, true)

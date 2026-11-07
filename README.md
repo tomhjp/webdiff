@@ -2,13 +2,21 @@
 
 A mobile-friendly web UI served over Tailscale for reviewing git diffs directly on your LLM sandbox, with an integrated Claude code-review workflow. It has 3 main views:
 
-* Home page listing git repos and tmux sessions
+* Home page listing git repos and agent sessions
 * Diff page showing git diff output, with the ability to add comments and send them to claude
 * Terminal page showing a stream of the claude session for a particular repo, with some minimal controls for interactivity
 
-It uses tmux to persist long-lived sessions per repo, starting a new session on-demand if none exists.
+It uses [Rex](https://www.superlogical.com/rex/docs) to persist long-lived sessions per repo, starting a new session on-demand if none exists. Each session is named `<name>-wd`, where name is the repo's directory name, or for a managed worktree the `<repo>-<worktree>` slug from its URL. Agents tell webdiff when a turn ends: Pi reports its state with OSC 7501, and Claude Code shows it in its terminal title.
 
-Webdiff doesn't try to replace your existing tools. If you need the full terminal experience, just attach to the tmux session in your terminal via `tmux a -t <name>-wd`, where name is the repo's directory name, or for a managed worktree the `<repo>-<worktree>` slug from its URL. And if you need the full IDE experience you can still use your regular remote SSH workflows. In either case, webdiff seamlessly picks up the latest state when you come back to it.
+Run the Rex server as a user service, so that sessions don't depend on webdiff:
+
+```
+systemctl --user enable --now rex.socket
+```
+
+`-terminal=tmux` starts new sessions in tmux instead. Sessions that already run in tmux keep working with either setting until they end.
+
+Webdiff doesn't try to replace your existing tools. If you need the full terminal experience, open the session in the Rex app (or `tmux a -t <name>-wd` for a tmux session). And if you need the full IDE experience you can still use your regular remote SSH workflows. In either case, webdiff seamlessly picks up the latest state when you come back to it.
 
 ## Opening a checkout in Zed, VS Code, or Ghostty
 
@@ -79,7 +87,7 @@ under review without leaving the UI. They're checked out at
 `<code-dir>/wt/<repo>/<worktree>` — beside your repos rather than in a cache
 dir, since they hold real uncommitted work — and addressed everywhere else by
 the flat slug `<repo>-<worktree>`, e.g. `/worktrees/corp-fix-thing/` with a
-`corp-fix-thing-wd` tmux session. The worktree name is the branch name with any
+`corp-fix-thing-wd` agent session. The worktree name is the branch name with any
 `<owner>/` prefix dropped.
 
 The **+ worktree** button is also available on worktree diff pages. It defaults
