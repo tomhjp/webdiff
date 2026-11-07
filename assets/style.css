@@ -507,6 +507,13 @@ details .term-container { margin: 0 }
 #pane-tail .line-bg-del .term-bgx52,
 #pane-tail .line-bg-del .term-bg41 { background: transparent }
 
+/* A 24-bit background (Pi's tool-call boxes, its diff rows) is an inline
+   style that terminal-to-html writes on the span. An inline-block span
+   is as tall as the line box, so the background fills the line height,
+   and adjacent rows of the same colour make one solid block, as in a
+   terminal. */
+.term-container .line span[style*="background-color"] { display: inline-block }
+
 /* ─── file browser ───────────────────────────────────────────────
  * Breadcrumb in the page heading: each path segment is its own `<a
  * class="crumb">`, joined by "/" separators. Inherit the muted

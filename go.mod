@@ -3,16 +3,16 @@ module github.com/tomhjp/webdiff
 go 1.26.2
 
 require (
-	github.com/buildkite/terminal-to-html/v3 v3.16.8
+	github.com/alecthomas/chroma/v2 v2.24.1
+	github.com/buildkite/terminal-to-html/v3 v3.17.3
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/yuin/goldmark v1.8.5
 )
 
 require (
-	github.com/alecthomas/chroma/v2 v2.24.1 // indirect
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/gorilla/csrf v1.7.3 // indirect
 	github.com/gorilla/securecookie v1.1.2 // indirect
-	github.com/yuin/goldmark v1.8.5 // indirect
 )
 
 require (
@@ -40,3 +40,5 @@ require (
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	tailscale.com v1.96.5
 )
+
+replace github.com/buildkite/terminal-to-html/v3 => ./third_party/terminal-to-html

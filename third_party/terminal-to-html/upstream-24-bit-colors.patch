@@ -1,0 +1,152 @@
+From 69c969c52ea3d8701d703e106182e08ee4b6a325 Mon Sep 17 00:00:00 2001
+From: Tom Proctor <tomhjp@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 20:03:19 +0000
+Subject: [PATCH] Render 24-bit colors as inline styles
+
+v3.17.0 started to parse 24-bit SGR colors (38;2;r;g;b and 48;2;r;g;b)
+into the style, but asClasses drops them, so the text shows in the
+default colors. Programs that detect COLORTERM=truecolor, such as
+coding agents and many modern CLIs, send all of their colors this way.
+
+There can't be a CSS class for each 24-bit color, so write them as an
+inline style attribute on the span, next to the classes for the other
+attributes:
+
+    <span class="term-fg1" style="color:#0000ff;">bold blue</span>
+
+8-bit and 16-color codes still render as classes only, so output that
+doesn't use 24-bit colors is unchanged.
+
+Pages that use a Content-Security-Policy without 'unsafe-inline' in
+style-src will ignore the style attributes, and the text falls back to
+the default colors as before.
+---
+ Readme.md        |  2 +-
+ output.go        | 12 +++++++++++-
+ style.go         | 30 ++++++++++++++++++++++++++----
+ terminal_test.go | 14 ++++++++++++--
+ 4 files changed, 50 insertions(+), 8 deletions(-)
+
+diff --git a/Readme.md b/Readme.md
+index 48a14ea..ad83d2b 100644
+--- a/Readme.md
++++ b/Readme.md
+@@ -26,7 +26,7 @@ terminal-to-html -http=:6060 &
+ curl --data-binary "@fixtures/pikachu.sh.raw" http://localhost:6060/terminal > out.html
+ ```
+ 
+-For coloring you can use the sample [terminal.css](/internal/assets/terminal.css) stylesheet and wrap the output in an element with class `term-container` (e.g. `<div class="term-container"><!-- terminal output --></div>`).
++For coloring you can use the sample [terminal.css](/internal/assets/terminal.css) stylesheet and wrap the output in an element with class `term-container` (e.g. `<div class="term-container"><!-- terminal output --></div>`). 24-bit colors (`ESC[38;2;r;g;bm` and `ESC[48;2;r;g;bm`) have no class; they are written as an inline `style` attribute on the span instead.
+ 
+ ### iTerm2 Image support
+ 
+diff --git a/output.go b/output.go
+index f7e141b..c836e6f 100644
+--- a/output.go
++++ b/output.go
+@@ -18,7 +18,17 @@ func (b *outputBuffer) appendNodeStyle(n node) {
+ 	// the joined value is always [a-z0-9- ] — nothing to escape.
+ 	b.WriteString(`<span class="`)
+ 	b.WriteString(strings.Join(n.style.asClasses(), " "))
+-	b.WriteString(`">`)
++	b.WriteString(`"`)
++	// There is no class for each of the 16.7 million 24-bit colors, so
++	// they are written as an inline style. asInlineStyle only ever emits
++	// "color:" or "background-color:" followed by "#" and 6 hex digits
++	// and ";" — nothing to escape.
++	if css := n.style.asInlineStyle(); css != "" {
++		b.WriteString(` style="`)
++		b.WriteString(css)
++		b.WriteString(`"`)
++	}
++	b.WriteString(`>`)
+ }
+ 
+ func (b *outputBuffer) closeStyle() {
+diff --git a/style.go b/style.go
+index bab88f9..38bd879 100644
+--- a/style.go
++++ b/style.go
+@@ -101,8 +101,7 @@ func (s style) asClasses() []string {
+ 	case color8Bit:
+ 		styles = append(styles, "term-fgx"+strconv.Itoa(int(s.fgColor())))
+ 	case color24Bit:
+-		// This should set the fg color to the specified color, but the previous behavior was
+-		// undefined and implementing that is outside the scope of this PR.
++		// Written as an inline style by asInlineStyle.
+ 	}
+ 
+ 	switch s.bgColorType() {
+@@ -116,8 +115,7 @@ func (s style) asClasses() []string {
+ 	case color8Bit:
+ 		styles = append(styles, "term-bgx"+strconv.Itoa(int(s.bgColor())))
+ 	case color24Bit:
+-		// This should set the bg color to the specified color, but the previous behavior was
+-		// undefined and implementing that is outside the scope of this PR.
++		// Written as an inline style by asInlineStyle.
+ 	}
+ 
+ 	if s.bold() {
+@@ -142,6 +140,30 @@ func (s style) asClasses() []string {
+ 	return styles
+ }
+ 
++// asInlineStyle returns the CSS declarations for the style's 24-bit colors,
++// or "" if it has none.
++func (s style) asInlineStyle() string {
++	var css string
++	if s.fgColorType() == color24Bit {
++		css += "color:" + hexColor(s.fgColor()) + ";"
++	}
++	if s.bgColorType() == color24Bit {
++		css += "background-color:" + hexColor(s.bgColor()) + ";"
++	}
++	return css
++}
++
++// hexColor formats a 0xRRGGBB color as "#rrggbb".
++func hexColor(rgb uint32) string {
++	const digits = "0123456789abcdef"
++	b := []byte("#000000")
++	for i := 6; i > 0; i-- {
++		b[i] = digits[rgb&0xf]
++		rgb >>= 4
++	}
++	return string(b)
++}
++
+ // Add colours to an existing style, returning a new style.
+ func (s style) color(colors []string) style {
+ 	if len(colors) == 0 || (len(colors) == 1 && (colors[0] == "0" || colors[0] == "")) {
+diff --git a/terminal_test.go b/terminal_test.go
+index 59f36f1..66b561a 100644
+--- a/terminal_test.go
++++ b/terminal_test.go
+@@ -260,12 +260,22 @@ var rendererTestCases = []struct {
+ 	{
+ 		name:  "doesn't trip over 24-bit colors",
+ 		input: "\x1b[48;5;50;38;2;48;7;1mhello\x1b[0m \x1b[38;5;179;48;2;38;5;200mgoodbye",
+-		want:  "<span class=\"term-bgx50\">hello</span> <span class=\"term-fgx179\">goodbye</span>",
++		want:  "<span class=\"term-bgx50\" style=\"color:#300701;\">hello</span> <span class=\"term-fgx179\" style=\"background-color:#2605c8;\">goodbye</span>",
+ 	},
+ 	{
+ 		name:  "doesn't panic on 24-bit colors with extra trailing values",
+ 		input: "\x1b[38;2;100;150;200;250;255mhello\x1b[0m",
+-		want:  `<span class="">hello</span>`,
++		want:  `<span class="" style="color:#6496c8;">hello</span>`,
++	},
++	{
++		name:  "renders 24-bit colors as inline styles",
++		input: "\x1b[48;2;37;65;49m\x1b[38;2;104;183;141m+ added\x1b[0m \x1b[1;38;2;0;0;255mbold blue\x1b[0m",
++		want:  `<span class="" style="color:#68b78d;background-color:#254131;">+ added</span> <span class="term-fg1" style="color:#0000ff;">bold blue</span>`,
++	},
++	{
++		name:  "replaces a 24-bit color with an 8-bit color",
++		input: "\x1b[38;2;1;2;3mone\x1b[38;5;100mtwo\x1b[39mthree",
++		want:  `<span class="" style="color:#010203;">one</span><span class="term-fgx100">two</span>three`,
+ 	},
+ 	{
+ 		name:  "handles non-xterm codes on the same line as xterm colors",
+-- 
+2.54.0
+
