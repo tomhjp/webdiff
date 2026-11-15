@@ -454,6 +454,9 @@ details .term-container { margin: 0 }
 .modal-agent-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--muted); font-size: 12px }
 .history-url-input { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); padding: 6px 8px; margin-bottom: 8px; user-select: all }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--border) }
+/* A red action, for example "stop session", sits at the left, away
+   from the confirm button. */
+.modal-footer .modal-danger { margin-right: auto }
 .modal-footer .send-btn { background: var(--branch); color: var(--bg); font-weight: bold; padding: 6px 14px; border-color: var(--branch) }
 .modal-footer .send-btn:hover { background: color-mix(in srgb, var(--branch) 80%, white); color: var(--bg) }
 .modal-footer .send-btn:disabled { background: transparent; color: var(--muted); border-color: var(--border); cursor: not-allowed }

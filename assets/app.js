@@ -27,6 +27,10 @@
   // opts.agents: {options:[id,…], selected} renders an agent drop-down
   // above the history URL. Omit it and the modal is exactly what it was
   // before — the resume flow on a history page has no agent to choose.
+  //
+  // opts.danger: {label, onClick(done)} adds a red button at the left of
+  // the footer. The restart modal uses it for "stop session", because
+  // the header hides the stop button on narrow screens.
   function showHistoryModal(opts){
     var fullURL=opts.historyURL?(window.location.origin+opts.historyURL):'';
     var backdrop=document.createElement('div');backdrop.className='modal-backdrop';
@@ -72,6 +76,18 @@
       footer.appendChild(copyBtn);
     }
     var goBtn=document.createElement('button');goBtn.type='button';goBtn.className='toggle send-btn';goBtn.textContent=opts.confirmLabel;
+    if(opts.danger){
+      var dangerBtn=document.createElement('button');dangerBtn.type='button';
+      dangerBtn.className='toggle danger modal-danger';dangerBtn.textContent=opts.danger.label;
+      dangerBtn.addEventListener('click',function(){
+        dangerBtn.disabled=true;goBtn.disabled=true;
+        opts.danger.onClick(function(err){
+          dangerBtn.disabled=false;goBtn.disabled=false;
+          if(err)window.alert(err.message);
+        });
+      });
+      footer.insertBefore(dangerBtn,footer.firstChild);
+    }
     goBtn.addEventListener('click',function(){
       goBtn.disabled=true;
       opts.onConfirm(function(err){
@@ -696,6 +712,9 @@
             confirmLabel:'kill & start fresh',
             historyURL:historyURL,
             agents:{options:choices,selected:restartBtn.dataset.agentId||''},
+            // The server writes data-can-stop only for a webdiff-managed
+            // session, the same check that it does for the stop button.
+            danger:restartBtn.dataset.canStop?{label:'stop session',onClick:stopPane}:null,
             onConfirm:function(done,agent){
               fetch('/api/pane/restart',{
                 method:'POST',
@@ -713,6 +732,21 @@
           restartBtn.disabled=false;
           window.alert('restart failed: '+e.message);
         });
+      });
+    }
+    // stopPane kills the session and goes to the home page. The stop
+    // modal and the stop button in the restart modal both use it. done
+    // gets the error when the request fails.
+    function stopPane(done){
+      fetch('/api/pane/stop',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({paneID:paneID})
+      }).then(function(r){
+        if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+        window.location.href='/';
+      }).catch(function(e){
+        done(new Error('stop failed: '+e.message));
       });
     }
     // Stop uses the same flow as restart: archive the scrollback, show a
@@ -739,18 +773,7 @@
               :'The tmux session will be killed.',
             confirmLabel:'kill session',
             historyURL:historyURL,
-            onConfirm:function(done){
-              fetch('/api/pane/stop',{
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({paneID:paneID})
-              }).then(function(r){
-                if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
-                window.location.href='/';
-              }).catch(function(e){
-                done(new Error('stop failed: '+e.message));
-              });
-            }
+            onConfirm:stopPane
           });
         }).catch(function(e){
           stopBtn.disabled=false;

@@ -1967,10 +1967,18 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		// drop-down can be built without a second request: data-agent-id
 		// is what's running now (the default the modal opens on),
 		// data-agent-choices is everything selectable.
-		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="restart-session" data-repo-url="%s" data-agent-id="%s" data-agent-choices="%s">restart session</button>`,
+		//
+		// data-can-stop tells the modal to show a "stop session" button.
+		// It is the only stop control on narrow screens, where
+		// #stop-session is hidden.
+		canStop := ""
+		if strings.HasSuffix(session, "-wd") {
+			canStop = ` data-can-stop="1"`
+		}
+		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="restart-session" data-repo-url="%s" data-agent-id="%s" data-agent-choices="%s"%s>restart session</button>`,
 			template.HTMLEscapeString(repoURL),
 			template.HTMLEscapeString(pageAgent),
-			template.HTMLEscapeString(strings.Join(agentChoices(), ",")))
+			template.HTMLEscapeString(strings.Join(agentChoices(), ",")), canStop)
 	}
 	if strings.HasSuffix(session, "-wd") {
 		// Stop only needs a webdiff-managed session, not a repo URL: the

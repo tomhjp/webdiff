@@ -316,3 +316,31 @@ func TestStreamPageHeaderButtons(t *testing.T) {
 		})
 	}
 }
+
+// The restart button has data-can-stop only for a webdiff-managed
+// session, so the restart modal shows "stop session" only when the
+// server can stop the session.
+func TestStreamPageRestartCanStop(t *testing.T) {
+	renameTestWorktree(t)
+	for _, tc := range []struct {
+		session string
+		want    bool
+	}{
+		{"repo-source-wd", true},
+		{"other", false},
+	} {
+		t.Run(tc.session, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeStreamPage(w, "%0", "/worktrees/repo-source/", "pane", tc.session, "")
+			body := w.Body.String()
+			start := strings.Index(body, `id="restart-session"`)
+			if start < 0 {
+				t.Fatal("missing restart button")
+			}
+			end := strings.Index(body[start:], `>`) + start
+			if got := strings.Contains(body[start:end], `data-can-stop="1"`); got != tc.want {
+				t.Fatalf("data-can-stop = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
