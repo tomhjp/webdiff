@@ -912,8 +912,8 @@ func writeDirGroup(b *strings.Builder, target repostats.Target, label string, se
 // one row with the repo name and inline buttons to start a worktree or
 // an agent, and below it one row for each agent session of the repo.
 // The rows show no branch or diff stats: work in these repos happens in
-// worktrees, so the repo stays on its main branch. The agent page of the
-// repo links to its diff and file views.
+// worktrees, and the daily pull (see pull.go) keeps the repo on its main
+// branch. The agent page of the repo links to its diff and file views.
 //
 // "+ agent" goes to /agent, which starts a session. A repo has only one
 // session for now, so the button shows only when that session is not
@@ -2091,6 +2091,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "initial repo stats:", err)
 		os.Exit(1)
 	}
+	startRepoPuller(context.Background(), filepath.Join(cacheRoot, "pull.json"))
 
 	browserMux := http.NewServeMux()
 	browserMux.HandleFunc("/app.js", serveAppJS)
