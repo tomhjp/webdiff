@@ -11,7 +11,7 @@
   // logic below shouldn't run here — there are no <details> on this
   // page anyway, but bailing early keeps the two flows independent.
   var streamRoot=document.getElementById('pane-tail');
-  if(streamRoot){setupStreamPage(streamRoot);setupWorktreeCreate();setupWorktreeRemove();setupWorktreeRename();return}
+  if(streamRoot){setupStreamPage(streamRoot);setupWorktreeCreate();setupWorktreeRemove();setupWorktreeRename();setupStickyOffsets();return}
 
   // showHistoryModal is the shared "confirm, and here's the scrollback URL
   // to hand the next session" dialog. Both entry points need it: restart
@@ -1164,6 +1164,9 @@
   // We set them from measured rendered heights so the stack still lines
   // up if the heading wraps onto extra rows on a narrow viewport or
   // someone bumps the font-size.
+  //
+  // The stream page returns early, so it calls setupStickyOffsets too.
+  // Its floating "jump to bottom" button uses --page-heading-h.
   function syncStickyOffsets(){
     var h=document.querySelector('.page-heading');
     var p=document.querySelector('.pillbar');
@@ -1171,15 +1174,18 @@
     if(h)root.style.setProperty('--page-heading-h',h.offsetHeight+'px');
     if(p)root.style.setProperty('--pillbar-h',p.offsetHeight+'px');
   }
-  syncStickyOffsets();
-  if(typeof ResizeObserver!=='undefined'){
-    var stickyRO=new ResizeObserver(syncStickyOffsets);
-    var heading=document.querySelector('.page-heading');
-    var pillbar=document.querySelector('.pillbar');
-    if(heading)stickyRO.observe(heading);
-    if(pillbar)stickyRO.observe(pillbar);
+  function setupStickyOffsets(){
+    syncStickyOffsets();
+    if(typeof ResizeObserver!=='undefined'){
+      var stickyRO=new ResizeObserver(syncStickyOffsets);
+      var heading=document.querySelector('.page-heading');
+      var pillbar=document.querySelector('.pillbar');
+      if(heading)stickyRO.observe(heading);
+      if(pillbar)stickyRO.observe(pillbar);
+    }
+    window.addEventListener('resize',syncStickyOffsets);
   }
-  window.addEventListener('resize',syncStickyOffsets);
+  setupStickyOffsets();
 
   // File-browser breadcrumb: when the path overflows its scroller,
   // start at the right end — the filename is where the user is; the

@@ -530,6 +530,12 @@ html:has(#pane-tail) { scrollbar-gutter: stable }
   .history-url-input { font-size: 16px }
 }
 #pane-tail { padding-bottom: 100px }
+/* Floating "jump to bottom" button. It stays in the top-right corner of
+   the pane, below the sticky page heading. --page-heading-h comes from
+   syncStickyOffsets in app.js. */
+.jump-bottom { position: fixed; top: calc(var(--page-heading-h, 68px) + 8px); right: 12px; z-index: 25; background: var(--chrome-bg); box-shadow: 0 2px 6px rgba(0,0,0,0.3) }
+.jump-bottom:hover { background: var(--bg) }
+.jump-bottom[hidden] { display: none }
 
 /* Diff-coloured stream rows get their bg painted on the .line block
    instead of the inline `term-bgxN` spans, so it fills the entire

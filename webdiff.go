@@ -1943,7 +1943,6 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 			template.HTMLEscapeString(worktreeName))
 	}
 	body.WriteString(`<div class="header-buttons-right">`)
-	body.WriteString(`<button class="toggle" type="button" id="jump-bottom" hidden>jump to bottom</button>`)
 	if hasRef {
 		// .wide-only hides this and "stop session" on narrow screens,
 		// where they make the row too wide. Restart stays because it is
@@ -1978,6 +1977,10 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 	body.WriteString(`</div>`)
 	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" data-agent-session="%s" class="term-container"><div class="term-inner"></div></div>`,
 		template.HTMLEscapeString(paneID), template.HTMLEscapeString(agentSession))
+	// The jump button floats over the top-right corner of the pane, below
+	// the sticky heading. It is not in the header row, because there it
+	// made the row too wide on narrow screens.
+	body.WriteString(`<button class="toggle jump-bottom" type="button" id="jump-bottom" hidden>jump to bottom</button>`)
 	body.WriteString(`<div class="stream-toolbar">`)
 	body.WriteString(`<div class="stream-toolbar-row">`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Escape" title="send Escape">esc</button>`)
