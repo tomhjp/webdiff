@@ -1,6 +1,8 @@
 package main
 
 import (
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -132,5 +134,39 @@ func TestWriteRepoActionsGroup(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSortByAgentActivity(t *testing.T) {
+	targets := []repostats.Target{
+		{Name: "a-none", Path: "/tmp/wt/a/none"},
+		{Name: "b-old", Path: "/tmp/wt/b/old"},
+		{Name: "c-new", Path: "/tmp/wt/c/new"},
+		{Name: "d-old", Path: "/tmp/wt/d/old"},
+	}
+	session := func(name string) string {
+		return repoSessionName(filepath.Join("/tmp/wt", name))
+	}
+	bySession := map[string][]homeSession{
+		session("b/old"): {
+			{LastUsed: 100},
+		},
+		// A stopped session that is newer than the live one counts.
+		session("c/new"): {
+			{LastUsed: 50},
+			{LastUsed: 300, Stopped: true},
+		},
+		session("d/old"): {
+			{LastUsed: 100},
+		},
+	}
+	sortByAgentActivity(targets, bySession)
+	var got []string
+	for _, target := range targets {
+		got = append(got, target.Name)
+	}
+	want := []string{"c-new", "b-old", "d-old", "a-none"}
+	if !slices.Equal(got, want) {
+		t.Errorf("order = %v, want %v", got, want)
 	}
 }

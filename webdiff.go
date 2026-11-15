@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"compress/gzip"
 	"context"
 	_ "embed"
@@ -852,6 +853,7 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 		writeSectionEnd(&body)
 	}
 
+	sortByAgentActivity(worktrees, bySession)
 	if len(worktrees) > 0 {
 		writeSectionStart(&body, "worktrees", "worktrees", len(worktrees))
 		for _, target := range worktrees {
@@ -880,6 +882,24 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writePage(w, body.String())
+}
+
+// sortByAgentActivity puts the targets with the most recent agent
+// activity first. The activity of a target is the latest LastUsed of its
+// sessions in bySession, live or stopped. Targets with the same time, or
+// with no session, keep the name order from the stats snapshot.
+func sortByAgentActivity(targets []repostats.Target, bySession map[string][]homeSession) {
+	activity := make(map[string]int64, len(targets))
+	for _, target := range targets {
+		var latest int64
+		for _, s := range bySession[repoSessionName(target.Path)] {
+			latest = max(latest, s.LastUsed)
+		}
+		activity[target.Path] = latest
+	}
+	slices.SortStableFunc(targets, func(a, b repostats.Target) int {
+		return cmp.Compare(activity[b.Path], activity[a.Path])
+	})
 }
 
 // writeSectionStart opens a home page section that the user can collapse.
@@ -1316,7 +1336,11 @@ type homeSession struct {
 	Desc    string // command and title, or "stopped"
 	Branch  string // branch of a stopped session at its first capture
 	When    string // time since last use, from formatLastUsed
-	Stopped bool
+	// LastUsed is the unix time of the last activity: the last output
+	// of a live pane, or the last capture of a stopped session. It is 0
+	// if not known.
+	LastUsed int64
+	Stopped  bool
 }
 
 // homeSessions returns every live pane on the host, followed by the
@@ -1352,22 +1376,24 @@ func homeSessions(ctx context.Context, now time.Time) []homeSession {
 		// session name from the paneID at request time so we don't need
 		// to pass it as a query param.
 		out = append(out, homeSession{
-			Session: p.Session,
-			Label:   p.Session + ":" + p.Index,
-			Href:    "/pane?paneID=" + url.QueryEscape(p.PaneID),
-			Desc:    desc,
-			When:    formatLastUsed(p.LastUsed, now),
+			Session:  p.Session,
+			Label:    p.Session + ":" + p.Index,
+			Href:     "/pane?paneID=" + url.QueryEscape(p.PaneID),
+			Desc:     desc,
+			When:     formatLastUsed(p.LastUsed, now),
+			LastUsed: p.LastUsed,
 		})
 	}
 	for _, m := range stoppedSessions(liveNames) {
 		out = append(out, homeSession{
-			Session: m.Session,
-			Label:   m.Session,
-			Href:    "/history/" + m.ID,
-			Desc:    "stopped",
-			Branch:  m.Branch,
-			When:    formatLastUsed(m.Updated, now),
-			Stopped: true,
+			Session:  m.Session,
+			Label:    m.Session,
+			Href:     "/history/" + m.ID,
+			Desc:     "stopped",
+			Branch:   m.Branch,
+			When:     formatLastUsed(m.Updated, now),
+			LastUsed: m.Updated,
+			Stopped:  true,
 		})
 	}
 	return out
