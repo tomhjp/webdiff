@@ -1738,8 +1738,9 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 	body.WriteString(`<div class="header-buttons-right">`)
 	body.WriteString(`<button class="toggle" type="button" id="jump-bottom" hidden>jump to bottom</button>`)
 	if hasRef {
-		// .wide-only hides this on narrow screens, where it makes the
-		// row too wide. Restart stays because it is the one used most.
+		// .wide-only hides this and "stop session" on narrow screens,
+		// where they make the row too wide. Restart stays because it is
+		// the one used most.
 		fmt.Fprintf(&body, `<a class="toggle wide-only" href="%s" title="previous sessions of this checkout">session history</a>`,
 			template.HTMLEscapeString(historyListURL(ref.kind, ref.name)))
 	}
@@ -1756,6 +1757,12 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 			template.HTMLEscapeString(repoURL),
 			template.HTMLEscapeString(pageAgent),
 			template.HTMLEscapeString(strings.Join(agentChoices(), ",")))
+	}
+	if strings.HasSuffix(session, "-wd") {
+		// Stop only needs a webdiff-managed session, not a repo URL: the
+		// client goes to the home page after the kill. The server does the
+		// same `-wd` check, so this only hides a button that would fail.
+		body.WriteString(`<button class="toggle danger wide-only" type="button" id="stop-session">stop session</button>`)
 	}
 	body.WriteString(`</div></div>`)
 	if hasRef {

@@ -715,6 +715,49 @@
         });
       });
     }
+    // Stop uses the same flow as restart: archive the scrollback, show a
+    // confirm modal with the history URL, then kill. After the kill it
+    // goes to the home page and does not start a new session.
+    var stopBtn=document.getElementById('stop-session');
+    if(stopBtn){
+      stopBtn.addEventListener('click',function(){
+        stopBtn.disabled=true;
+        fetch('/api/pane/history-url',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({paneID:paneID})
+        }).then(function(r){
+          if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+          return r.json().catch(function(){return {}});
+        }).then(function(j){
+          stopBtn.disabled=false;
+          var historyURL=j&&j.historyURL;
+          showHistoryModal({
+            title:'stop session',
+            note:historyURL
+              ?'The tmux session will be killed. Its scrollback is archived first — copy this URL to give a later session its history:'
+              :'The tmux session will be killed.',
+            confirmLabel:'kill session',
+            historyURL:historyURL,
+            onConfirm:function(done){
+              fetch('/api/pane/stop',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({paneID:paneID})
+              }).then(function(r){
+                if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
+                window.location.href='/';
+              }).catch(function(e){
+                done(new Error('stop failed: '+e.message));
+              });
+            }
+          });
+        }).catch(function(e){
+          stopBtn.disabled=false;
+          window.alert('stop failed: '+e.message);
+        });
+      });
+    }
     // Keep #pane-tail padding-bottom in sync with the toolbar height so
     // auto-follow never hides the last line under the fixed toolbar.
     var toolbar=document.querySelector('.stream-toolbar');

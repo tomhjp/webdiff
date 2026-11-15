@@ -352,7 +352,8 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/pane/stream", handlePaneStream)
 	mux.HandleFunc("/api/pane/input", handlePaneInput)
 	mux.HandleFunc("/api/pane/resize", handlePaneResize)
-	mux.HandleFunc("/api/pane/restart", handlePaneRestart)
+	mux.HandleFunc("/api/pane/restart", handlePaneKill)
+	mux.HandleFunc("/api/pane/stop", handlePaneKill)
 	mux.HandleFunc("/api/pane/history-url", handlePaneHistoryURL)
 	mux.HandleFunc("/api/pane/attach", handlePaneAttach)
 	mux.HandleFunc("/api/sessions/spinning", handleSessionsSpinning)
@@ -1000,12 +1001,14 @@ func handlePaneHistoryURL(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// handlePaneRestart kills the webdiff-managed session that owns
-// paneID. The client navigates to /agent<refURL> after this returns,
-// which respawns a fresh session with a clean scrollback. Used by the
-// stream page's "restart session" button when accumulated history has
-// made the live tail sluggish to render.
-func handlePaneRestart(w http.ResponseWriter, r *http.Request) {
+// handlePaneKill kills the webdiff-managed session that owns paneID.
+// Two routes use it, and only the client's next step differs:
+//   - /api/pane/restart: the stream page's "restart session" button. The
+//     client then goes to /agent<refURL>, which starts a fresh session
+//     with a clean scrollback.
+//   - /api/pane/stop: the stream page's "stop session" button. The client
+//     then goes to the home page.
+func handlePaneKill(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1028,7 +1031,8 @@ func handlePaneRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Archive the scrollback before we throw it away — the whole point of
-	// "restart" is a clean slate, so this is the last chance to keep it.
+	// "restart" and "stop" are a clean slate, so this is the last chance
+	// to keep it.
 	histID := snapshotSessionHistory(ctx, name)
 	if err := killSession(ctx, name); err != nil {
 		writeJSONError(w, http.StatusBadGateway, "kill session: "+err.Error(), nil)

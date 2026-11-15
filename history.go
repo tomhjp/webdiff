@@ -76,7 +76,7 @@ const historySnapInterval = 2 * time.Second
 //
 // historyMu also serialises the read-modify-write of <id>.json. Two
 // captures for one id can overlap — force=true bypasses the throttle, so
-// the watcher's turn-end capture can race handlePaneRestart's — and an
+// the watcher's turn-end capture can race handlePaneKill's — and an
 // unsynchronised RMW would let a capture that read the file before a
 // clear write the stale Live=true back afterwards.
 var (
