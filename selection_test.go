@@ -75,9 +75,12 @@ func TestSelectionCombinations(t *testing.T) {
 			selected["working"] = true
 			want = append(want, "staged", "working")
 		}
-		env, base, cleanup, err := selectionIndex(context.Background(), repo, commits, selected)
+		env, base, working, cleanup, err := selectionIndex(context.Background(), repo, commits, selected)
 		if err != nil {
 			t.Fatalf("mask %d: %v", mask, err)
+		}
+		if !working {
+			t.Errorf("mask %d: working tree has changes, but working = false", mask)
 		}
 		got := changedFiles(env, repo, base)
 		if !reflect.DeepEqual(got, want) {
@@ -115,7 +118,7 @@ func TestSelectionDependentChanges(t *testing.T) {
 		for _, i := range indexes {
 			selected[commits[i].SHA] = true
 		}
-		env, base, cleanup, err := selectionIndex(context.Background(), repo, commits, selected)
+		env, base, _, cleanup, err := selectionIndex(context.Background(), repo, commits, selected)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -124,7 +127,7 @@ func TestSelectionDependentChanges(t *testing.T) {
 		}
 		cleanup()
 	}
-	_, _, cleanup, err := selectionIndex(context.Background(), repo, commits, map[string]bool{
+	_, _, _, cleanup, err := selectionIndex(context.Background(), repo, commits, map[string]bool{
 		commits[0].SHA: true,
 		commits[2].SHA: true,
 	})
@@ -149,7 +152,7 @@ func TestSelectionMergeAndBinary(t *testing.T) {
 	if err != nil || len(commits) != 2 || commits[1].Subject != "merge side" {
 		t.Fatalf("first-parent list = %+v: %v", commits, err)
 	}
-	env, base, cleanup, err := selectionIndex(context.Background(), repo, commits, map[string]bool{
+	env, base, _, cleanup, err := selectionIndex(context.Background(), repo, commits, map[string]bool{
 		commits[1].SHA: true,
 	})
 	defer cleanup()
@@ -173,7 +176,7 @@ func TestDiffPickerEscapesSubjects(t *testing.T) {
 		Subject: "<script>alert(1)</script>",
 	}}, map[string]bool{
 		sha: true,
-	})
+	}, true)
 	if strings.Contains(body.String(), "<script>") || !strings.Contains(body.String(), "&lt;script&gt;") || !strings.Contains(body.String(), `value="`+sha+`" checked`) {
 		t.Fatalf("unsafe or incorrect picker: %s", body.String())
 	}
@@ -250,6 +253,72 @@ func TestCreateFromWorktree(t *testing.T) {
 		}
 		if got := selectionGit(t, wantPath, "rev-parse", "HEAD"); got != tc.want {
 			t.Errorf("created HEAD = %s, want %s", got, tc.want)
+		}
+	}
+}
+
+// selectionIndex reports if the working tree has changes, both when the
+// working tree is selected and when it is not.
+func TestSelectionWorkingChanged(t *testing.T) {
+	repo := selectionRepo(t)
+	selectionWrite(t, repo, "a", "a\n")
+	selectionGit(t, repo, "add", "a")
+	selectionGit(t, repo, "commit", "-qm", "a")
+	oldCache := indexCache
+	indexCache = gitindex.New(filepath.Join(t.TempDir(), "indexes"))
+	t.Cleanup(func() { indexCache = oldCache })
+	commits, err := branchCommits(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(want bool) {
+		t.Helper()
+		for _, withWorking := range []bool{false, true} {
+			selected := map[string]bool{
+				commits[0].SHA: true,
+			}
+			if withWorking {
+				selected["working"] = true
+			}
+			_, _, working, cleanup, err := selectionIndex(context.Background(), repo, commits, selected)
+			cleanup()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if working != want {
+				t.Errorf("selected working %v: working = %v, want %v", withWorking, working, want)
+			}
+		}
+	}
+	check(false)
+	selectionWrite(t, repo, "untracked", "new\n")
+	check(true)
+}
+
+// A clean working tree is disabled in the picker and is not counted.
+func TestDiffPickerCleanWorkingTree(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	commits := []branchCommit{{
+		SHA:     sha,
+		Subject: "change",
+	}}
+	selected := map[string]bool{
+		sha:       true,
+		"working": true,
+	}
+	for _, tc := range []struct {
+		working bool
+		count   string
+		input   string
+	}{
+		{true, "changes (2)", `value="working" checked>`},
+		{false, "changes (1)", `value="working" disabled>`},
+	} {
+		var body strings.Builder
+		writeDiffPicker(&body, commits, selected, tc.working)
+		html := body.String()
+		if !strings.Contains(html, tc.count) || !strings.Contains(html, tc.input) {
+			t.Errorf("working %v: picker = %s", tc.working, html)
 		}
 	}
 }

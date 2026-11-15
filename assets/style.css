@@ -343,6 +343,7 @@ a { color: var(--accent) }
 .diff-picker-menu { position: fixed; right: 12px; z-index: 100; box-sizing: border-box; width: min(520px, calc(100vw - 24px)); max-height: 60vh; overflow: auto; background: var(--chrome-bg); color: var(--accent); border: 1px solid var(--border); padding: 8px; box-shadow: 0 4px 16px #0006; font-size: 12px }
 .diff-picker-menu[hidden] { display: none }
 .diff-picker-menu label { display: flex; align-items: baseline; gap: 6px; padding: 5px 0; overflow-wrap: anywhere; cursor: pointer }
+.diff-picker-menu label:has(input:disabled) { color: var(--muted); cursor: default }
 .diff-picker-menu .header-buttons { margin-top: 8px }
 @media (pointer: coarse) {
   .diff-picker-menu label { min-height: 44px; box-sizing: border-box; align-items: center }

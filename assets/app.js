@@ -952,7 +952,9 @@
   if(diffPicker){
     var pickerToggle=document.getElementById('diff-picker-toggle');
     var pickerMenu=document.getElementById('diff-picker-menu');
-    var choices=pickerMenu.querySelectorAll('input[type="checkbox"]');
+    // Disabled choices (the working tree when it has no changes) are
+    // not read or saved, so the saved selection does not change.
+    var choices=pickerMenu.querySelectorAll('input[type="checkbox"]:not(:disabled)');
     var selectionKey='webdiff:changes:'+location.pathname;
     function saveSelection(){
       var excluded=[];

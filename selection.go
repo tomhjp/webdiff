@@ -68,15 +68,20 @@ func selectedChanges(q url.Values, commits []branchCommit) (map[string]bool, err
 
 // selectionIndex builds one temporary index. No selected combination is cached.
 // The base is the parent of the oldest selected commit, or HEAD for working changes.
-func selectionIndex(ctx context.Context, repo string, commits []branchCommit, selected map[string]bool) (env []string, base string, cleanup func(), err error) {
+//
+// working tells if the working tree has changes from HEAD. It is true
+// when selectionIndex fails before it can find out, so that the caller
+// continues to show the working tree as a choice.
+func selectionIndex(ctx context.Context, repo string, commits []branchCommit, selected map[string]bool) (env []string, base string, working bool, cleanup func(), err error) {
+	working = true
 	dir, err := os.MkdirTemp("", "webdiff-selection-")
 	if err != nil {
-		return nil, "", func() {}, err
+		return nil, "", working, func() {}, err
 	}
 	cleanup = func() { os.RemoveAll(dir) }
-	fail := func(e error) ([]string, string, func(), error) {
+	fail := func(e error) ([]string, string, bool, func(), error) {
 		cleanup()
-		return nil, "", func() {}, e
+		return nil, "", working, func() {}, e
 	}
 	cache := indexCache
 	if cache == nil {
@@ -130,6 +135,18 @@ func selectionIndex(ctx context.Context, repo string, commits []branchCommit, se
 		if err != nil {
 			return fail(err)
 		}
+		working = len(workingPatch) > 0
+	} else {
+		// Do not make the full patch when it is not used. --quiet
+		// exits with status 1 when there are changes.
+		cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet", "--no-ext-diff", head)
+		cmd.Dir = repo
+		cmd.Env = warm
+		if err := cmd.Run(); err == nil {
+			working = false
+		} else if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
+			return fail(fmt.Errorf("git diff --cached --quiet: %w", err))
+		}
 	}
 	// Keep new objects temporary, but permit reads from the warm object cache.
 	var alternates string
@@ -176,22 +193,36 @@ func selectionIndex(ctx context.Context, repo string, commits []branchCommit, se
 	if err := apply(workingPatch, "working tree"); err != nil {
 		return fail(err)
 	}
-	return env, base, cleanup, nil
+	return env, base, working, cleanup, nil
 }
 
-func writeDiffPicker(body *strings.Builder, commits []branchCommit, selected map[string]bool) {
-	fmt.Fprintf(body, `<div class="diff-picker" id="diff-picker"><button class="toggle" type="button" id="diff-picker-toggle" aria-expanded="false" aria-controls="diff-picker-menu">changes (%d)</button><div class="diff-picker-menu" id="diff-picker-menu" hidden>`, len(selected))
-	writeChoice := func(value, label string) {
-		checked := ""
-		if selected[value] {
-			checked = " checked"
-		}
-		fmt.Fprintf(body, `<label><input type="checkbox" value="%s"%s> %s</label>`, template.HTMLEscapeString(value), checked, template.HTMLEscapeString(label))
+// writeDiffPicker writes the "changes" menu. working tells if the
+// working tree has changes. When it has none, the working tree choice
+// is disabled and the count does not include it.
+func writeDiffPicker(body *strings.Builder, commits []branchCommit, selected map[string]bool, working bool) {
+	count := len(selected)
+	if selected["working"] && !working {
+		count--
 	}
-	writeChoice("working", "working tree")
+	fmt.Fprintf(body, `<div class="diff-picker" id="diff-picker"><button class="toggle" type="button" id="diff-picker-toggle" aria-expanded="false" aria-controls="diff-picker-menu">changes (%d)</button><div class="diff-picker-menu" id="diff-picker-menu" hidden>`, count)
+	writeChoice := func(value, label string, enabled bool) {
+		attrs := ""
+		if selected[value] && enabled {
+			attrs = " checked"
+		}
+		if !enabled {
+			// app.js does not read or save disabled choices, so the
+			// saved selection keeps the working tree when it has
+			// changes again.
+			attrs += " disabled"
+			label += " (no changes)"
+		}
+		fmt.Fprintf(body, `<label><input type="checkbox" value="%s"%s> %s</label>`, template.HTMLEscapeString(value), attrs, template.HTMLEscapeString(label))
+	}
+	writeChoice("working", "working tree", working)
 	for i := len(commits) - 1; i >= 0; i-- {
 		commit := commits[i]
-		writeChoice(commit.SHA, commit.SHA[:12]+" "+commit.Subject)
+		writeChoice(commit.SHA, commit.SHA[:12]+" "+commit.Subject, true)
 	}
 	body.WriteString(`<div class="header-buttons"><button class="toggle" type="button" id="diff-picker-all">all</button><button class="toggle" type="button" id="diff-picker-none">none</button><button class="toggle send-btn" type="button" id="diff-picker-apply">apply</button></div></div></div>`)
 }

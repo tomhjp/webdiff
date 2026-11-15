@@ -1495,7 +1495,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// navigating somewhere else.
 	fullContext := r.URL.Query().Get("context") == "full"
 
-	env, base, cleanup, selectionErr := selectionIndex(r.Context(), repo, commits, selected)
+	env, base, working, cleanup, selectionErr := selectionIndex(r.Context(), repo, commits, selected)
 	defer cleanup()
 	var files []string
 	if selectionErr == nil {
@@ -1613,7 +1613,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// this box, so the diff actions get their own row.
 	body.WriteString(`<div class="diff-right">`)
 	body.WriteString(`<div class="header-buttons diff-primary">`)
-	writeDiffPicker(&body, commits, selected)
+	writeDiffPicker(&body, commits, selected, working)
 	if len(files) > 0 {
 		body.WriteString(`<button class="toggle" type="button" id="toggle-all">expand all</button>`)
 	}
