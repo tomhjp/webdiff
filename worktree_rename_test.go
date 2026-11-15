@@ -344,3 +344,20 @@ func TestStreamPageRestartCanStop(t *testing.T) {
 		})
 	}
 }
+
+// Remove is the last button in the right group of the stream page
+// header, so it is always at the right edge.
+func TestStreamPageRemoveLast(t *testing.T) {
+	renameTestWorktree(t)
+	w := httptest.NewRecorder()
+	writeStreamPage(w, "%0", "/worktrees/repo-source/", "pane", "repo-source-wd", "")
+	body := w.Body.String()
+	right := strings.Index(body, `<div class="header-buttons-right">`)
+	remove := strings.Index(body, `id="wt-remove-btn"`)
+	if right < 0 || remove < right {
+		t.Fatal("remove is not in the right group")
+	}
+	if !strings.Contains(body[remove:], `>remove</button></div></div>`) {
+		t.Fatal("remove is not the last header button")
+	}
+}

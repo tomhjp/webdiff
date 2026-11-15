@@ -1609,6 +1609,10 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	writeWorktreeNewButton(&body)
 	body.WriteString(`</div>`)
 
+	// .diff-right holds the diff actions and remove, so remove stays at
+	// the right edge when the row wraps. On narrow screens CSS removes
+	// this box, so the diff actions get their own row.
+	body.WriteString(`<div class="diff-right">`)
 	body.WriteString(`<div class="header-buttons diff-primary">`)
 	writeDiffPicker(&body, commits, selected)
 	if len(files) > 0 {
@@ -1648,7 +1652,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		fmt.Fprintf(&body, `<button class="toggle danger diff-remove" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
 			template.HTMLEscapeString(ref.name))
 	}
-	body.WriteString(`</div>`)
+	body.WriteString(`</div></div>`)
 
 	writeWorktreeCreateRow(&body, ref)
 	body.WriteString(`</div>`)
@@ -1946,10 +1950,6 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		}
 		body.WriteString(`</div>`)
 	}
-	if worktreeName != "" {
-		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
-			template.HTMLEscapeString(worktreeName))
-	}
 	body.WriteString(`<div class="header-buttons-right">`)
 	if hasRef {
 		// .wide-only hides this and "stop session" on narrow screens,
@@ -1985,6 +1985,12 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		// client goes to the home page after the kill. The server does the
 		// same `-wd` check, so this only hides a button that would fail.
 		body.WriteString(`<button class="toggle danger wide-only" type="button" id="stop-session">stop session</button>`)
+	}
+	// Remove is the last button, so it is always at the right edge, as
+	// on the diff page.
+	if worktreeName != "" {
+		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
+			template.HTMLEscapeString(worktreeName))
 	}
 	body.WriteString(`</div></div>`)
 	if hasRef {
