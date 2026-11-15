@@ -300,6 +300,25 @@ a { color: var(--accent) }
 .session-row { border-bottom: none; padding: 2px 12px 8px 32px; font-size: 12px }
 .session-row .dir-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg) }
 .session-row .dir-name::before { content: "↳ "; color: var(--muted) }
+
+/* The repos that are developed on main show above the sections, with
+   no heading. */
+.on-main-list { margin-top: 12px; border-top: 1px solid var(--border) }
+
+/* A repo that is not developed on main: its name, then inline buttons
+   to start a worktree or an agent. The name is not a link, so the row
+   does not change colour on hover. */
+.repo-head .dir-name { color: var(--fg) }
+.dir-row-wrap:has(> .repo-head):hover { background: transparent }
+.repo-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; padding: 0 4px }
+.repo-actions .toggle { text-decoration: none }
+/* The home page form sits below its repo row, indented like the
+   session rows. */
+.home-wt-create { padding: 2px 12px 8px 32px }
+/* Narrow viewports use the grid layout of .wt-create-row. */
+@media (min-width: 601px) {
+  .home-wt-create { display: flex; align-items: center }
+}
 @keyframes wd-spin { to { transform: rotate(360deg) } }
 .session-spinning::after { content: ''; flex: 0 0 auto; align-self: center; width: 8px; height: 8px; border: 1.5px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: wd-spin 0.6s linear infinite }
 

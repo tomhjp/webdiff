@@ -61,3 +61,76 @@ func TestWriteSessionRowOther(t *testing.T) {
 		t.Errorf("writeSessionRow =\n%s\nwant:\n%s", got, want)
 	}
 }
+
+func TestWriteRepoActionsGroup(t *testing.T) {
+	target := repostats.Target{
+		Kind:   repostats.Repo,
+		Name:   "corp",
+		Path:   "/tmp/corp",
+		Branch: "feature",
+		AllChanges: repostats.Summary{
+			Files: 3,
+			Ins:   10,
+		},
+	}
+	live := homeSession{
+		Session: "corp-wd",
+		Label:   "corp-wd:0.0",
+		Href:    "/pane?paneID=%251",
+		Desc:    "pi · working",
+		When:    "now",
+	}
+	stopped := homeSession{
+		Session: "corp-wd",
+		Label:   "corp-wd",
+		Href:    "/history/1-corp-wd",
+		Desc:    "stopped",
+		When:    "2h",
+		Stopped: true,
+	}
+	tests := []struct {
+		name      string
+		sessions  []homeSession
+		wantAgent bool
+	}{
+		{
+			name:      "no sessions",
+			wantAgent: true,
+		},
+		{
+			name:      "stopped session",
+			sessions:  []homeSession{stopped},
+			wantAgent: true,
+		},
+		{
+			name:     "live session",
+			sessions: []homeSession{live},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b strings.Builder
+			writeRepoActionsGroup(&b, target, tt.sessions)
+			got := b.String()
+			for _, want := range []string{
+				`data-wt-form="wt-create-repos-corp"`,
+				`id="wt-create-repos-corp" data-repo="corp" data-kind="repos" data-open="agent" hidden>`,
+			} {
+				if !strings.Contains(got, want) {
+					t.Errorf("output does not contain %s:\n%s", want, got)
+				}
+			}
+			if hasAgent := strings.Contains(got, `href="/agent/repos/corp/"`); hasAgent != tt.wantAgent {
+				t.Errorf("+ agent button shown = %v, want %v:\n%s", hasAgent, tt.wantAgent, got)
+			}
+			if n := strings.Count(got, "session-row"); n != len(tt.sessions) {
+				t.Errorf("got %d session rows, want %d:\n%s", n, len(tt.sessions), got)
+			}
+			for _, unwanted := range []string{"feature", "stats-files", "stats-ins"} {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("output contains %q:\n%s", unwanted, got)
+				}
+			}
+		})
+	}
+}

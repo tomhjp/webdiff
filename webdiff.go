@@ -81,6 +81,14 @@ var rootDir string
 // directory names.
 var defaultBranchPrefix string
 
+// onMainRepos holds the names of the repos under rootDir that are
+// developed directly on main, set from -develop-on-main. The home page
+// shows them above the repos section, with their branch and diff stats.
+// Work in all other repos happens in worktrees, so the home page shows
+// those repos only with buttons to start a worktree or an agent, and
+// their agent sessions (see writeRepoActionsGroup).
+var onMainRepos = map[string]bool{}
+
 // agentCmd is the full shell command spawned in each repo's tmux pane
 // (e.g. "claude" or "opencode --foo --bar"); set from the -agent flag in
 // main. agentName is the first whitespace-separated token, used for the
@@ -808,24 +816,41 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 		return rows
 	}
 
-	var repos, worktrees []repostats.Target
+	// Repos that are developed on main come first. The other repos
+	// follow, without their branch and diff stats, because their work
+	// happens in worktrees.
+	var onMain, repos, worktrees []repostats.Target
 	for _, target := range targets {
-		switch target.Kind {
-		case repostats.Repo:
+		switch {
+		case target.Kind == repostats.Repo && onMainRepos[target.Name]:
+			onMain = append(onMain, target)
+		case target.Kind == repostats.Repo:
 			repos = append(repos, target)
-		case repostats.Worktree:
+		case target.Kind == repostats.Worktree:
 			worktrees = append(worktrees, target)
 		}
 	}
 
-	writeSectionStart(&body, "repos", "repos", len(repos))
-	for _, target := range repos {
-		writeDirGroup(&body, target, target.Name, takeSessions(target))
+	// The repos that are developed on main show above all sections,
+	// without a heading, because they are where most of the work is.
+	if len(onMain) > 0 {
+		body.WriteString(`<div class="dir-list on-main-list">`)
+		for _, target := range onMain {
+			writeDirGroup(&body, target, target.Name, takeSessions(target))
+		}
+		body.WriteString(`</div>`)
 	}
-	if len(repos) == 0 {
-		body.WriteString(`<p class="empty">No git repos under this directory.</p>`)
+
+	if len(repos) > 0 || len(onMain) == 0 {
+		writeSectionStart(&body, "repos", "repos", len(repos))
+		for _, target := range repos {
+			writeRepoActionsGroup(&body, target, takeSessions(target))
+		}
+		if len(repos) == 0 {
+			body.WriteString(`<p class="empty">No git repos under this directory.</p>`)
+		}
+		writeSectionEnd(&body)
 	}
-	writeSectionEnd(&body)
 
 	if len(worktrees) > 0 {
 		writeSectionStart(&body, "worktrees", "worktrees", len(worktrees))
@@ -877,6 +902,46 @@ func writeSectionEnd(b *strings.Builder) {
 func writeDirGroup(b *strings.Builder, target repostats.Target, label string, sessions []homeSession) {
 	b.WriteString(`<div class="dir-group">`)
 	writeDirRow(b, target, label)
+	for _, s := range sessions {
+		writeSessionRow(b, s, true)
+	}
+	b.WriteString(`</div>`)
+}
+
+// writeRepoActionsGroup emits a repo that is not developed on main:
+// one row with the repo name and inline buttons to start a worktree or
+// an agent, and below it one row for each agent session of the repo.
+// The rows show no branch or diff stats: work in these repos happens in
+// worktrees, so the repo stays on its main branch. The agent page of the
+// repo links to its diff and file views.
+//
+// "+ agent" goes to /agent, which starts a session. A repo has only one
+// session for now, so the button shows only when that session is not
+// running. When it runs, its own row links to it.
+func writeRepoActionsGroup(b *strings.Builder, target repostats.Target, sessions []homeSession) {
+	formID := "wt-create-" + string(target.Kind) + "-" + target.Name
+	live := false
+	for _, s := range sessions {
+		if !s.Stopped {
+			live = true
+		}
+	}
+	b.WriteString(`<div class="dir-group"><div class="dir-row-wrap">`)
+	b.WriteString(`<div class="dir-row repo-row repo-head"><span class="dir-name">`)
+	writeTitle(b, target.Name, target.Path)
+	b.WriteString(`</span></div><span class="repo-actions">`)
+	fmt.Fprintf(b, `<button class="toggle add-comment-btn" type="button" data-wt-form="%s" title="create a worktree of %s">+ worktree</button>`,
+		template.HTMLEscapeString(formID), template.HTMLEscapeString(target.Name))
+	if !live {
+		fmt.Fprintf(b, `<a class="toggle add-comment-btn" href="%s" title="start a %s session in %s">+ agent</a>`,
+			template.HTMLEscapeString("/agent/"+string(target.Kind)+"/"+target.Name+"/"),
+			template.HTMLEscapeString(agentName), template.HTMLEscapeString(target.Name))
+	}
+	b.WriteString(`</span>`)
+	writeOpenButtons(b, target.Path, "dir-open")
+	writeCopyButton(b, target.Path, "dir-copy")
+	b.WriteString(`</div>`)
+	writeHomeWorktreeForm(b, formID, target)
 	for _, s := range sessions {
 		writeSessionRow(b, s, true)
 	}
@@ -987,8 +1052,25 @@ func writeWorktreeCreateRow(b *strings.Builder, ref repoRef) {
 		checked = " checked"
 	}
 	fmt.Fprintf(b, `<label class="wt-from-main"><input type="checkbox" id="wt-from-main"%s> from main (otherwise this HEAD)</label>`, checked)
-	b.WriteString(`<button type="button" class="toggle send-btn" id="wt-create-submit">create</button>`)
-	b.WriteString(`<button type="button" class="toggle" id="wt-create-cancel">cancel</button>`)
+	b.WriteString(`<button type="button" class="toggle send-btn wt-create-submit" id="wt-create-submit">create</button>`)
+	b.WriteString(`<button type="button" class="toggle wt-create-cancel" id="wt-create-cancel">cancel</button>`)
+	b.WriteString(`</div>`)
+}
+
+// writeHomeWorktreeForm emits the worktree create form for one repo on
+// the home page. It is hidden until its "+ worktree" button is clicked.
+// It has the same parts as writeWorktreeCreateRow, found by class rather
+// than id, because the home page has one form for each repo.
+// data-open="agent" tells app.js to open the agent page of the new
+// worktree, because the next step is to start work in it.
+func writeHomeWorktreeForm(b *strings.Builder, id string, target repostats.Target) {
+	fmt.Fprintf(b, `<div class="wt-create-row home-wt-create" id="%s" data-repo="%s" data-kind="%s" data-open="agent" hidden>`,
+		template.HTMLEscapeString(id), template.HTMLEscapeString(target.Name), template.HTMLEscapeString(string(target.Kind)))
+	fmt.Fprintf(b, `<input type="text" class="wt-branch-input" value="%s" placeholder="branch name (e.g. tongue/foo)" aria-label="branch name" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">`,
+		template.HTMLEscapeString(defaultBranchPrefix))
+	b.WriteString(`<label class="wt-from-main"><input type="checkbox" checked> from main (otherwise this HEAD)</label>`)
+	b.WriteString(`<button type="button" class="toggle send-btn wt-create-submit">create</button>`)
+	b.WriteString(`<button type="button" class="toggle wt-create-cancel">cancel</button>`)
 	b.WriteString(`</div>`)
 }
 
@@ -1911,6 +1993,7 @@ func main() {
 	terminalFlag := flag.String("terminal", "auto", "where new agent sessions run: rex, tmux, or auto (rex if the rex command is installed); sessions already running in tmux keep working either way")
 	rexSocketFlag := flag.String("rex-socket", defaultRexSocket(), "Unix socket of the Rex server")
 	branchPrefixFlag := flag.String("branch-prefix", "", "default branch prefix to prepopulate when creating worktrees and hide on the home page")
+	onMainFlag := flag.String("develop-on-main", "", "comma-separated repos under the root that are developed directly on main; the home page shows them above the repos section with their branch and diff stats, and shows the other repos with buttons to start a worktree or an agent")
 	sshHostFlag := flag.String("ssh-host", "", "how the browser's machine reaches this one over SSH (e.g. an ~/.ssh/config alias); defaults to this node's MagicDNS name")
 	flag.Parse()
 	args := flag.Args()
@@ -1931,6 +2014,11 @@ func main() {
 	}
 
 	defaultBranchPrefix = strings.TrimSpace(*branchPrefixFlag)
+	for _, name := range strings.Split(*onMainFlag, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			onMainRepos[name] = true
+		}
+	}
 
 	agentCmd = strings.TrimSpace(*agentFlag)
 	if agentCmd == "" {

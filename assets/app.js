@@ -1098,11 +1098,22 @@
   function setupWorktreeCreate(){
     var wtNewBtn=document.getElementById('wt-new-btn');
     var wtRow=document.getElementById('wt-create-row');
-    var wtBranch=document.getElementById('wt-branch');
-    var wtFromMain=document.getElementById('wt-from-main');
-    var wtSubmit=document.getElementById('wt-create-submit');
-    var wtCancel=document.getElementById('wt-create-cancel');
-    if(!wtNewBtn||!wtRow)return;
+    if(wtNewBtn&&wtRow)bindWorktreeCreate(wtNewBtn,wtRow);
+    // The home page has one form for each repo. Each "+ worktree" button
+    // names its form in data-wt-form.
+    document.querySelectorAll('[data-wt-form]').forEach(function(btn){
+      var row=document.getElementById(btn.dataset.wtForm);
+      if(row)bindWorktreeCreate(btn,row);
+    });
+  }
+  // bindWorktreeCreate connects a "+ worktree" button to its form. It
+  // finds the parts of the form by class. data-open="agent" on the form
+  // opens the agent page of the new worktree, not its diff page.
+  function bindWorktreeCreate(wtNewBtn,wtRow){
+    var wtBranch=wtRow.querySelector('.wt-branch-input');
+    var wtFromMain=wtRow.querySelector('.wt-from-main input');
+    var wtSubmit=wtRow.querySelector('.wt-create-submit');
+    var wtCancel=wtRow.querySelector('.wt-create-cancel');
     function openWt(){
       wtRow.hidden=false;
       if(wtBranch){
@@ -1122,12 +1133,13 @@
       fetch('/api/worktrees/create',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({repo:repo,kind:wtRow.dataset.kind,branch:branch,fromMain:wtFromMain&&wtFromMain.checked})
+        body:JSON.stringify({repo:repo,kind:wtRow.dataset.kind,branch:branch,fromMain:!!(wtFromMain&&wtFromMain.checked)})
       }).then(function(r){
         if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
         return r.json();
       }).then(function(j){
-        if(j&&j.url)location.href=j.url;
+        if(!j||!j.url)return;
+        location.href=wtRow.dataset.open==='agent'?'/stream'+j.url:j.url;
       }).catch(function(e){
         if(wtSubmit){wtSubmit.disabled=false;wtSubmit.textContent='create'}
         window.alert('create failed: '+e.message);
