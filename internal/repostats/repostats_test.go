@@ -151,3 +151,62 @@ func TestAllChangesSummaryIncludesBranchAndWorkingTree(t *testing.T) {
 		t.Fatalf("all changes = %+v, want %+v", got.AllChanges, want)
 	}
 }
+
+// Watch gives a channel that closes when an edit changes the stats, and
+// the next Watch returns the new stats. No Current call is necessary.
+func TestManagerWatch(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.Mkdir(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init", "-q")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("one\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "file.txt")
+	runGit(t, repo, "commit", "-qm", "initial")
+	runGit(t, repo, "branch", "-M", "main")
+	m, err := New(Config{
+		RootDir:       root,
+		WorktreesRoot: filepath.Join(root, "wt"),
+		Debounce:      20 * time.Millisecond,
+		MaxDebounce:   100 * time.Millisecond,
+		Workers:       1,
+		Reconcile:     time.Hour,
+		FullRefresh:   time.Hour,
+	}, gitindex.New(filepath.Join(t.TempDir(), "indexes")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if _, ok, _ := m.Watch(Repo, "missing"); ok {
+		t.Fatal("Watch found a missing target")
+	}
+	target, ok, changed := m.Watch(Repo, "repo")
+	if !ok || target.AllChanges.Files != 0 {
+		t.Fatalf("initial target: %+v, %v", target, ok)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("one\ntwo\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(10 * time.Second)
+	for target.AllChanges.Files != 1 {
+		select {
+		case <-changed:
+		case <-deadline:
+			t.Fatalf("stats did not change: %+v", target.AllChanges)
+		}
+		target, _, changed = m.Watch(Repo, "repo")
+	}
+	if target.AllChanges.Ins != 1 {
+		t.Fatalf("updated stats: %+v", target.AllChanges)
+	}
+}

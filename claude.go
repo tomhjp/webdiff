@@ -21,6 +21,7 @@ import (
 	"time"
 
 	terminal "github.com/buildkite/terminal-to-html/v3"
+	"github.com/tomhjp/webdiff/internal/repostats"
 )
 
 // Pane is one tmux pane that's a candidate for receiving review
@@ -1275,6 +1276,33 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 	if !attempt() {
 		return
 	}
+	// With ?repo=, the stream also sends {"meta": html} when the branch
+	// or the stats of that checkout change, so the stream page heading
+	// stays current without more requests. The repostats cache sends
+	// the change signal, so this does not run git. The first meta goes
+	// at once, so a reconnect after a hidden tab gets current stats.
+	var metaChanged <-chan struct{}
+	var lastMeta string
+	var metaRef repoRef
+	sendMeta := func() bool {
+		target, ok, changed := statsManager.Watch(repostats.Kind(metaRef.kind), metaRef.name)
+		metaChanged = changed
+		if !ok || target.Branch == "" {
+			return true
+		}
+		meta := headMetaHTML(target.Branch, summaryHTML(target.AllChanges))
+		if meta == lastMeta {
+			return true
+		}
+		lastMeta = meta
+		return send(map[string]string{"meta": meta})
+	}
+	if ref, ok := resolveRepoRef(r.URL.Query().Get("repo")); ok && statsManager != nil {
+		metaRef = ref
+		if !sendMeta() {
+			return
+		}
+	}
 	// 30s matches handleTurnEvents. The write itself only errors once
 	// TCP gives up on retransmits, but each keepalive restarts that
 	// clock, so a dead peer is reaped within minutes rather than never.
@@ -1289,6 +1317,11 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
+			continue
+		case <-metaChanged:
+			if !sendMeta() {
+				return
+			}
 			continue
 		case <-changes:
 			dirty = true

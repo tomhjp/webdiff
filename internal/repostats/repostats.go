@@ -179,6 +179,20 @@ func (m *Manager) Lookup(kind Kind, name string) (Target, bool) {
 	return s.target, true
 }
 
+// Watch returns the current target for kind and name, and a channel
+// that closes at the next change to the registry. Any change closes
+// the channel, not only a change to this target, so the caller must
+// call Watch again and compare the targets. ok is false when the target
+// is not known.
+func (m *Manager) Watch(kind Kind, name string) (t Target, ok bool, changed <-chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s := m.targets[key(kind, name)]; s != nil {
+		t, ok = s.target, true
+	}
+	return t, ok, m.changed
+}
+
 // RefreshDiscovery synchronously reconciles target topology. Worktree API
 // handlers call this after explicit create/remove operations.
 func (m *Manager) RefreshDiscovery(ctx context.Context) error {

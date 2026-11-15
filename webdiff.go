@@ -1177,9 +1177,27 @@ func writeHeadingTitleRow(b *strings.Builder, ref repoRef, stats string) {
 	writeTitle(b, title, ref.abs)
 	b.WriteString(`</span>`)
 	b.WriteString(`<span class="head-meta">`)
-	fmt.Fprintf(b, `<span class="head-branch">%s</span>`, template.HTMLEscapeString(currentBranch(ref.abs)))
-	b.WriteString(stats)
+	b.WriteString(headMetaHTML(currentBranch(ref.abs), stats))
 	b.WriteString(`</span></div>`)
+}
+
+// headMetaHTML returns the contents of the .head-meta element: the
+// branch, then the stats HTML. The pane stream sends the same HTML when
+// the branch or the stats change, so the stream page can replace it.
+func headMetaHTML(branch, stats string) string {
+	return `<span class="head-branch">` + template.HTMLEscapeString(branch) + `</span>` + stats
+}
+
+// summaryHTML returns the stats HTML for s, or "" when s has no files.
+func summaryHTML(s repostats.Summary) string {
+	if s.Files == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(`<span class="stats">`)
+	writeSummary(&b, s)
+	b.WriteString(`</span>`)
+	return b.String()
 }
 
 // cachedStats returns the stats HTML for all the changes of a checkout,
@@ -1191,14 +1209,10 @@ func cachedStats(ref repoRef) string {
 		return ""
 	}
 	target, ok := statsManager.Lookup(repostats.Kind(ref.kind), ref.name)
-	if !ok || target.AllChanges.Files == 0 {
+	if !ok {
 		return ""
 	}
-	var b strings.Builder
-	b.WriteString(`<span class="stats">`)
-	writeSummary(&b, target.AllChanges)
-	b.WriteString(`</span>`)
-	return b.String()
+	return summaryHTML(target.AllChanges)
 }
 
 // tildePath abbreviates the user's home directory to "~" for display.
@@ -2034,8 +2048,14 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		writeWorktreeCreateRow(&body, ref)
 	}
 	body.WriteString(`</div>`)
-	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" data-agent-session="%s" class="term-container"><div class="term-inner"></div></div>`,
-		template.HTMLEscapeString(paneID), template.HTMLEscapeString(agentSession))
+	// data-repo-url asks the pane stream to also send the branch and
+	// stats of the checkout when they change.
+	var streamRepo string
+	if hasRef {
+		streamRepo = ref.url
+	}
+	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" data-agent-session="%s" data-repo-url="%s" class="term-container"><div class="term-inner"></div></div>`,
+		template.HTMLEscapeString(paneID), template.HTMLEscapeString(agentSession), template.HTMLEscapeString(streamRepo))
 	// The jump button floats over the top-right corner of the pane, below
 	// the sticky heading. It is not in the header row, because there it
 	// made the row too wide on narrow screens.

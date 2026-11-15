@@ -327,12 +327,21 @@
     }
     function connectStream(){
       if(es){try{es.close()}catch(e){}}
-      es=new EventSource('/api/pane/stream?paneID='+encodeURIComponent(paneID));
+      var streamURL='/api/pane/stream?paneID='+encodeURIComponent(paneID);
+      if(root.dataset.repoUrl)streamURL+='&repo='+encodeURIComponent(root.dataset.repoUrl);
+      es=new EventSource(streamURL);
       es.onopen=function(){reconnectDelay=500};
       es.onmessage=function(ev){
         try{
           var msg=JSON.parse(ev.data);
           if(msg.error){inner.textContent='stream error: '+msg.error;return}
+          // The server sends the heading branch and stats as HTML
+          // when they change. They are not pane lines.
+          if(msg.meta!==undefined){
+            var headMeta=document.querySelector('.head-meta');
+            if(headMeta)headMeta.innerHTML=msg.meta;
+            return;
+          }
           applyUpdate(msg);
         }catch(e){}
       };
