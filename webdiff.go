@@ -1155,6 +1155,52 @@ func writeTitle(b *strings.Builder, label, dir string) {
 		template.HTMLEscapeString(label), template.HTMLEscapeString(tildePath(dir)))
 }
 
+// writeHeadingTitleRow writes the first row of the page heading for a
+// checkout: the title at the left, and the branch and stats at the
+// right. The diff page and the stream page both use it, so the two
+// pages have the same first row. stats is HTML, or "" for no stats.
+//
+// The title is the repo name. A worktree's leaf dir is its branch, which
+// is redundant next to the branch shown in the meta; show its parent
+// repo instead so the heading reads "repo … branch" like the home-page
+// rows do. Broken worktrees have no resolvable parent — fall back to
+// the slug, which at least identifies which worktree you're looking at.
+func writeHeadingTitleRow(b *strings.Builder, ref repoRef, stats string) {
+	title := worktreeSlug(ref.abs)
+	if ref.kind == "worktrees" {
+		if parent, ok := worktreeParentRepo(ref.abs); ok {
+			title = parent
+		}
+	}
+	b.WriteString(`<div class="page-heading-row">`)
+	b.WriteString(`<span class="branch">`)
+	writeTitle(b, title, ref.abs)
+	b.WriteString(`</span>`)
+	b.WriteString(`<span class="head-meta">`)
+	fmt.Fprintf(b, `<span class="head-branch">%s</span>`, template.HTMLEscapeString(currentBranch(ref.abs)))
+	b.WriteString(stats)
+	b.WriteString(`</span></div>`)
+}
+
+// cachedStats returns the stats HTML for all the changes of a checkout,
+// from the repostats cache. It does not run git, so a page that does
+// not show a diff can show stats cheaply. It returns "" when the cache
+// has no stats for the checkout.
+func cachedStats(ref repoRef) string {
+	if statsManager == nil {
+		return ""
+	}
+	target, ok := statsManager.Lookup(repostats.Kind(ref.kind), ref.name)
+	if !ok || target.AllChanges.Files == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(`<span class="stats">`)
+	writeSummary(&b, target.AllChanges)
+	b.WriteString(`</span>`)
+	return b.String()
+}
+
 // tildePath abbreviates the user's home directory to "~" for display.
 // Paths are only ever shown, never fed back to the server, so the lossy
 // form is fine.
@@ -1572,25 +1618,8 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// mode/context/expand controls (right). Everything that used to
 	// live in a separate info bar is folded in here so only the
 	// streaming diff body scrolls.
-	// Title is the repo name. A worktree's leaf dir is its branch, which
-	// is redundant next to the branch shown in the meta; show its parent
-	// repo instead so the heading reads "repo … branch" like the home-page
-	// rows do. Broken worktrees have no resolvable parent — fall back to
-	// the slug, which at least identifies which worktree you're looking at.
-	title := worktreeSlug(repo)
-	if ref.kind == "worktrees" {
-		if parent, ok := worktreeParentRepo(repo); ok {
-			title = parent
-		}
-	}
-	body.WriteString(`<div class="page-heading"><div class="page-heading-row">`)
-	body.WriteString(`<span class="branch">`)
-	writeTitle(&body, title, repo)
-	body.WriteString(`</span>`)
-	body.WriteString(`<span class="head-meta">`)
-	fmt.Fprintf(&body, `<span class="head-branch">%s</span>`, template.HTMLEscapeString(currentBranch(repo)))
-	body.WriteString(stats)
-	body.WriteString(`</span></div>`)
+	body.WriteString(`<div class="page-heading">`)
+	writeHeadingTitleRow(&body, ref, stats)
 
 	// Keep diff controls on a separate row on narrow screens.
 	body.WriteString(`<div class="page-heading-row diff-toolbar">`)
@@ -1928,11 +1957,17 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		agentSession = session
 	}
 	var body strings.Builder
-	body.WriteString(`<div class="page-heading"><div class="page-heading-row">`)
-	body.WriteString(`<span class="branch">`)
-	writeTitle(&body, title, dir)
-	body.WriteString(`</span>`)
-	body.WriteString(`</div><div class="header-buttons">`)
+	body.WriteString(`<div class="page-heading">`)
+	// A checkout gets the same first row as the diff page. A pane that
+	// is not in a known checkout shows only its name.
+	if hasRef {
+		writeHeadingTitleRow(&body, ref, cachedStats(ref))
+	} else {
+		body.WriteString(`<div class="page-heading-row"><span class="branch">`)
+		writeTitle(&body, title, dir)
+		body.WriteString(`</span></div>`)
+	}
+	body.WriteString(`<div class="header-buttons">`)
 	body.WriteString(`<a class="toggle" href="/">home</a>`)
 	if repoURL != "" {
 		fmt.Fprintf(&body, `<a class="toggle" href="%s">diff</a>`, template.HTMLEscapeString(repoURL))

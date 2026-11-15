@@ -361,3 +361,27 @@ func TestStreamPageRemoveLast(t *testing.T) {
 		t.Fatal("remove is not the last header button")
 	}
 }
+
+// The stream page of a checkout has the same first heading row as the
+// diff page: the parent repo as the title, and the branch at the right.
+func TestStreamPageTitleRow(t *testing.T) {
+	_, wt := renameTestWorktree(t)
+	ref, ok := resolveRepoRef("/worktrees/repo-source/")
+	if !ok {
+		t.Fatal("cannot resolve worktree")
+	}
+	var want strings.Builder
+	writeHeadingTitleRow(&want, ref, cachedStats(ref))
+	w := httptest.NewRecorder()
+	writeStreamPage(w, "%0", ref.url, "pane", "", "")
+	body := w.Body.String()
+	if !strings.Contains(body, `<div class="page-heading">`+want.String()) {
+		t.Fatalf("stream page does not start with the shared title row: %s", body)
+	}
+	if !strings.Contains(want.String(), `<span class="head-branch">`+currentBranch(wt)+`</span>`) {
+		t.Fatalf("title row has no branch: %s", want.String())
+	}
+	if !strings.Contains(want.String(), `<span class="title-short">repo</span>`) {
+		t.Fatalf("title row does not name the parent repo: %s", want.String())
+	}
+}
