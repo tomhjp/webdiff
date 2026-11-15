@@ -261,3 +261,39 @@ func TestWorktreeRenameHTTPValidation(t *testing.T) {
 		}
 	}
 }
+
+// The stream page has the same open and "+ worktree" buttons as the diff
+// page, so the top-left buttons agree on both pages.
+func TestStreamPageHeaderButtons(t *testing.T) {
+	renameTestWorktree(t)
+	saved := sshHost
+	sshHost = "slop"
+	defer func() { sshHost = saved }()
+	for _, tc := range []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{"worktree", "/worktrees/repo-source/", true},
+		{"repo", "/repos/repo/", true},
+		{"unknown", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeStreamPage(w, "%0", tc.url, "pane", "", "")
+			body := w.Body.String()
+			for _, s := range []string{
+				`href="zed://ssh/slop`,
+				`href="vscode://vscode-remote/ssh-remote+slop`,
+				`href="webdiff://ghostty?host=slop`,
+				`id="wt-new-btn"`,
+				`id="wt-create-row"`,
+				`class="toggle wide-only" href="/history/?kind=`,
+			} {
+				if got := strings.Contains(body, s); got != tc.want {
+					t.Errorf("%s present = %v, want %v", s, got, tc.want)
+				}
+			}
+		})
+	}
+}

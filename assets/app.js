@@ -11,7 +11,7 @@
   // logic below shouldn't run here — there are no <details> on this
   // page anyway, but bailing early keeps the two flows independent.
   var streamRoot=document.getElementById('pane-tail');
-  if(streamRoot){setupStreamPage(streamRoot);setupWorktreeRemove();setupWorktreeRename();return}
+  if(streamRoot){setupStreamPage(streamRoot);setupWorktreeCreate();setupWorktreeRemove();setupWorktreeRename();return}
 
   // showHistoryModal is the shared "confirm, and here's the scrollback URL
   // to hand the next session" dialog. Both entry points need it: restart
@@ -1029,20 +1029,21 @@
     });
   });
 
-  // Worktree creation is available on repo and worktree diff pages.
+  // Worktree creation is available on the diff and stream pages.
   // Clicking "+ worktree"
   // reveals an inline form; submitting POSTs to /api/worktrees/create
   // and navigates to the new worktree's diff page. The form stays
   // visually attached to the page heading rather than floating as a
   // modal so the iOS soft keyboard doesn't reflow the page out from
   // under the textbox.
-  var wtNewBtn=document.getElementById('wt-new-btn');
-  var wtRow=document.getElementById('wt-create-row');
-  var wtBranch=document.getElementById('wt-branch');
-  var wtFromMain=document.getElementById('wt-from-main');
-  var wtSubmit=document.getElementById('wt-create-submit');
-  var wtCancel=document.getElementById('wt-create-cancel');
-  if(wtNewBtn&&wtRow){
+  function setupWorktreeCreate(){
+    var wtNewBtn=document.getElementById('wt-new-btn');
+    var wtRow=document.getElementById('wt-create-row');
+    var wtBranch=document.getElementById('wt-branch');
+    var wtFromMain=document.getElementById('wt-from-main');
+    var wtSubmit=document.getElementById('wt-create-submit');
+    var wtCancel=document.getElementById('wt-create-cancel');
+    if(!wtNewBtn||!wtRow)return;
     function openWt(){
       wtRow.hidden=false;
       if(wtBranch){
@@ -1082,6 +1083,7 @@
     }
   }
 
+  setupWorktreeCreate();
   setupWorktreeRemove();
   setupWorktreeRename();
 

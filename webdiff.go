@@ -913,6 +913,33 @@ func writeCopyButton(b *strings.Builder, dir, cls string) {
 		cls, short, short)
 }
 
+// writeWorktreeNewButton emits the "+ worktree" button. It shows and
+// hides the form from writeWorktreeCreateRow, so a page that writes one
+// must also write the other.
+func writeWorktreeNewButton(b *strings.Builder) {
+	b.WriteString(`<button class="toggle add-comment-btn" type="button" id="wt-new-btn" title="create a worktree from this checkout">+ worktree</button>`)
+}
+
+// writeWorktreeCreateRow emits the worktree create form. It is hidden
+// until "+ worktree" is clicked. It is inline rather than a modal, so it
+// works the same on mobile Safari as on desktop, and it stays attached
+// to the button that shows it. data-repo and data-kind tell the
+// worktree-add call which checkout to use.
+func writeWorktreeCreateRow(b *strings.Builder, ref repoRef) {
+	fmt.Fprintf(b, `<div class="page-heading-row wt-create-row" id="wt-create-row" data-repo="%s" data-kind="%s" hidden>`,
+		template.HTMLEscapeString(ref.name), template.HTMLEscapeString(ref.kind))
+	fmt.Fprintf(b, `<input type="text" id="wt-branch" class="wt-branch-input" value="%s" placeholder="branch name (e.g. tongue/foo)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">`,
+		template.HTMLEscapeString(defaultBranchPrefix))
+	checked := ""
+	if ref.kind == "repos" {
+		checked = " checked"
+	}
+	fmt.Fprintf(b, `<label class="wt-from-main"><input type="checkbox" id="wt-from-main"%s> from main (otherwise this HEAD)</label>`, checked)
+	b.WriteString(`<button type="button" class="toggle send-btn" id="wt-create-submit">create</button>`)
+	b.WriteString(`<button type="button" class="toggle" id="wt-create-cancel">cancel</button>`)
+	b.WriteString(`</div>`)
+}
+
 // writeOpenButtons emits links that open dir in Zed, VS Code, and Ghostty on
 // the machine running the browser. They have to be plain anchors to a custom
 // scheme rather than a fetch: this page comes straight off the sandbox, so
@@ -1372,7 +1399,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		writeAgentSelect(&body, "agent-select", pageAgent)
 	}
 	writeOpenButtons(&body, ref.abs, "toggle")
-	body.WriteString(`<button class="toggle add-comment-btn" type="button" id="wt-new-btn" title="create a worktree from this checkout">+ worktree</button>`)
+	writeWorktreeNewButton(&body)
 	body.WriteString(`</div>`)
 
 	body.WriteString(`<div class="header-buttons diff-primary">`)
@@ -1416,25 +1443,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	}
 	body.WriteString(`</div>`)
 
-	// Worktree create form — hidden until "+ worktree" is clicked.
-	// Inline rather than modal so it works the same on mobile Safari
-	// as on desktop, and stays visually attached to the button that
-	// reveals it. data-repo on the form picks up which repo the
-	// worktree-add call should target.
-	{
-		fmt.Fprintf(&body, `<div class="page-heading-row wt-create-row" id="wt-create-row" data-repo="%s" data-kind="%s" hidden>`,
-			template.HTMLEscapeString(ref.name), ref.kind)
-		fmt.Fprintf(&body, `<input type="text" id="wt-branch" class="wt-branch-input" value="%s" placeholder="branch name (e.g. tongue/foo)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">`,
-			template.HTMLEscapeString(defaultBranchPrefix))
-		checked := ""
-		if ref.kind == "repos" {
-			checked = " checked"
-		}
-		fmt.Fprintf(&body, `<label class="wt-from-main"><input type="checkbox" id="wt-from-main"%s> from main (otherwise this HEAD)</label>`, checked)
-		body.WriteString(`<button type="button" class="toggle send-btn" id="wt-create-submit">create</button>`)
-		body.WriteString(`<button type="button" class="toggle" id="wt-create-cancel">cancel</button>`)
-		body.WriteString(`</div>`)
-	}
+	writeWorktreeCreateRow(&body, ref)
 	body.WriteString(`</div>`)
 
 	// send-comments is always visible (no `hidden`) so the modal — which
@@ -1696,7 +1705,8 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		worktreeName = strings.Trim(rest, "/")
 	}
 	var dir string
-	if ref, ok := resolveRepoRef(repoURL); ok {
+	ref, hasRef := resolveRepoRef(repoURL)
+	if hasRef {
 		dir = ref.abs
 	}
 	pageAgent, _ := resolveAgent(liveAgent)
@@ -1714,6 +1724,12 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 	if repoURL != "" {
 		fmt.Fprintf(&body, `<a class="toggle" href="%s">diff</a>`, template.HTMLEscapeString(repoURL))
 	}
+	// Same open and "+ worktree" buttons as the diff page, so the two
+	// pages have the same buttons at the top left.
+	writeOpenButtons(&body, dir, "toggle")
+	if hasRef {
+		writeWorktreeNewButton(&body)
+	}
 	if worktreeName != "" {
 		writeWorktreeRenameButton(&body, worktreeName, dir)
 		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
@@ -1721,6 +1737,12 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 	}
 	body.WriteString(`<div class="header-buttons-right">`)
 	body.WriteString(`<button class="toggle" type="button" id="jump-bottom" hidden>jump to bottom</button>`)
+	if hasRef {
+		// .wide-only hides this on narrow screens, where it makes the
+		// row too wide. Restart stays because it is the one used most.
+		fmt.Fprintf(&body, `<a class="toggle wide-only" href="%s" title="previous sessions of this checkout">session history</a>`,
+			template.HTMLEscapeString(historyListURL(ref.kind, ref.name)))
+	}
 	if repoURL != "" {
 		// Restart is webdiff-managed-only: server gates on the `-wd`
 		// session suffix, and we hide the button when there's no repo
@@ -1735,7 +1757,11 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 			template.HTMLEscapeString(pageAgent),
 			template.HTMLEscapeString(strings.Join(agentChoices(), ",")))
 	}
-	body.WriteString(`</div></div></div>`)
+	body.WriteString(`</div></div>`)
+	if hasRef {
+		writeWorktreeCreateRow(&body, ref)
+	}
+	body.WriteString(`</div>`)
 	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" data-agent-session="%s" class="term-container"><div class="term-inner"></div></div>`,
 		template.HTMLEscapeString(paneID), template.HTMLEscapeString(agentSession))
 	body.WriteString(`<div class="stream-toolbar">`)

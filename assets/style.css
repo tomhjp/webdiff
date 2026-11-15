@@ -191,10 +191,14 @@ a { color: var(--accent) }
    about. Emitted by writeOpenButtons in webdiff.go. */
 /* Show path-copy buttons at the same breakpoint as the tool links. */
 .open-link, [data-copy] { display: none }
+/* Secondary buttons that make a toolbar row too wide on a phone. Same
+   breakpoint as the tool links. */
+.wide-only { display: none }
 @media (min-width: 900px) {
   .title-short { display: none }
   .title-full { display: inline }
   .open-link, [data-copy] { display: inline-flex; align-items: center }
+  .wide-only { display: inline-block }
 }
 /* The sprite is hidden by size rather than display:none, which in some
    engines stops <use> resolving against it. Emitted from assets/icons.svg
