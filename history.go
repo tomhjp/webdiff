@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -482,7 +483,8 @@ func listHistory() []historyMeta {
 func handleHistory(w http.ResponseWriter, r *http.Request) {
 	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/history"), "/")
 	if id == "" {
-		renderHistoryList(w)
+		q := r.URL.Query()
+		renderHistoryList(w, q.Get("kind"), q.Get("name"))
 		return
 	}
 	// A ".txt" suffix selects the agent-friendly plain-text rendering
@@ -545,17 +547,43 @@ func renderHistoryText(w http.ResponseWriter, id string) {
 	_, _ = w.Write([]byte(out.String()))
 }
 
+// historyListURL is the /history/ listing for one repo or worktree. The
+// stream page's "session history" button links to it.
+func historyListURL(kind, name string) string {
+	return "/history/?" + url.Values{
+		"kind": {kind},
+		"name": {name},
+	}.Encode()
+}
+
 // renderHistoryList renders the newest-first listing. The chronological
 // anchor (start time) is the row's main label; the repo and branch the
 // session was on sit at the end of the row.
-func renderHistoryList(w http.ResponseWriter) {
+//
+// When kind and name are set, the list shows only the sessions of that
+// repo or worktree. A worktree rename changes its name, so sessions from
+// before the rename are only in the full list.
+func renderHistoryList(w http.ResponseWriter, kind, name string) {
+	filtered := (kind == "repos" || kind == "worktrees") && name != ""
 	metas := listHistory()
+	if filtered {
+		metas = slices.DeleteFunc(metas, func(m historyMeta) bool {
+			return m.Kind != kind || m.Name != name
+		})
+	}
 
 	var body strings.Builder
 	body.WriteString(`<div class="page-heading"><div class="page-heading-row">`)
 	body.WriteString(`<span class="branch">session history</span>`)
+	if filtered {
+		fmt.Fprintf(&body, `<span class="head-meta"><span class="head-branch">%s</span></span>`,
+			template.HTMLEscapeString(name))
+	}
 	body.WriteString(`</div><div class="page-heading-row page-heading-row-scroll"><div class="header-buttons">`)
 	body.WriteString(`<a class="toggle" href="/">home</a>`)
+	if filtered {
+		body.WriteString(`<a class="toggle" href="/history/" title="sessions of all repos and worktrees">all sessions</a>`)
+	}
 	body.WriteString(`</div></div></div>`)
 
 	body.WriteString(`<div class="dir-list">`)

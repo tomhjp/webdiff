@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -327,5 +330,39 @@ func TestListHistoryNewestFirst(t *testing.T) {
 		if metas[i].Started != w {
 			t.Errorf("metas[%d].Started = %d, want %d", i, metas[i].Started, w)
 		}
+	}
+}
+
+// The stream page's "session history" button opens the list filtered to
+// one repo or worktree. A kind that is not a ref kind shows everything.
+func TestHistoryListFilter(t *testing.T) {
+	historyRoot = t.TempDir()
+	writeLegacyMeta(t, historyID(1000, "foo-wd"), "foo-wd", 1000)
+	writeLegacyMeta(t, historyID(2000, "bar-wd"), "bar-wd", 2000)
+	for _, tc := range []struct {
+		query string
+		want  []string
+		skip  []string
+	}{
+		{"", []string{"foo-wd", "bar-wd"}, nil},
+		{"?kind=repos&name=foo-wd", []string{"foo-wd"}, []string{"bar-wd"}},
+		{"?kind=worktrees&name=foo-wd", nil, []string{"foo-wd", "bar-wd"}},
+		{"?kind=bogus&name=foo-wd", []string{"foo-wd", "bar-wd"}, nil},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			handleHistory(w, httptest.NewRequest(http.MethodGet, "/history/"+tc.query, nil))
+			body := w.Body.String()
+			for _, s := range tc.want {
+				if !strings.Contains(body, `<span class="dir-parent">`+s+`</span>`) {
+					t.Errorf("missing %s", s)
+				}
+			}
+			for _, s := range tc.skip {
+				if strings.Contains(body, `<span class="dir-parent">`+s+`</span>`) {
+					t.Errorf("unexpected %s", s)
+				}
+			}
+		})
 	}
 }
