@@ -28,7 +28,7 @@ func TestDiffToolbar(t *testing.T) {
 			}
 			end := strings.Index(html[start:], `</div>`) + start
 			menu := html[start:end]
-			for _, want := range []string{`>files</a>`, `id="wt-rename-btn"`} {
+			for _, want := range []string{`id="wt-new-btn"`, `>files</a>`, `id="wt-rename-btn"`} {
 				if !strings.Contains(menu, want) {
 					t.Errorf("menu is missing %s", want)
 				}

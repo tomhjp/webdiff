@@ -1606,7 +1606,6 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		writeAgentSelect(&body, "agent-select", pageAgent)
 	}
 	writeOpenButtons(&body, ref.abs, "toggle")
-	writeWorktreeNewButton(&body)
 	body.WriteString(`</div>`)
 
 	// .diff-right holds the diff actions and remove, so remove stays at
@@ -1620,6 +1619,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	}
 	body.WriteString(`<button class="toggle" type="button" id="diff-more-toggle" aria-expanded="false" aria-controls="diff-more-menu">more &#x25be;</button>`)
 	body.WriteString(`<div class="diff-more-menu" id="diff-more-menu" hidden>`)
+	writeWorktreeNewButton(&body)
 	fmt.Fprintf(&body, `<a class="toggle" href="/file/%s/%s/" title="browse repo files">files</a>`,
 		ref.kind, template.HTMLEscapeString(ref.name))
 	if ref.kind == "worktrees" {
