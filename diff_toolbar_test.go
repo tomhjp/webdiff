@@ -33,9 +33,24 @@ func TestDiffToolbar(t *testing.T) {
 					t.Errorf("menu is missing %s", want)
 				}
 			}
+			// "more" is in the left group with home and the agent
+			// button. The diff actions are in the right group.
+			right := strings.Index(html, `<div class="diff-right">`)
+			if right < end {
+				t.Fatal("right group is not after the more menu")
+			}
+			more := strings.Index(html, `id="diff-more-toggle"`)
+			home := strings.Index(html, `href="/">home</a>`)
+			if home < 0 || more < home || more > start {
+				t.Error("more is not next to home")
+			}
+			if !strings.Contains(html[right:], `id="diff-picker"`) {
+				t.Error("changes picker is not in the right group")
+			}
 			if query != "?changes=" {
-				if !strings.Contains(html[:start], `id="toggle-all"`) {
-					t.Error("collapse control is not before the menu")
+				toggle := strings.Index(html, `id="toggle-all"`)
+				if toggle < right || !strings.Contains(html[toggle:], `<use href="#icon-expand-all"/>`) {
+					t.Error("expand/collapse control is not an icon in the right group")
 				}
 				label := ">full context</button>"
 				if query == "?context=full" {

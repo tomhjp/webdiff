@@ -1606,17 +1606,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		writeAgentSelect(&body, "agent-select", pageAgent)
 	}
 	writeOpenButtons(&body, ref.abs, "toggle")
-	body.WriteString(`</div>`)
-
-	// .diff-right holds the diff actions and remove, so remove stays at
-	// the right edge when the row wraps. On narrow screens CSS removes
-	// this box, so the diff actions get their own row.
-	body.WriteString(`<div class="diff-right">`)
-	body.WriteString(`<div class="header-buttons diff-primary">`)
-	writeDiffPicker(&body, commits, selected, working)
-	if len(files) > 0 {
-		body.WriteString(`<button class="toggle" type="button" id="toggle-all">expand all</button>`)
-	}
+	// "more" is next to home and the agent button, as on the stream page.
 	body.WriteString(`<button class="toggle" type="button" id="diff-more-toggle" aria-expanded="false" aria-controls="diff-more-menu">more &#x25be;</button>`)
 	body.WriteString(`<div class="diff-more-menu" id="diff-more-menu" hidden>`)
 	writeWorktreeNewButton(&body)
@@ -1634,6 +1624,18 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 			fullContext, ctxLabel)
 	}
 	body.WriteString(`</div>`)
+	body.WriteString(`</div>`)
+
+	// .diff-right holds the diff actions and remove at the right side of
+	// the same row. Remove is last, so it is at the right edge. The
+	// expand/collapse button is an icon, so the row does not wrap on
+	// narrow screens. app.js changes the icon and the title.
+	body.WriteString(`<div class="diff-right">`)
+	body.WriteString(`<div class="header-buttons diff-primary">`)
+	writeDiffPicker(&body, commits, selected, working)
+	if len(files) > 0 {
+		body.WriteString(`<button class="toggle icon-btn" type="button" id="toggle-all" title="expand all" aria-label="expand all"><svg class="icon" aria-hidden="true"><use href="#icon-expand-all"/></svg></button>`)
+	}
 	// Sync buttons: hand-off to the desktop client's /_local/sync mux.
 	// The browser is reverse-proxied through the client, so a relative
 	// POST lands on the desktop, never on the sandbox. data-sync-dir

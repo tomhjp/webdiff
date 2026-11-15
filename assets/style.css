@@ -166,23 +166,19 @@ a { color: var(--accent) }
 .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
 .header-buttons { display: flex; gap: 4px; flex-wrap: wrap }
 .header-buttons-right { display: flex; gap: 4px; margin-left: auto }
-/* Put the main diff actions first on narrow screens. */
+/* One row: navigation and "more" at the left, the diff actions and
+   remove at the right. The row wraps only when it must. Then
+   justify-content keeps the right group at the right edge. */
 .diff-toolbar { flex-wrap: wrap; gap: 6px }
-/* .diff-right keeps remove after the diff actions. justify-content puts
-   remove at the right edge when it wraps onto a line by itself. */
 .diff-right { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; margin-left: auto }
 .diff-primary { align-items: center }
-.diff-more-menu { position: fixed; right: 12px; z-index: 100; display: flex; flex-direction: column; gap: 4px; width: min(200px, calc(100vw - 24px)); box-sizing: border-box; overflow: auto; padding: 8px; background: var(--chrome-bg); border: 1px solid var(--border); box-shadow: 0 4px 16px #0006 }
+/* An icon-only button. It has the same height as the text buttons. */
+.icon-btn { display: inline-flex; align-items: center; justify-content: center; padding: 2px 6px }
+.icon-btn .icon { width: 14px; height: 14px }
+/* app.js sets left from the position of the toggle. */
+.diff-more-menu { position: fixed; left: 12px; z-index: 100; display: flex; flex-direction: column; gap: 4px; width: min(200px, calc(100vw - 24px)); box-sizing: border-box; overflow: auto; padding: 8px; background: var(--chrome-bg); border: 1px solid var(--border); box-shadow: 0 4px 16px #0006 }
 .diff-more-menu[hidden] { display: none }
 .diff-more-menu .toggle { text-align: left; text-decoration: none }
-@media (max-width: 700px) {
-  /* Remove the .diff-right box, so its children are toolbar items:
-     the diff actions get the first row and remove goes to the right
-     of the second row. */
-  .diff-right { display: contents }
-  .diff-primary { order: -1; flex-basis: 100% }
-  .diff-remove { margin-left: auto }
-}
 @media (pointer: coarse) {
   .diff-more-menu .toggle { min-height: 44px; display: flex; align-items: center }
 }

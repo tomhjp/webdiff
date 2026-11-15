@@ -1045,10 +1045,15 @@
     }
     toggle.addEventListener('click',function(){
       if(!menu.hidden){close(false);return}
-      var top=toggle.getBoundingClientRect().bottom+4;
+      var rect=toggle.getBoundingClientRect();
+      var top=rect.bottom+4;
       menu.style.top=top+'px';
       menu.style.maxHeight=Math.max(44,window.innerHeight-top-12)+'px';
       menu.hidden=false;
+      // Align the menu with the left edge of the toggle, but keep it
+      // in the viewport.
+      var maxLeft=window.innerWidth-menu.offsetWidth-12;
+      menu.style.left=Math.max(12,Math.min(rect.left||0,maxLeft))+'px';
       toggle.setAttribute('aria-expanded','true');
       menu.querySelector('a, button').focus();
     });
@@ -1272,7 +1277,17 @@
   details.forEach(function(d){if(state[d.id]===false)d.open=false;});
 
   function anyOpen(){return Array.from(details).some(function(d){return d.open})}
-  function refreshBtn(){if(btn)btn.textContent=anyOpen()?'collapse all':'expand all'}
+  // The button is an icon. Change the icon, the title, and the label
+  // together.
+  function refreshBtn(){
+    if(!btn)return;
+    var collapse=anyOpen();
+    var label=collapse?'collapse all':'expand all';
+    var use=btn.querySelector('use');
+    if(use)use.setAttribute('href',collapse?'#icon-collapse-all':'#icon-expand-all');
+    btn.title=label;
+    btn.setAttribute('aria-label',label);
+  }
   // When a file collapses while the user is scrolled past its top
   // (typically: read to the bottom of a long diff, then collapsed),
   // pin the just-closed summary at its sticky offset. Without this,

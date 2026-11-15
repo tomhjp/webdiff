@@ -14,12 +14,12 @@ function toolbar(present = true) {
     events: {}, attrs: {},
     addEventListener(type, fn) { this.events[type] = fn; },
     setAttribute(key, value) { this.attrs[key] = value; },
-    getBoundingClientRect() { return {bottom: 90}; },
+    getBoundingClientRect() { return {bottom: 90, left: 40}; },
     contains(target) { return target === this; },
     focus() { this.focused = true; },
   };
   const menu = {
-    hidden: true, style: {}, events: {},
+    hidden: true, style: {}, events: {}, offsetWidth: 200,
     addEventListener(type, fn) { this.events[type] = fn; },
     contains(target) { return target === this || target === first; },
     querySelector() { return first; },
@@ -32,7 +32,7 @@ function toolbar(present = true) {
   vm.runInNewContext(script, {
     document,
     streamRoot: null,
-    window: {innerHeight: 600, addEventListener(type, fn) { windowEvents[type] = fn; }},
+    window: {innerHeight: 600, innerWidth: 800, addEventListener(type, fn) { windowEvents[type] = fn; }},
   });
   return {toggle, menu, first, events, windowEvents};
 }
@@ -45,6 +45,7 @@ test('more starts hidden and opens a positioned menu with keyboard focus', () =>
   assert.equal(menu.hidden, false);
   assert.equal(toggle.attrs['aria-expanded'], 'true');
   assert.equal(menu.style.top, '94px');
+  assert.equal(menu.style.left, '40px');
   assert.equal(first.focused, true);
   toggle.events.click();
   assert.equal(menu.hidden, true);
