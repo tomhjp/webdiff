@@ -31,6 +31,7 @@ function toolbar(present = true) {
   };
   vm.runInNewContext(script, {
     document,
+    streamRoot: null,
     window: {innerHeight: 600, addEventListener(type, fn) { windowEvents[type] = fn; }},
   });
   return {toggle, menu, first, events, windowEvents};

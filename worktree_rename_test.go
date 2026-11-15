@@ -294,6 +294,25 @@ func TestStreamPageHeaderButtons(t *testing.T) {
 					t.Errorf("%s present = %v, want %v", s, got, tc.want)
 				}
 			}
+			if !tc.want {
+				return
+			}
+			// "+ worktree" and rename are in the "more" menu, not in
+			// the header row.
+			start := strings.Index(body, `<div class="diff-more-menu" id="diff-more-menu" hidden>`)
+			if start < 0 {
+				t.Fatal("missing more menu")
+			}
+			menu := body[start : strings.Index(body[start:], `</div>`)+start]
+			wants := []string{`id="wt-new-btn"`}
+			if tc.name == "worktree" {
+				wants = append(wants, `id="wt-rename-btn"`)
+			}
+			for _, s := range wants {
+				if !strings.Contains(menu, s) {
+					t.Errorf("menu is missing %s", s)
+				}
+			}
 		})
 	}
 }

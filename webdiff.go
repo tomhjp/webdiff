@@ -1934,11 +1934,19 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 	// Same open and "+ worktree" buttons as the diff page, so the two
 	// pages have the same buttons at the top left.
 	writeOpenButtons(&body, dir, "toggle")
+	// "+ worktree" and rename go in a "more" menu, so the header row
+	// does not become too wide on narrow screens. The diff page uses
+	// the same menu, and app.js sets up both with setupDiffMore.
 	if hasRef {
+		body.WriteString(`<button class="toggle" type="button" id="diff-more-toggle" aria-expanded="false" aria-controls="diff-more-menu">more &#x25be;</button>`)
+		body.WriteString(`<div class="diff-more-menu" id="diff-more-menu" hidden>`)
 		writeWorktreeNewButton(&body)
+		if worktreeName != "" {
+			writeWorktreeRenameButton(&body, worktreeName, dir)
+		}
+		body.WriteString(`</div>`)
 	}
 	if worktreeName != "" {
-		writeWorktreeRenameButton(&body, worktreeName, dir)
 		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="wt-remove-btn" data-name="%s" title="remove this worktree">remove</button>`,
 			template.HTMLEscapeString(worktreeName))
 	}

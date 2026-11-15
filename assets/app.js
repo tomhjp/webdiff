@@ -11,7 +11,7 @@
   // logic below shouldn't run here — there are no <details> on this
   // page anyway, but bailing early keeps the two flows independent.
   var streamRoot=document.getElementById('pane-tail');
-  if(streamRoot){setupStreamPage(streamRoot);setupWorktreeCreate();setupWorktreeRemove();setupWorktreeRename();setupStickyOffsets();return}
+  if(streamRoot){setupStreamPage(streamRoot);setupDiffMore();setupWorktreeCreate();setupWorktreeRemove();setupWorktreeRename();setupStickyOffsets();return}
 
   // showHistoryModal is the shared "confirm, and here's the scrollback URL
   // to hand the next session" dialog. Both entry points need it: restart
@@ -1031,7 +1031,10 @@
       if(!toggle.contains(ev.target)&&!menu.contains(ev.target))close(false);
     });
     menu.addEventListener('click',function(ev){
-      if(ev.target.closest('a, button'))close(true);
+      // Give focus back to the toggle only if the item kept it. Do not
+      // take focus from an item that moved it, for example "+ worktree",
+      // which puts focus in the branch input.
+      if(ev.target.closest('a, button'))close(menu.contains(document.activeElement));
     });
     document.addEventListener('keydown',function(ev){
       if(ev.key==='Escape'&&!menu.hidden){ev.preventDefault();close(true)}
@@ -1040,7 +1043,10 @@
       if(!toggle.contains(ev.target)&&!menu.contains(ev.target))close(false);
     });
     window.addEventListener('resize',function(){close(false)});
-    window.addEventListener('scroll',function(){close(false)});
+    // The stream page scrolls the window each time new output arrives
+    // while it follows the tail. Do not close the menu there. The
+    // heading is sticky, so the menu stays below its toggle.
+    if(!streamRoot)window.addEventListener('scroll',function(){close(false)});
   }
   setupDiffMore();
 
