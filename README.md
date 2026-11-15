@@ -129,13 +129,6 @@ Alternatively, get a more opinionated install from `deploy/install.sh` which:
 * Serves webdiff's own parent directory as the code directory
 * Enables linger
 
-## Future designs
-
-* [Agent transcript views](TRANSCRIPT-PLAN.md): agent-specific transcript adapters
-  and incremental source watching, with tmux retained for interaction and fallback.
-* [Zellij migration analysis](ZELLIJ-PLAN.md): an assessment of event-driven
-  terminal capture and multiplexer trade-offs.
-
 ## Terminal colour palette
 
 By default webdiff uses a built-in colour scheme. To match your terminal's actual palette:
