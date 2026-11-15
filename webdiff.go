@@ -748,8 +748,9 @@ func splitGutter(line string) (prefix, tail string, ok bool) {
 
 // renderHomeHandler is the root-only fallback. Anything other than "/"
 // 404s — there is no nested directory navigation, just the two named
-// URL namespaces (/repos/, /worktrees/) and the home page's three
-// sections (repos, worktrees, tmux).
+// URL namespaces (/repos/, /worktrees/) and the home page's
+// sections (repos and worktrees, each with their sessions, then the
+// other sessions).
 func renderHomeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -791,44 +792,95 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	body.WriteString(`<a class="toggle" href="/history/" title="archived agent sessions">history</a>`)
 	body.WriteString(`</div></div>`)
 
-	body.WriteString(`<h2 class="section-title">repos</h2><div class="dir-list">`)
-	repos := 0
-	for _, target := range targets {
-		if target.Kind != repostats.Repo {
-			continue
-		}
-		repos++
-		writeDirRow(&body, target, target.Name)
+	// Each live or stopped session shows under the repo or worktree it
+	// belongs to. The sessions section shows only the sessions that are
+	// left. The map holds a list for each session name, so a checkout
+	// can show more than one session.
+	sessions := homeSessions(r.Context(), time.Now())
+	bySession := make(map[string][]homeSession, len(sessions))
+	for _, s := range sessions {
+		bySession[s.Session] = append(bySession[s.Session], s)
 	}
-	if repos == 0 {
+	takeSessions := func(target repostats.Target) []homeSession {
+		name := repoSessionName(target.Path)
+		rows := bySession[name]
+		delete(bySession, name)
+		return rows
+	}
+
+	var repos, worktrees []repostats.Target
+	for _, target := range targets {
+		switch target.Kind {
+		case repostats.Repo:
+			repos = append(repos, target)
+		case repostats.Worktree:
+			worktrees = append(worktrees, target)
+		}
+	}
+
+	writeSectionStart(&body, "repos", "repos", len(repos))
+	for _, target := range repos {
+		writeDirGroup(&body, target, target.Name, takeSessions(target))
+	}
+	if len(repos) == 0 {
 		body.WriteString(`<p class="empty">No git repos under this directory.</p>`)
 	}
-	body.WriteString(`</div>`)
+	writeSectionEnd(&body)
 
-	worktrees := 0
-	for _, target := range targets {
-		if target.Kind == repostats.Worktree {
-			worktrees++
-		}
-	}
-	if worktrees > 0 {
-		body.WriteString(`<h2 class="section-title">worktrees</h2><div class="dir-list">`)
-		for _, target := range targets {
-			if target.Kind != repostats.Worktree {
-				continue
-			}
+	if len(worktrees) > 0 {
+		writeSectionStart(&body, "worktrees", "worktrees", len(worktrees))
+		for _, target := range worktrees {
 			label := target.ParentRepo
 			if label == "" {
 				label = target.Name
 			}
-			writeDirRow(&body, target, label)
+			writeDirGroup(&body, target, label, takeSessions(target))
 		}
-		body.WriteString(`</div>`)
+		writeSectionEnd(&body)
 	}
 
-	writeTmuxSection(&body, r.Context())
+	// Keep the order from homeSessions for the sessions that are left.
+	var other []homeSession
+	for _, s := range sessions {
+		if _, ok := bySession[s.Session]; ok {
+			other = append(other, s)
+		}
+	}
+	if len(other) > 0 {
+		writeSectionStart(&body, "sessions", "other sessions", len(other))
+		for _, s := range other {
+			writeSessionRow(&body, s, false)
+		}
+		writeSectionEnd(&body)
+	}
 
 	writePage(w, body.String())
+}
+
+// writeSectionStart opens a home page section that the user can collapse.
+// key identifies the section in app.js, which keeps the open or closed
+// state in localStorage. The section has no id, because the diff page
+// code in app.js uses details[id] for the file sections.
+func writeSectionStart(b *strings.Builder, key, title string, count int) {
+	fmt.Fprintf(b, `<details class="home-section" data-section="%s" open>`, template.HTMLEscapeString(key))
+	fmt.Fprintf(b, `<summary class="section-title">%s<span class="section-count" data-stat="%d"></span></summary>`,
+		template.HTMLEscapeString(title), count)
+	b.WriteString(`<div class="dir-list">`)
+}
+
+func writeSectionEnd(b *strings.Builder) {
+	b.WriteString(`</div></details>`)
+}
+
+// writeDirGroup emits a repo or worktree row and, below it, the rows of
+// the sessions that belong to it.
+func writeDirGroup(b *strings.Builder, target repostats.Target, label string, sessions []homeSession) {
+	b.WriteString(`<div class="dir-group">`)
+	writeDirRow(b, target, label)
+	for _, s := range sessions {
+		writeSessionRow(b, s, true)
+	}
+	b.WriteString(`</div>`)
 }
 
 // writeDirRow emits one <a class="dir-row repo-row"> for a repo or
@@ -1172,19 +1224,28 @@ func worktreeParentRepo(wtPath string) (string, bool) {
 	return filepath.Base(filepath.Dir(common)), true
 }
 
-// writeTmuxSection appends a "sessions" block to the root listing: every
-// live pane on the host, followed by agent sessions we remember as having
-// been running but which are no longer in tmux (see stoppedSessions).
-// Each live row links to the streaming page for that pane so the reviewer
-// can peek at session state without having to be the one who kicked off a
-// review-comment send; each stopped row links to its archived scrollback.
-// Hidden entirely when there's nothing in either group so the page stays
-// clean on hosts that don't use tmux.
+// homeSession is one row in a home page session list: a live pane, or an
+// agent session that we remember as running but that is no longer in
+// tmux (see stoppedSessions).
+type homeSession struct {
+	Session string // session name, used to find the repo or worktree
+	Label   string // "session:window.pane" for a live pane, else the name
+	Href    string
+	Desc    string // command and title, or "stopped"
+	Branch  string // branch of a stopped session at its first capture
+	When    string // time since last use, from formatLastUsed
+	Stopped bool
+}
+
+// homeSessions returns every live pane on the host, followed by the
+// stopped agent sessions. Each live row links to the streaming page for
+// that pane, so the reviewer can see the session state without having to
+// be the one who sent a review comment. Each stopped row links to its
+// archived scrollback.
 //
-// Live rows are per-pane and labelled "session:window.pane"; stopped rows
-// are per-session and labelled by name, because a session that's gone has
-// no pane left to name.
-func writeTmuxSection(b *strings.Builder, ctx context.Context) {
+// Live rows are per pane. Stopped rows are per session, because a
+// session that is gone has no pane left to name.
+func homeSessions(ctx context.Context, now time.Time) []homeSession {
 	panes, err := listAllPanes(ctx)
 	if err != nil {
 		panes = nil
@@ -1199,15 +1260,8 @@ func writeTmuxSection(b *strings.Builder, ctx context.Context) {
 	for _, p := range panes {
 		liveNames[p.Session] = true
 	}
-	stopped := stoppedSessions(liveNames)
-	if len(panes) == 0 && len(stopped) == 0 {
-		return
-	}
-	b.WriteString(`<h2 class="section-title">sessions</h2>`)
-	b.WriteString(`<div class="dir-list">`)
-	now := time.Now()
+	var out []homeSession
 	for _, p := range panes {
-		label := p.Session + ":" + p.Index
 		desc := p.Command
 		if p.Title != "" && p.Title != p.Command {
 			desc += " · " + p.Title
@@ -1215,34 +1269,70 @@ func writeTmuxSection(b *strings.Builder, ctx context.Context) {
 		// /pane is the arbitrary-pane viewer; the handler looks up the
 		// session name from the paneID at request time so we don't need
 		// to pass it as a query param.
-		href := "/pane?paneID=" + url.QueryEscape(p.PaneID)
-		fmt.Fprintf(b, `<a class="dir-row tmux-row" href="%s" data-session="%s"><span class="dir-name">%s</span><span class="dir-stats">%s</span><span class="dir-branch">%s</span></a>`,
-			template.HTMLEscapeString(href),
-			template.HTMLEscapeString(p.Session),
-			template.HTMLEscapeString(label),
-			template.HTMLEscapeString(desc),
-			template.HTMLEscapeString(formatLastUsed(p.LastUsed, now)),
-		)
+		out = append(out, homeSession{
+			Session: p.Session,
+			Label:   p.Session + ":" + p.Index,
+			Href:    "/pane?paneID=" + url.QueryEscape(p.PaneID),
+			Desc:    desc,
+			When:    formatLastUsed(p.LastUsed, now),
+		})
 	}
-	// No data-session on stopped rows: app.js selects `.tmux-row
-	// [data-session]` for the spinner poll, so leaving it off keeps them
-	// out of it without the JS needing to know they exist.
-	// Columns line up with the live rows above: name, description, then
-	// time on the right. "stopped" sits where a live row shows its running
-	// command, which is exactly the distinction being drawn.
-	for _, m := range stopped {
-		desc := "stopped"
-		if m.Branch != "" {
-			desc += " · " + m.Branch
+	for _, m := range stoppedSessions(liveNames) {
+		out = append(out, homeSession{
+			Session: m.Session,
+			Label:   m.Session,
+			Href:    "/history/" + m.ID,
+			Desc:    "stopped",
+			Branch:  m.Branch,
+			When:    formatLastUsed(m.Updated, now),
+			Stopped: true,
+		})
+	}
+	return out
+}
+
+// writeSessionRow emits one session row. A nested row shows below the
+// repo or worktree that it belongs to, so it does not repeat the session
+// name or branch. The name stays in the title attribute.
+//
+// No data-session on stopped rows: app.js selects `[data-session]`
+// rows for the spinner poll, so leaving it off keeps them
+// out of it without the JS needing to know they exist.
+func writeSessionRow(b *strings.Builder, s homeSession, nested bool) {
+	cls := "dir-row tmux-row"
+	if nested {
+		cls += " session-row"
+	}
+	attrs := ""
+	if s.Stopped {
+		cls += " session-stopped"
+	} else {
+		attrs = fmt.Sprintf(` data-session="%s"`, template.HTMLEscapeString(s.Session))
+	}
+	fmt.Fprintf(b, `<a class="%s" href="%s" title="%s"%s>`,
+		cls,
+		template.HTMLEscapeString(s.Href),
+		template.HTMLEscapeString(s.Label),
+		attrs,
+	)
+	if nested {
+		// The description is the part that tells sessions of one
+		// checkout apart, so it takes the flexible name cell.
+		fmt.Fprintf(b, `<span class="dir-name">%s</span>`, template.HTMLEscapeString(s.Desc))
+	} else {
+		// Columns: name, description, then time on the right. "stopped"
+		// sits where a live row shows its running command, which is
+		// exactly the distinction being drawn.
+		desc := s.Desc
+		if s.Branch != "" {
+			desc += " · " + s.Branch
 		}
-		fmt.Fprintf(b, `<a class="dir-row tmux-row session-stopped" href="%s"><span class="dir-name">%s</span><span class="dir-stats">%s</span><span class="dir-branch">%s</span></a>`,
-			template.HTMLEscapeString("/history/"+m.ID),
-			template.HTMLEscapeString(m.Session),
+		fmt.Fprintf(b, `<span class="dir-name">%s</span><span class="dir-stats">%s</span>`,
+			template.HTMLEscapeString(s.Label),
 			template.HTMLEscapeString(desc),
-			template.HTMLEscapeString(formatLastUsed(m.Updated, now)),
 		)
 	}
-	b.WriteString(`</div>`)
+	fmt.Fprintf(b, `<span class="dir-branch">%s</span></a>`, template.HTMLEscapeString(s.When))
 }
 
 // formatLastUsed renders a tmux activity timestamp as a short relative

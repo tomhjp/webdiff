@@ -283,6 +283,23 @@ a { color: var(--accent) }
 .tmux-row .dir-name { flex: 0 0 auto; overflow: visible; text-overflow: clip }
 .tmux-row .dir-stats { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .tmux-row .dir-branch { flex: 0 0 auto; max-width: none; overflow: visible }
+
+/* Home page sections are <details> so each one can collapse. Undo the
+   sticky diff-file summary style: the home page has no sticky heading
+   for it to stack under. */
+.home-section > summary.section-title { position: static; display: flex; justify-content: flex-start; align-items: baseline; gap: 0; background: transparent; border-top: none; font-size: 11px; color: var(--muted); user-select: none; -webkit-tap-highlight-color: transparent }
+.home-section > summary.section-title::before { color: var(--muted); font-weight: normal }
+.home-section > summary.section-title:hover { color: var(--fg) }
+.section-count::before { content: attr(data-stat); margin-left: 8px; color: var(--muted) }
+
+/* A repo or worktree row and the rows of its sessions. The group draws
+   the rule below the last row, so the session rows read as part of the
+   checkout above them. */
+.dir-group { border-bottom: 1px solid var(--border) }
+.dir-group > .dir-row-wrap { border-bottom: none }
+.session-row { border-bottom: none; padding: 2px 12px 8px 32px; font-size: 12px }
+.session-row .dir-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg) }
+.session-row .dir-name::before { content: "↳ "; color: var(--muted) }
 @keyframes wd-spin { to { transform: rotate(360deg) } }
 .session-spinning::after { content: ''; flex: 0 0 auto; align-self: center; width: 8px; height: 8px; border: 1.5px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: wd-spin 0.6s linear infinite }
 

@@ -891,6 +891,22 @@
     });
   }
 
+  // Listing page: keep the open or closed state of each section.
+  var HOME_SECTIONS_KEY='webdiff:homeSections';
+  var homeSections=document.querySelectorAll('details.home-section[data-section]');
+  if(homeSections.length>0){
+    var sectionState={};
+    try{sectionState=JSON.parse(localStorage.getItem(HOME_SECTIONS_KEY)||'{}')||{}}catch(e){}
+    homeSections.forEach(function(d){
+      if(sectionState[d.dataset.section]===false)d.open=false;
+      d.addEventListener('toggle',function(){
+        if(d.open)delete sectionState[d.dataset.section];
+        else sectionState[d.dataset.section]=false;
+        try{localStorage.setItem(HOME_SECTIONS_KEY,JSON.stringify(sectionState))}catch(e){}
+      });
+    });
+  }
+
   // Listing page: poll for spinning *-wd sessions and reflect that
   // state on the tmux rows with a CSS spinner via .session-spinning.
   var tmuxRows=document.querySelectorAll('.tmux-row[data-session]');
