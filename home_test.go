@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -168,5 +169,25 @@ func TestSortByAgentActivity(t *testing.T) {
 	want := []string{"c-new", "b-old", "d-old", "a-none"}
 	if !slices.Equal(got, want) {
 		t.Errorf("order = %v, want %v", got, want)
+	}
+}
+
+func TestSessionLabel(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip(err)
+	}
+	tests := []struct {
+		agent, dir, want string
+	}{
+		{"pi", filepath.Join(home, "ai/wt/corp/safer-ciguestlet-shutdown"), "pi · ~/ai/wt/corp/safer-ciguestlet-shutdown"},
+		{"claude", "/srv/repo", "claude · /srv/repo"},
+		{"", filepath.Join(home, "ai/webdiff"), "~/ai/webdiff"},
+		{"pi", "", "pi"},
+	}
+	for _, tt := range tests {
+		if got := sessionLabel(tt.agent, tt.dir); got != tt.want {
+			t.Errorf("sessionLabel(%q, %q) = %q, want %q", tt.agent, tt.dir, got, tt.want)
+		}
 	}
 }

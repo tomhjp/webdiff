@@ -776,8 +776,10 @@ func (c *rexClient) ensureConnected(ctx context.Context) error {
 
 // createAgentSession starts cmd in a new session named label, in dir.
 // The agent id goes in the block label, so that a later webdiff can tell
-// which agent runs there. It waits until the agent can take a paste.
-func (c *rexClient) createAgentSession(ctx context.Context, label, dir, agentID, agentName, cmd string) (rexSession, error) {
+// which agent runs there. windowLabel is the label of the agent window,
+// which the Rex apps show as the row of the session. It waits until the
+// agent can take a paste.
+func (c *rexClient) createAgentSession(ctx context.Context, label, windowLabel, dir, agentID, agentName, cmd string) (rexSession, error) {
 	if err := c.ensureConnected(ctx); err != nil {
 		return rexSession{}, err
 	}
@@ -794,7 +796,7 @@ func (c *rexClient) createAgentSession(ctx context.Context, label, dir, agentID,
 	err := c.call(ctx, "session.create", map[string]any{
 		"label": label,
 		"initial_windows": []any{map[string]any{
-			"window_label": "agent",
+			"window_label": windowLabel,
 			"layout": map[string]any{"block": map[string]any{
 				"flavor": rexTerminalFlavor,
 				"label":  agentID,
@@ -1022,6 +1024,39 @@ func (c *rexClient) rename(ctx context.Context, sessionID, label string) error {
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+// setAgentWindowLabel sets the label of the window that holds the
+// session's agent block. The Rex apps show this label as the row of the
+// session, below the session label. webdiff does not read the label, so
+// it can change it without an effect on how it finds the session.
+func (c *rexClient) setAgentWindowLabel(ctx context.Context, s rexSession, label string) error {
+	if c == nil {
+		return errRexDisconnected
+	}
+	var blocks struct {
+		Blocks []struct {
+			BlockID  string `json:"block_id"`
+			WindowID string `json:"window_id"`
+		} `json:"blocks"`
+	}
+	if err := c.call(ctx, "session.list_blocks", map[string]string{"session_id": s.ID}, &blocks); err != nil {
+		return err
+	}
+	window := ""
+	for _, b := range blocks.Blocks {
+		if b.BlockID == s.Agent {
+			window = b.WindowID
+		}
+	}
+	if window == "" {
+		return fmt.Errorf("session %s has no window for its agent", s.ID)
+	}
+	return c.call(ctx, "session.set_window_label", map[string]string{
+		"session_id": s.ID,
+		"window_id":  window,
+		"label":      label,
+	}, nil)
 }
 
 type rexFormatResult struct {

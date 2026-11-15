@@ -243,7 +243,7 @@ read -r rest
 		t.Fatal(err)
 	}
 	label := fmt.Sprintf("webdiff-test-%d-wd", time.Now().UnixNano())
-	s, err := c.createAgentSession(ctx, label, dir, "fake", "fake", "sh ./fake")
+	s, err := c.createAgentSession(ctx, label, "fake · test", dir, "fake", "fake", "sh ./fake")
 	if err != nil {
 		t.Fatal(err)
 	}

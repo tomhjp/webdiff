@@ -142,6 +142,9 @@ func renameWorktree(ctx context.Context, ref repoRef, branch string) (string, in
 	}
 	if live {
 		recordRepoSession(newSession, newPath)
+		if newPath != ref.abs {
+			relabelAgentWindow(ctx, newSession, newPath)
+		}
 	}
 	if indexCache != nil {
 		_ = indexCache.Remove("worktrees-" + ref.name)

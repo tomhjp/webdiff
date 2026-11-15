@@ -810,10 +810,17 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	for _, s := range sessions {
 		bySession[s.Session] = append(bySession[s.Session], s)
 	}
+	// A row below its checkout names its agent and directory, the same
+	// label that the Rex apps show (see sessionLabel).
 	takeSessions := func(target repostats.Target) []homeSession {
 		name := repoSessionName(target.Path)
 		rows := bySession[name]
 		delete(bySession, name)
+		for i := range rows {
+			if !rows[i].Stopped {
+				rows[i].Desc = sessionLabel(rows[i].Agent, target.Path)
+			}
+		}
 		return rows
 	}
 
@@ -1334,6 +1341,7 @@ type homeSession struct {
 	Label   string // "session:window.pane" for a live pane, else the name
 	Href    string
 	Desc    string // command and title, or "stopped"
+	Agent   string // command of a live pane, for example "pi"
 	Branch  string // branch of a stopped session at its first capture
 	When    string // time since last use, from formatLastUsed
 	// LastUsed is the unix time of the last activity: the last output
@@ -1380,6 +1388,7 @@ func homeSessions(ctx context.Context, now time.Time) []homeSession {
 			Label:    p.Session + ":" + p.Index,
 			Href:     "/pane?paneID=" + url.QueryEscape(p.PaneID),
 			Desc:     desc,
+			Agent:    p.Command,
 			When:     formatLastUsed(p.LastUsed, now),
 			LastUsed: p.LastUsed,
 		})

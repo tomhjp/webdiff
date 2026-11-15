@@ -1382,7 +1382,7 @@ func ensureRepoSession(ctx context.Context, repoPath, agentID, piSession string)
 	}
 	var pane Pane
 	if rexSpawn {
-		s, err := rexc.createAgentSession(ctx, name, repoPath, wantName, wantName, wantCmd)
+		s, err := rexc.createAgentSession(ctx, name, sessionLabel(wantName, repoPath), repoPath, wantName, wantName, wantCmd)
 		if err != nil {
 			return Pane{}, err
 		}
