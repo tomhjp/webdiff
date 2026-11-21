@@ -171,13 +171,14 @@ func writeHistoryMeta(id, session string, created int64) {
 func newHistoryMeta(id, session string, created, now int64) historyMeta {
 	// The fallback Name works out to the same thing sessionRepoRef would
 	// have returned, but only because session names are the flat slug
-	// plus "-wd" — see worktreeSlug.
+	// plus "-wd" and the session number — see worktreeSlug and
+	// checkoutSessionName.
 	m := historyMeta{
 		ID:      id,
 		Session: session,
 		Started: created,
 		Updated: now,
-		Name:    strings.TrimSuffix(session, "-wd"),
+		Name:    strings.TrimSuffix(sessionGroupKey(session), webdiffSessionSuffix),
 	}
 	if ref, ok := sessionRepoRef(session); ok {
 		m.Kind = ref.kind
@@ -195,7 +196,7 @@ func newHistoryMeta(id, session string, created, now int64) historyMeta {
 // can't learn the ID again, because Rex doesn't report a program's
 // arguments.
 func recordPiSession(ctx context.Context, session, piSession string) {
-	if historyRoot == "" || !strings.HasSuffix(session, "-wd") || !piSessionIDRE.MatchString(piSession) {
+	if historyRoot == "" || !isWebdiffSession(session) || !piSessionIDRE.MatchString(piSession) {
 		return
 	}
 	created, ok := sessionCreated(ctx, session)
@@ -291,17 +292,29 @@ func clearSessionLive(session string) {
 	}
 }
 
-// sessionRepoRef resolves a *-wd session name back to the repo or
+// clearCheckoutSessionsLive clears the Live flag on the newest archive
+// of every session of the checkout at repoPath, running or not.
+func clearCheckoutSessionsLive(repoPath string) {
+	primary := repoSessionName(repoPath)
+	for session := range newestArchiveIDs() {
+		if p, _, ok := parseSessionName(session); ok && p == primary {
+			clearSessionLive(session)
+		}
+	}
+}
+
+// sessionRepoRef resolves a webdiff session name back to the repo or
 // worktree it was spawned for, by the same managed-ref scan paneRepoURL
 // uses. ok=false when nothing currently managed matches (e.g. the
 // worktree was removed) — the caller then falls back to a name derived
 // from the session.
 func sessionRepoRef(session string) (repoRef, bool) {
-	if !strings.HasSuffix(session, "-wd") {
+	primary, _, ok := parseSessionName(session)
+	if !ok {
 		return repoRef{}, false
 	}
 	for _, ref := range allManagedRefs() {
-		if repoSessionName(ref.abs) == session {
+		if repoSessionName(ref.abs) == primary {
 			return ref, true
 		}
 	}
@@ -315,7 +328,7 @@ func sessionRepoRef(session string) (repoRef, bool) {
 // building a /history/<id> reference) or "" when the session isn't
 // webdiff-managed or tmux can't be reached.
 func snapshotSessionHistory(ctx context.Context, session string) string {
-	if !strings.HasSuffix(session, "-wd") {
+	if !isWebdiffSession(session) {
 		return ""
 	}
 	created, ok := sessionCreated(ctx, session)
@@ -654,8 +667,8 @@ func renderHistoryEntry(w http.ResponseWriter, ctx context.Context, id string) {
 				fmt.Fprintf(&body, `<a class="toggle" id="history-continue-btn" href="%s" title="continue this pi conversation in a new session">resume</a>`,
 					template.HTMLEscapeString("/agent"+ref.url+"?"+url.Values{"resume": {m.ID}}.Encode()))
 			} else if ok && isGitRepo(ref.abs) {
-				fmt.Fprintf(&body, `<button class="toggle" type="button" id="history-resume-btn" data-repo-url="%s" data-history-url="%s" title="start a new %s session for this repo">resume</button>`,
-					template.HTMLEscapeString(ref.url),
+				fmt.Fprintf(&body, `<button class="toggle" type="button" id="history-resume-btn" data-agent-url="%s" data-history-url="%s" title="start a new %s session for this repo">resume</button>`,
+					template.HTMLEscapeString("/agent"+ref.url+sessionQuery(sessionNumber(m.Session), "")),
 					template.HTMLEscapeString("/history/"+m.ID+".txt"),
 					template.HTMLEscapeString(agentName))
 			}

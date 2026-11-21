@@ -166,6 +166,9 @@ a { color: var(--accent) }
 .header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
 .header-buttons { display: flex; gap: 4px; flex-wrap: wrap }
 .header-buttons-right { display: flex; gap: 4px; margin-left: auto }
+/* The number of the agent session on the stream page, for example "#2",
+   when the checkout has more than one session. */
+.session-tag { align-self: center; font-size: 12px; font-weight: bold; color: var(--branch); padding: 0 4px }
 /* One row: navigation and "more" at the left, the diff actions and
    remove at the right. The row wraps only when it must. Then
    justify-content keeps the right group at the right edge. */

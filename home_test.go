@@ -92,18 +92,15 @@ func TestWriteRepoActionsGroup(t *testing.T) {
 		Stopped: true,
 	}
 	tests := []struct {
-		name      string
-		sessions  []homeSession
-		wantAgent bool
+		name     string
+		sessions []homeSession
 	}{
 		{
-			name:      "no sessions",
-			wantAgent: true,
+			name: "no sessions",
 		},
 		{
-			name:      "stopped session",
-			sessions:  []homeSession{stopped},
-			wantAgent: true,
+			name:     "stopped session",
+			sessions: []homeSession{stopped},
 		},
 		{
 			name:     "live session",
@@ -123,8 +120,10 @@ func TestWriteRepoActionsGroup(t *testing.T) {
 					t.Errorf("output does not contain %s:\n%s", want, got)
 				}
 			}
-			if hasAgent := strings.Contains(got, `href="/agent/repos/corp/"`); hasAgent != tt.wantAgent {
-				t.Errorf("+ agent button shown = %v, want %v:\n%s", hasAgent, tt.wantAgent, got)
+			// "+ agent" always shows: with a live session, it starts
+			// another one.
+			if !strings.Contains(got, `href="/agent/repos/corp/?new=1"`) {
+				t.Errorf("+ agent button not shown:\n%s", got)
 			}
 			if n := strings.Count(got, "session-row"); n != len(tt.sessions) {
 				t.Errorf("got %d session rows, want %d:\n%s", n, len(tt.sessions), got)
@@ -178,16 +177,51 @@ func TestSessionLabel(t *testing.T) {
 		t.Skip(err)
 	}
 	tests := []struct {
-		agent, dir, want string
+		agent, dir string
+		n          int
+		want       string
 	}{
-		{"pi", filepath.Join(home, "ai/wt/corp/safer-ciguestlet-shutdown"), "pi · ~/ai/wt/corp/safer-ciguestlet-shutdown"},
-		{"claude", "/srv/repo", "claude · /srv/repo"},
-		{"", filepath.Join(home, "ai/webdiff"), "~/ai/webdiff"},
-		{"pi", "", "pi"},
+		{"pi", filepath.Join(home, "ai/wt/corp/safer-ciguestlet-shutdown"), 1, "pi · ~/ai/wt/corp/safer-ciguestlet-shutdown"},
+		{"claude", "/srv/repo", 1, "claude · /srv/repo"},
+		{"", filepath.Join(home, "ai/webdiff"), 1, "~/ai/webdiff"},
+		{"pi", "", 1, "pi"},
+		{"pi", "/srv/repo", 2, "pi #2 · /srv/repo"},
+		{"", "/srv/repo", 3, "#3 · /srv/repo"},
 	}
 	for _, tt := range tests {
-		if got := sessionLabel(tt.agent, tt.dir); got != tt.want {
-			t.Errorf("sessionLabel(%q, %q) = %q, want %q", tt.agent, tt.dir, got, tt.want)
+		if got := sessionLabel(tt.agent, tt.dir, tt.n); got != tt.want {
+			t.Errorf("sessionLabel(%q, %q, %d) = %q, want %q", tt.agent, tt.dir, tt.n, got, tt.want)
 		}
+	}
+}
+
+func TestCheckoutSessionRows(t *testing.T) {
+	rows := checkoutSessionRows([]homeSession{
+		{
+			Session: "corp-wd3",
+			Desc:    "stopped",
+			Stopped: true,
+		},
+		{
+			Session: "corp-wd2",
+			Agent:   "claude",
+		},
+		{
+			Session: "corp-wd",
+			Desc:    "stopped",
+			Stopped: true,
+		},
+		{
+			Session: "corp-wd",
+			Agent:   "pi",
+		},
+	}, "/srv/corp")
+	var got []string
+	for _, r := range rows {
+		got = append(got, r.Desc)
+	}
+	want := []string{"pi · /srv/corp", "claude #2 · /srv/corp", "stopped", "stopped #3"}
+	if !slices.Equal(got, want) {
+		t.Errorf("rows = %q, want %q", got, want)
 	}
 }

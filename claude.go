@@ -49,8 +49,12 @@ type Comment struct {
 // path basename to derive a `webdiff-<base>` tmux session that's
 // dedicated to this repo. No pane-picker fields any more — the
 // "session per repo" model auto-creates the session on first send.
+//
+// N is the number of the agent session of the checkout that gets the
+// comments (see agent_sessions.go). 0 selects session 1.
 type sendRequest struct {
 	Repo     string    `json:"repo"`
+	N        int       `json:"n,omitempty"`
 	Comments []Comment `json:"comments"`
 }
 
@@ -62,7 +66,7 @@ var (
 	wdLastRaw    = map[string]string{}
 	wdLastChange = map[string]time.Time{}
 	// wdSessionRepo maps a *-wd tmux session name to the repo it was
-	// spawned for, populated by ensureRepoSession. Consumed by
+	// spawned for, populated by ensureAgentSession. Consumed by
 	// pollWdSessions when broadcasting turn-ended events so subscribers
 	// know which repo to sync without having to reverse-derive the path
 	// from the session name (which can ambiguate when repos in rootDir
@@ -116,7 +120,7 @@ func broadcastTurnEvent(ev turnEvent) {
 	}
 }
 
-// recordRepoSession is called by ensureRepoSession on every cache hit
+// recordRepoSession is called by ensureAgentSession on every cache hit
 // or miss to keep wdSessionRepo current with the live sessions. The
 // caller is the only place a *-wd session is created or observed by
 // name+repo together, so this is the right registration point.
@@ -166,7 +170,7 @@ func startSessionWatcher(ctx context.Context) {
 					return
 				case <-t.C:
 					for _, s := range rexc.snapshot() {
-						if s.spinning && strings.HasSuffix(s.Label, "-wd") {
+						if s.spinning && isWebdiffSession(s.Label) {
 							captureHistory(ctx, s.Label, s.Created, false)
 						}
 					}
@@ -195,7 +199,7 @@ const rexHistoryInterval = 15 * time.Second
 // onRexTurnEnd broadcasts a turn event for a Rex session whose agent
 // stopped working, and archives the session's scrollback.
 func onRexTurnEnd(s rexSession) {
-	if !strings.HasSuffix(s.Label, "-wd") {
+	if !isWebdiffSession(s.Label) {
 		return
 	}
 	wdSessionsMu.RLock()
@@ -239,7 +243,7 @@ func pollWdSessions(ctx context.Context) {
 	active := map[string]bool{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		name, rest, _ := strings.Cut(line, "\t")
-		if !strings.HasSuffix(name, "-wd") {
+		if !isWebdiffSession(name) {
 			continue
 		}
 		createdStr, path, _ := strings.Cut(rest, "\t")
@@ -448,7 +452,7 @@ func handlePaneAttach(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, "look up pane session: "+err.Error(), nil)
 		return
 	}
-	if !strings.HasSuffix(session, "-wd") {
+	if !isWebdiffSession(session) {
 		http.Error(w, "pane is not in a webdiff-managed session", http.StatusForbidden)
 		return
 	}
@@ -701,8 +705,7 @@ func handleWorktreeRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
-	sessName := repoSessionName(ref.abs)
-	if sessionExists(ctx, sessName) {
+	for _, sessName := range checkoutSessionNames(ctx, ref.abs) {
 		// Removing the worktree kills the session and the scrollback with
 		// it; archive it first so the history survives the teardown.
 		snapshotSessionHistory(ctx, sessName)
@@ -711,12 +714,12 @@ func handleWorktreeRemove(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Outside the branch above: the usual order is that the session died on
+	// Outside the loop above: the usual order is that the session died on
 	// its own (leaving its archive flagged live) and only later did the
 	// user remove the worktree. Removing the worktree is unambiguously
 	// deliberate either way, and once the directory is gone there's nothing
 	// left to resume into.
-	clearSessionLive(sessName)
+	clearCheckoutSessionsLive(ref.abs)
 
 	// `git worktree remove` needs to run from inside the parent repo, not
 	// the worktree itself (the worktree's git common dir tells us where).
@@ -959,7 +962,7 @@ func webdiffSessionForPane(ctx context.Context, paneID string) (name string, sta
 	if err != nil {
 		return "", http.StatusBadGateway, "look up pane session: " + err.Error()
 	}
-	if !strings.HasSuffix(name, "-wd") {
+	if !isWebdiffSession(name) {
 		return "", http.StatusForbidden, "session is not webdiff-managed"
 	}
 	return name, 0, ""
@@ -1079,10 +1082,18 @@ func handleCommentsSend(w http.ResponseWriter, r *http.Request) {
 	}
 	prompt := formatPrompt(repoPath, req.Comments)
 
+	n := req.N
+	if n == 0 {
+		n = 1
+	}
+	if n < 1 || n > maxCheckoutSessions {
+		http.Error(w, "bad session number", http.StatusBadRequest)
+		return
+	}
 	// No agent id: sending comments only spawns when the session has
 	// died, and there's no reviewer choice attached to a send. That
 	// respawn gets the default agent.
-	pane, err := ensureRepoSession(ctx, repoPath, "", "")
+	pane, err := ensureAgentSession(ctx, repoPath, n, "", "")
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, err.Error(), nil)
 		return
@@ -1373,12 +1384,13 @@ func streamDelta(old, new []string) (drop, keep int, appendLines []string) {
 	return bestDrop, bestKeep, new[bestKeep:]
 }
 
-// ensureRepoSession returns the agent pane in the session dedicated to
-// repoPath, creating both session and agent process on first call. The
-// session is named `<slug>-wd` so it's easy to spot in a session list
-// and won't collide with the user's own sessions. An existing session
-// can be in Rex or, if it started before webdiff moved to Rex, in tmux.
-// New sessions start in Rex unless rexSpawn is off.
+// ensureAgentSession returns the agent pane in session n of repoPath,
+// creating both session and agent process on first call. The session is
+// named `<slug>-wd` (or `<slug>-wd<n>` for n > 1, see
+// checkoutSessionName) so it's easy to spot in a session list and won't
+// collide with the user's own sessions. An existing session can be in
+// Rex or, if it started before webdiff moved to Rex, in tmux. New
+// sessions start in Rex unless rexSpawn is off.
 //
 // agentID selects which agent to spawn (see resolveAgent); it only
 // matters on the creating call, since an existing session is already
@@ -1387,8 +1399,8 @@ func streamDelta(old, new []string) (drop, keep int, appendLines []string) {
 // A new Pi agent gets a session ID that webdiff chooses, and webdiff
 // records the ID in the history metadata (see pi_session.go). If
 // piSession is set, Pi continues that session, and agentID is ignored.
-func ensureRepoSession(ctx context.Context, repoPath, agentID, piSession string) (Pane, error) {
-	name := repoSessionName(repoPath)
+func ensureAgentSession(ctx context.Context, repoPath string, n int, agentID, piSession string) (Pane, error) {
+	name := checkoutSessionName(repoPath, n)
 	recordRepoSession(name, repoPath)
 	if s, ok := rexc.sessionByLabel(name); ok {
 		return Pane{ID: rexPaneID(s.ID, s.Agent), Label: name}, nil
@@ -1414,7 +1426,7 @@ func ensureRepoSession(ctx context.Context, repoPath, agentID, piSession string)
 	}
 	var pane Pane
 	if rexSpawn {
-		s, err := rexc.createAgentSession(ctx, name, sessionLabel(wantName, repoPath), repoPath, wantName, wantName, wantCmd)
+		s, err := rexc.createAgentSession(ctx, name, sessionLabel(wantName, repoPath, n), repoPath, wantName, wantName, wantCmd)
 		if err != nil {
 			return Pane{}, err
 		}
@@ -1432,7 +1444,7 @@ func ensureRepoSession(ctx context.Context, repoPath, agentID, piSession string)
 	return pane, nil
 }
 
-// ensureTmuxSession is ensureRepoSession for tmux. When the session
+// ensureTmuxSession is ensureAgentSession for tmux. When the session
 // already exists it looks up its initial pane (window 0, pane 0):
 // webdiff always puts the agent there, and ignoring later splits the
 // user might have made keeps the behaviour predictable.
@@ -1520,8 +1532,8 @@ func ensureTmuxSession(ctx context.Context, name, repoPath, wantName, wantCmd st
 	return Pane{}, fmt.Errorf("%s didn't start within 15 s", wantName)
 }
 
-// handleStartSession ensures the ref's webdiff-<base> tmux session
-// exists, then 303-redirects to /stream<refUrl>. Mounted at /agent/
+// handleStartSession ensures an agent session of the ref exists, then
+// 303-redirects to /stream<refUrl>. Mounted at /agent/
 // as a prefix handler so the URL suffix is the ref's diff URL path
 // (/repos/<name>/ or /worktrees/<name>/), mirroring /stream/. The
 // diff page's agent header button uses this so a single button works
@@ -1531,6 +1543,11 @@ func ensureTmuxSession(ctx context.Context, name, repoPath, wantName, wantCmd st
 // `?agent=<id>` picks which agent to spawn, and is echoed onto the
 // redirect so a reload of the stream page still shows which one is
 // running.
+//
+// `?n=<n>` selects session n of the ref (see agent_sessions.go), and
+// `?new=1` starts a session with the lowest number that is not running.
+// Without either, the handler uses session 1. `?resume=<id>` uses the
+// number of the archived session.
 func handleStartSession(w http.ResponseWriter, r *http.Request) {
 	repoURL := strings.TrimPrefix(r.URL.Path, "/agent")
 	ref, ok := resolveRepoRef(repoURL)
@@ -1538,55 +1555,70 @@ func handleStartSession(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	agentID := r.URL.Query().Get("agent")
+	q := r.URL.Query()
+	agentID := q.Get("agent")
+	n, ok := sessionNumberParam(q)
+	if !ok {
+		http.Error(w, "bad session number", http.StatusBadRequest)
+		return
+	}
 	var piSession string
-	if histID := r.URL.Query().Get("resume"); histID != "" {
+	if histID := q.Get("resume"); histID != "" {
 		var status int
 		var msg string
-		piSession, status, msg = resumablePiSession(histID, ref)
+		piSession, n, status, msg = resumablePiSession(histID, ref)
 		if status != 0 {
 			http.Error(w, msg, status)
 			return
 		}
 		agentID = piAgentName
+	} else if q.Get("new") != "" {
+		free, release, err := reserveFreeSession(r.Context(), ref.abs)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		defer release()
+		n = free
 	}
-	if _, err := ensureRepoSession(r.Context(), ref.abs, agentID, piSession); err != nil {
+	if _, err := ensureAgentSession(r.Context(), ref.abs, n, agentID, piSession); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	http.Redirect(w, r, "/stream"+ref.url+agentQuery(agentID), http.StatusSeeOther)
+	http.Redirect(w, r, "/stream"+ref.url+sessionQuery(n, agentID), http.StatusSeeOther)
 }
 
 // resumablePiSession returns the Pi session recorded for the history
-// instance histID, which must belong to ref. A non-zero status is an
-// HTTP error code with a matching message.
-func resumablePiSession(histID string, ref repoRef) (piSession string, status int, msg string) {
+// instance histID, which must belong to ref, and the number of the
+// session that it ran in. A non-zero status is an HTTP error code with
+// a matching message.
+func resumablePiSession(histID string, ref repoRef) (piSession string, n, status int, msg string) {
 	if !historyIDRE.MatchString(histID) {
-		return "", http.StatusBadRequest, "bad history id"
+		return "", 0, http.StatusBadRequest, "bad history id"
 	}
 	m, ok := readHistoryMeta(histID)
 	if !ok {
-		return "", http.StatusNotFound, "unknown history entry"
+		return "", 0, http.StatusNotFound, "unknown history entry"
 	}
 	if !piSessionIDRE.MatchString(m.PiSession) {
-		return "", http.StatusConflict, "history entry has no pi session to resume"
+		return "", 0, http.StatusConflict, "history entry has no pi session to resume"
 	}
 	if m.Kind != ref.kind || m.Name != ref.name {
-		return "", http.StatusBadRequest, "history entry belongs to another repo"
+		return "", 0, http.StatusBadRequest, "history entry belongs to another repo"
 	}
-	return m.PiSession, 0, ""
+	return m.PiSession, sessionNumber(m.Session), 0, ""
 }
 
 // repoStreamPane returns the pane id, session label and running agent
-// id for the repo's webdiff session if it already exists. Returns
+// id for session n of the repo if it already exists. Returns
 // zero values when the session hasn't been spawned yet (the diff page
 // hides the stream link in that case — readers don't need a "stream"
 // link before there's anything to stream). Failures past existence (the
 // display lookup erroring out) are also reported as not-running so a
 // transient tmux hiccup just removes the link rather than breaking page
 // render.
-func repoStreamPane(ctx context.Context, repoPath string) (paneID, label, agentID string) {
-	name := repoSessionName(repoPath)
+func repoStreamPane(ctx context.Context, repoPath string, n int) (paneID, label, agentID string) {
+	name := checkoutSessionName(repoPath, n)
 	if s, ok := rexc.sessionByLabel(name); ok {
 		return rexPaneID(s.ID, s.Agent), name, agentFromLabel(s.AgentLabel)
 	}
@@ -1603,7 +1635,7 @@ func repoStreamPane(ctx context.Context, repoPath string) (paneID, label, agentI
 
 // agentFromStartCommand extracts the agent id from a pane's
 // pane_start_command, which for a webdiff-spawned pane is the
-// `bash -lc <cmd>` wrapper ensureRepoSession used. Returns "" when the
+// `bash -lc <cmd>` wrapper ensureAgentSession used. Returns "" when the
 // command names something we don't recognise — a user's own pane, or a
 // session left over from a differently configured -agent flag — so
 // callers fall back to the default rather than showing a bogus label.
@@ -1625,7 +1657,8 @@ func agentFromStartCommand(start string) string {
 	return ""
 }
 
-// repoSessionName derives the tmux session name for a repo path. The
+// repoSessionName derives the name of session 1 of a repo path (see
+// checkoutSessionName for the other sessions). The
 // slug gives something readable in `tmux list-sessions` and the `-wd`
 // suffix scopes it to this tool without burying the repo name at the
 // end of a long prefix. Characters tmux disallows in session names
@@ -1636,7 +1669,7 @@ func repoSessionName(repoPath string) string {
 		base = "default"
 	}
 	base = strings.NewReplacer(".", "-", ":", "-", " ", "-").Replace(base)
-	return base + "-wd"
+	return base + webdiffSessionSuffix
 }
 
 // writeJSONError writes a uniform JSON error body with optional extra

@@ -92,8 +92,14 @@ func TestResumablePiSession(t *testing.T) {
 	noPi := historyID(2000, "foo-wd")
 	writeHistoryMeta(noPi, "foo-wd", 2000)
 
-	if got, status, msg := resumablePiSession(withPi, ref); got != pi || status != 0 {
-		t.Errorf("resumablePiSession = %q, %d %q", got, status, msg)
+	if got, n, status, msg := resumablePiSession(withPi, ref); got != pi || n != 1 || status != 0 {
+		t.Errorf("resumablePiSession = %q, %d, %d %q", got, n, status, msg)
+	}
+	// An archive of session 2 resumes in session 2.
+	second := historyID(1500, "foo-wd2")
+	setHistoryPiSession(second, "foo-wd2", 1500, pi)
+	if got, n, status, msg := resumablePiSession(second, ref); got != pi || n != 2 || status != 0 {
+		t.Errorf("resumablePiSession(session 2) = %q, %d, %d %q", got, n, status, msg)
 	}
 	for _, tc := range []struct {
 		id     string
@@ -105,7 +111,7 @@ func TestResumablePiSession(t *testing.T) {
 		{noPi, ref, http.StatusConflict},
 		{withPi, repoRef{kind: "repos", name: "bar"}, http.StatusBadRequest},
 	} {
-		if got, status, _ := resumablePiSession(tc.id, tc.ref); got != "" || status != tc.status {
+		if got, _, status, _ := resumablePiSession(tc.id, tc.ref); got != "" || status != tc.status {
 			t.Errorf("resumablePiSession(%q, %+v) = %q, %d; want status %d", tc.id, tc.ref, got, status, tc.status)
 		}
 	}

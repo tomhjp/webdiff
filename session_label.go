@@ -5,14 +5,23 @@ import (
 	"log"
 )
 
-// sessionLabel returns the label of an agent session: the agent name,
-// then its working directory from ~, for example
-// "pi · ~/ai/wt/corp/safer-ciguestlet-shutdown". The home page shows the
-// label on the agent row, and the Rex apps show it as the label of the
-// agent window. Rex gets the label when the session starts, and again
-// when a worktree rename moves the directory.
-func sessionLabel(agent, dir string) string {
+// sessionLabel returns the label of agent session n of a checkout: the
+// agent name, then its working directory from ~, for example
+// "pi · ~/ai/wt/corp/safer-ciguestlet-shutdown". For n > 1 the agent
+// name has the session tag after it, for example "pi #2 · ~/ai/webdiff",
+// so the sessions of one checkout have different labels. The home page
+// shows the label on the agent row, and the Rex apps show it as the
+// label of the agent window. Rex gets the label when the session starts,
+// and again when a worktree rename moves the directory.
+func sessionLabel(agent, dir string, n int) string {
 	dir = tildePath(dir)
+	if tag := sessionTag(n); tag != "" {
+		if agent == "" {
+			agent = tag
+		} else {
+			agent += " " + tag
+		}
+	}
 	switch {
 	case agent == "":
 		return dir
@@ -33,7 +42,8 @@ func relabelAgentWindow(ctx context.Context, session, dir string) {
 	if !ok {
 		return
 	}
-	if err := rexc.setAgentWindowLabel(ctx, s, sessionLabel(agentFromLabel(s.AgentLabel), dir)); err != nil {
+	label := sessionLabel(agentFromLabel(s.AgentLabel), dir, sessionNumber(session))
+	if err := rexc.setAgentWindowLabel(ctx, s, label); err != nil {
 		log.Printf("rex window label %s: %v", session, err)
 	}
 }

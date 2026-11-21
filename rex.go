@@ -454,7 +454,7 @@ func (c *rexClient) syncSession(ctx context.Context, sessionID string) {
 		c.mu.Unlock()
 		// A webdiff session whose agent exited is left with no blocks.
 		// tmux ends such a session, so do the same.
-		if s != nil && len(blocks.Blocks) == 0 && strings.HasSuffix(s.Label, "-wd") {
+		if s != nil && len(blocks.Blocks) == 0 && isWebdiffSession(s.Label) {
 			_ = c.call(ctx, "session.destroy", map[string]string{"session_id": sessionID}, nil)
 		}
 		return

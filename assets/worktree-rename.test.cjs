@@ -8,7 +8,7 @@ const start = app.indexOf('  function setupWorktreeRename(){');
 const end = app.indexOf('  function setupWorktreeRemove(){', start);
 const script = app.slice(start, end) + '\nsetupWorktreeRename();';
 
-function view({stream = false, branch = 'tomhjp/new', ok = true, button = true} = {}) {
+function view({stream = false, branch = 'tomhjp/new', ok = true, button = true, sessionN = ''} = {}) {
   const btn = {
     dataset: {name: 'repo-old', branch: 'tomhjp/old'},
     addEventListener(event, fn) { this[event] = fn; },
@@ -18,7 +18,10 @@ function view({stream = false, branch = 'tomhjp/new', ok = true, button = true} 
   const location = {href: 'http://localhost/worktrees/repo-old/?context=full', search: '?context=full'};
   vm.runInNewContext(script, {
     URL, location, streamRoot: stream ? {} : null,
-    document: {getElementById() { return button ? btn : null; }},
+    document: {getElementById(id) {
+      if (id === 'restart-session') return sessionN ? {dataset: {sessionN}} : null;
+      return button ? btn : null;
+    }},
     window: {prompt() { return branch; }, alert(message) { alerts.push(message); }},
     fetch(url, options) {
       requests.push({url, options});
@@ -45,6 +48,12 @@ test('pane rename returns to the renamed stream', async () => {
   const page = view({stream: true});
   await click(page);
   assert.equal(page.location.href, 'http://localhost/stream/worktrees/repo-new/');
+});
+
+test('pane rename keeps the agent session number', async () => {
+  const page = view({stream: true, sessionN: '2'});
+  await click(page);
+  assert.equal(page.location.href, 'http://localhost/stream/worktrees/repo-new/?n=2');
 });
 
 test('cancel and empty names do not send requests', async () => {

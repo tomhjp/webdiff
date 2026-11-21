@@ -165,14 +165,19 @@ func TestWorktreeRenameLiveSession(t *testing.T) {
 			}
 			ctx := context.Background()
 			oldSession := repoSessionName(wt)
-			out, err := tmuxOut(ctx, "new-session", "-d", "-s", oldSession, "-c", wt, "sleep 300")
-			if err != nil {
-				t.Fatalf("start isolated tmux: %v: %s", err, out)
+			// A second agent session of the worktree is renamed too.
+			oldSecond := checkoutSessionName(wt, 2)
+			for _, name := range []string{oldSession, oldSecond} {
+				out, err := tmuxOut(ctx, "new-session", "-d", "-s", name, "-c", wt, "sleep 300")
+				if err != nil {
+					t.Fatalf("start isolated tmux: %v: %s", err, out)
+				}
 			}
+			newPath := filepath.Join(filepath.Dir(wt), worktreeLeaf(branch))
 			t.Cleanup(func() {
 				_, _ = tmuxOut(ctx, "kill-server")
 				wdSessionsMu.Lock()
-				for _, session := range []string{oldSession, repoSessionName(filepath.Join(filepath.Dir(wt), worktreeLeaf(branch)))} {
+				for _, session := range []string{oldSession, oldSecond, repoSessionName(newPath), checkoutSessionName(newPath, 2)} {
 					delete(wdSessionRepo, session)
 					delete(wdSpinning, session)
 					delete(wdLastRaw, session)
@@ -185,6 +190,10 @@ func TestWorktreeRenameLiveSession(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			secondPane, err := tmuxOut(ctx, "display-message", "-p", "-t", "="+oldSecond, "#{pane_id}")
+			if err != nil {
+				t.Fatal(err)
+			}
 			w := requestWorktreeRename(worktreeSlug(wt), branch)
 			if w.Code != http.StatusOK {
 				t.Fatalf("rename: %d: %s", w.Code, w.Body.String())
@@ -194,6 +203,11 @@ func TestWorktreeRenameLiveSession(t *testing.T) {
 			got, err := tmuxOut(ctx, "display-message", "-p", "-t", "="+newSession, "#{pane_id}")
 			if err != nil || got != pane {
 				t.Fatalf("pane changed: %q, want %q: %v", got, pane, err)
+			}
+			newSecond := checkoutSessionName(path, 2)
+			got, err = tmuxOut(ctx, "display-message", "-p", "-t", "="+newSecond, "#{pane_id}")
+			if err != nil || got != secondPane {
+				t.Fatalf("second pane changed: %q, want %q: %v", got, secondPane, err)
 			}
 			wdSessionsMu.RLock()
 			ref := wdSessionRepo[newSession]
@@ -327,6 +341,7 @@ func TestStreamPageRestartCanStop(t *testing.T) {
 		want    bool
 	}{
 		{"repo-source-wd", true},
+		{"repo-source-wd2", true},
 		{"other", false},
 	} {
 		t.Run(tc.session, func(t *testing.T) {
@@ -383,5 +398,34 @@ func TestStreamPageTitleRow(t *testing.T) {
 	}
 	if !strings.Contains(want.String(), `<span class="title-short">repo</span>`) {
 		t.Fatalf("title row does not name the parent repo: %s", want.String())
+	}
+}
+
+// The stream page of session n > 1 keeps n in its diff link and its
+// restart button, so both go to the same session again.
+func TestStreamPageSessionNumber(t *testing.T) {
+	renameTestWorktree(t)
+	for _, tc := range []struct {
+		session  string
+		diffHref string
+		n        string
+		tag      bool
+	}{
+		{"repo-source-wd", `href="/worktrees/repo-source/">diff</a>`, `data-session-n="1"`, false},
+		{"repo-source-wd2", `href="/worktrees/repo-source/?n=2">diff</a>`, `data-session-n="2"`, true},
+	} {
+		t.Run(tc.session, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeStreamPage(w, "%0", "/worktrees/repo-source/", "pane", tc.session, "")
+			body := w.Body.String()
+			for _, want := range []string{tc.diffHref, tc.n, `href="/agent/worktrees/repo-source/?new=1"`} {
+				if !strings.Contains(body, want) {
+					t.Errorf("stream page does not contain %s", want)
+				}
+			}
+			if got := strings.Contains(body, `class="session-tag"`); got != tc.tag {
+				t.Errorf("session tag shown = %v, want %v", got, tc.tag)
+			}
+		})
 	}
 }

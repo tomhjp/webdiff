@@ -153,20 +153,6 @@ func writeAgentSelect(b *strings.Builder, id, selected string) {
 	b.WriteString(`</select>`)
 }
 
-// agentQuery returns the "?agent=<id>" suffix for a non-default agent.
-// This is not added to general navigation links. It is a choice for the session
-// about to be spawned, carried only far enough that a reload of the
-// stream page still shows which agent is running.
-func agentQuery(id string) string {
-	if id == "" || id == agentName {
-		return ""
-	}
-	if _, ok := knownAgents[id]; !ok {
-		return ""
-	}
-	return "?agent=" + url.QueryEscape(id)
-}
-
 // sshHost is how the machine running the _browser_ reaches this one over
 // SSH, for the hand-off links writeOpenButtons emits. The MagicDNS name is
 // only a guess at that — it's wrong as soon as the user's ~/.ssh/config
@@ -800,25 +786,20 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 
 	// Each live or stopped session shows under the repo or worktree it
 	// belongs to. The sessions section shows only the sessions that are
-	// left. The map holds a list for each session name, so a checkout
-	// can show more than one session.
+	// left. The map holds a list for each checkout, keyed by the name of
+	// its session 1 (see sessionGroupKey), so a checkout can show all of
+	// its sessions.
 	sessions := homeSessions(r.Context(), time.Now())
 	bySession := make(map[string][]homeSession, len(sessions))
 	for _, s := range sessions {
-		bySession[s.Session] = append(bySession[s.Session], s)
+		key := sessionGroupKey(s.Session)
+		bySession[key] = append(bySession[key], s)
 	}
-	// A row below its checkout names its agent and directory, the same
-	// label that the Rex apps show (see sessionLabel).
 	takeSessions := func(target repostats.Target) []homeSession {
 		name := repoSessionName(target.Path)
 		rows := bySession[name]
 		delete(bySession, name)
-		for i := range rows {
-			if !rows[i].Stopped {
-				rows[i].Desc = sessionLabel(rows[i].Agent, target.Path)
-			}
-		}
-		return rows
+		return checkoutSessionRows(rows, target.Path)
 	}
 
 	// Repos that are developed on main come first. The other repos
@@ -873,7 +854,7 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	// Keep the order from homeSessions for the sessions that are left.
 	var other []homeSession
 	for _, s := range sessions {
-		if _, ok := bySession[s.Session]; ok {
+		if _, ok := bySession[sessionGroupKey(s.Session)]; ok {
 			other = append(other, s)
 		}
 	}
@@ -886,6 +867,35 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writePage(w, body.String())
+}
+
+// checkoutSessionRows prepares the session rows that show below the
+// checkout at dir. A live row names its agent and directory, the same
+// label that the Rex apps show (see sessionLabel). A stopped row of a
+// session other than session 1 shows its session tag. The live sessions
+// come first, in the order of their session numbers, then the stopped
+// sessions in the same order.
+func checkoutSessionRows(rows []homeSession, dir string) []homeSession {
+	for i := range rows {
+		n := sessionNumber(rows[i].Session)
+		if rows[i].Stopped {
+			if tag := sessionTag(n); tag != "" {
+				rows[i].Desc += " " + tag
+			}
+		} else {
+			rows[i].Desc = sessionLabel(rows[i].Agent, dir, n)
+		}
+	}
+	slices.SortStableFunc(rows, func(a, b homeSession) int {
+		if a.Stopped != b.Stopped {
+			if a.Stopped {
+				return 1
+			}
+			return -1
+		}
+		return sessionNumber(a.Session) - sessionNumber(b.Session)
+	})
+	return rows
 }
 
 // sortByAgentActivity puts the targets with the most recent agent
@@ -939,28 +949,21 @@ func writeDirGroup(b *strings.Builder, target repostats.Target, label string, se
 // worktrees, and the daily pull (see pull.go) keeps the repo on its main
 // branch. The agent page of the repo links to its diff and file views.
 //
-// "+ agent" goes to /agent, which starts a session. A repo has only one
-// session for now, so the button shows only when that session is not
-// running. When it runs, its own row links to it.
+// "+ agent" goes to /agent with ?new=1, which starts a new session with
+// the lowest free session number. Thus it starts session 1 if no session
+// runs, and another session if one or more run. Each session has its own
+// row, which links to it.
 func writeRepoActionsGroup(b *strings.Builder, target repostats.Target, sessions []homeSession) {
 	formID := "wt-create-" + string(target.Kind) + "-" + target.Name
-	live := false
-	for _, s := range sessions {
-		if !s.Stopped {
-			live = true
-		}
-	}
 	b.WriteString(`<div class="dir-group"><div class="dir-row-wrap">`)
 	b.WriteString(`<div class="dir-row repo-row repo-head"><span class="dir-name">`)
 	writeTitle(b, target.Name, target.Path)
 	b.WriteString(`</span></div><span class="repo-actions">`)
 	fmt.Fprintf(b, `<button class="toggle add-comment-btn" type="button" data-wt-form="%s" title="create a worktree of %s">+ worktree</button>`,
 		template.HTMLEscapeString(formID), template.HTMLEscapeString(target.Name))
-	if !live {
-		fmt.Fprintf(b, `<a class="toggle add-comment-btn" href="%s" title="start a %s session in %s">+ agent</a>`,
-			template.HTMLEscapeString("/agent/"+string(target.Kind)+"/"+target.Name+"/"),
-			template.HTMLEscapeString(agentName), template.HTMLEscapeString(target.Name))
-	}
+	fmt.Fprintf(b, `<a class="toggle add-comment-btn" href="%s" title="start a new %s session in %s">+ agent</a>`,
+		template.HTMLEscapeString(newAgentURL("/"+string(target.Kind)+"/"+target.Name+"/", "")),
+		template.HTMLEscapeString(agentName), template.HTMLEscapeString(target.Name))
 	b.WriteString(`</span>`)
 	writeOpenButtons(b, target.Path, "dir-open")
 	writeCopyButton(b, target.Path, "dir-copy")
@@ -1059,6 +1062,14 @@ func writeCopyButton(b *strings.Builder, dir, cls string) {
 // must also write the other.
 func writeWorktreeNewButton(b *strings.Builder) {
 	b.WriteString(`<button class="toggle add-comment-btn" type="button" id="wt-new-btn" title="create a worktree from this checkout">+ worktree</button>`)
+}
+
+// writeNewAgentButton emits the "+ agent" link, which starts a new agent
+// session in the checkout at refURL, beside the sessions that already
+// run there. The new session runs agent.
+func writeNewAgentButton(b *strings.Builder, refURL, agent string) {
+	fmt.Fprintf(b, `<a class="toggle add-comment-btn" id="new-agent-btn" href="%s" title="start a new %s session in this checkout">+ agent</a>`,
+		template.HTMLEscapeString(newAgentURL(refURL, agent)), template.HTMLEscapeString(agent))
 }
 
 // writeWorktreeCreateRow emits the worktree create form. It is hidden
@@ -1589,9 +1600,18 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// the same place. The dashed-border "to-be-created" treatment (via
 	// add-comment-btn) signals the click will spend ~5 s spawning a new
 	// pane rather than instantly attaching to a live one. Both URLs are
-	// path-based: each repo maps 1-1 to its tmux session, so neither
-	// side needs to thread a paneID through the URL.
-	paneID, _, liveAgent := repoStreamPane(r.Context(), repo)
+	// path-based: the ref and the session number select the session,
+	// so neither side needs to thread a paneID through the URL.
+	//
+	// `?n=<n>` selects which agent session of the checkout the button
+	// and the comments go to (see agent_sessions.go). The stream page's
+	// diff link sets it for sessions other than session 1.
+	sessionN, ok := sessionNumberParam(r.URL.Query())
+	if !ok {
+		http.Error(w, "bad session number", http.StatusBadRequest)
+		return
+	}
+	paneID, _, liveAgent := repoStreamPane(r.Context(), repo, sessionN)
 
 	// Which agent this page's copy names. A running session wins — it's
 	// a fact, not a preference — otherwise it's the `?agent=` the spawn
@@ -1604,13 +1624,19 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 
 	var agentHref, agentClass, agentTitle string
 	if paneID != "" {
-		agentHref = "/stream" + urlPath
+		agentHref = "/stream" + urlPath + sessionQuery(sessionN, "")
 		agentClass = "toggle"
 		agentTitle = "open the running " + pageAgent + " session for this repo"
 	} else {
-		agentHref = "/agent" + urlPath + agentQuery(pageAgent)
+		agentHref = "/agent" + urlPath + sessionQuery(sessionN, pageAgent)
 		agentClass = "toggle add-comment-btn"
 		agentTitle = "start a " + pageAgent + " session for this repo"
+	}
+	// agentLabel tells the sessions of the checkout apart, for example
+	// "pi #2".
+	agentLabel := pageAgent
+	if tag := sessionTag(sessionN); tag != "" {
+		agentLabel += " " + tag
 	}
 
 	var stats string
@@ -1653,7 +1679,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	body.WriteString(`<div class="header-buttons">`)
 	body.WriteString(`<a class="toggle" href="/">home</a>`)
 	fmt.Fprintf(&body, `<a class="%s" id="agent-btn" href="%s" title="%s">%s</a>`,
-		agentClass, template.HTMLEscapeString(agentHref), template.HTMLEscapeString(agentTitle), template.HTMLEscapeString(pageAgent))
+		agentClass, template.HTMLEscapeString(agentHref), template.HTMLEscapeString(agentTitle), template.HTMLEscapeString(agentLabel))
 	// The picker only makes sense before a session exists: once one is
 	// running the button just attaches to it, and switching agents is
 	// the restart modal's job. app.js rewrites #agent-btn's href on
@@ -1666,6 +1692,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	body.WriteString(`<button class="toggle" type="button" id="diff-more-toggle" aria-expanded="false" aria-controls="diff-more-menu">more &#x25be;</button>`)
 	body.WriteString(`<div class="diff-more-menu" id="diff-more-menu" hidden>`)
 	writeWorktreeNewButton(&body)
+	writeNewAgentButton(&body, urlPath, pageAgent)
 	fmt.Fprintf(&body, `<a class="toggle" href="/file/%s/%s/" title="browse repo files">files</a>`,
 		ref.kind, template.HTMLEscapeString(ref.name))
 	if ref.kind == "worktrees" {
@@ -1721,7 +1748,8 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// floating bottom-right chip just opens the modal; the modal's
 	// footer button does the actual send and is the one that
 	// disables/enables based on comment count.
-	fmt.Fprintf(&body, `<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments">send to %s (<span class="send-count">0</span>)</button></div>`, template.HTMLEscapeString(pageAgent))
+	fmt.Fprintf(&body, `<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments" data-session-n="%d">send to %s (<span class="send-count">0</span>)</button></div>`,
+		sessionN, template.HTMLEscapeString(agentLabel))
 
 	if resetErr != nil {
 		fmt.Fprintf(&body, `<p class="selection-reset">The selected changes cannot be shown, so all changes are shown. %s</p>`,
@@ -1887,17 +1915,19 @@ func gzipMiddleware(next http.Handler) http.Handler {
 }
 
 // paneRepoURL derives the diff page URL from a tmux session label of
-// the form "<slug>-wd" or "<slug>-wd:<window>" by searching every
-// managed ref for the one whose repoSessionName matches (which also
-// handles names containing "." or ":"). Returns "" when the label
-// doesn't resolve to anything webdiff is currently managing.
+// the form "<slug>-wd" or "<slug>-wd:<window>" (or the same with a
+// session number after "-wd") by searching every managed ref for the
+// one whose repoSessionName matches (which also handles names
+// containing "." or ":"). Returns "" when the label doesn't resolve to
+// anything webdiff is currently managing.
 func paneRepoURL(label string) string {
 	session := strings.SplitN(label, ":", 2)[0]
-	if !strings.HasSuffix(session, "-wd") {
+	primary, _, ok := parseSessionName(session)
+	if !ok {
 		return ""
 	}
 	for _, ref := range allManagedRefs() {
-		if repoSessionName(ref.abs) == session {
+		if repoSessionName(ref.abs) == primary {
 			return ref.url
 		}
 	}
@@ -1907,9 +1937,10 @@ func paneRepoURL(label string) string {
 // renderRepoStreamPage renders the live tail of the tmux pane paired
 // with one repo or worktree. Mounted at /stream/ as a prefix handler
 // so the URL suffix is the diff URL (/repos/<name>/ or
-// /worktrees/<name>/) — each ref maps 1-1 to its `<base>-wd` tmux
-// session, so the server resolves the paneID from the ref instead of
-// accepting it as a query param. If the session hasn't been spawned
+// /worktrees/<name>/) — the ref and the `?n=` session number (see
+// agent_sessions.go) select the session, so the server resolves the
+// paneID from them instead of accepting it as a query param. If the
+// session hasn't been spawned
 // yet the request 303-redirects to /agent<refUrl>, which spawns it
 // and bounces back here.
 //
@@ -1925,9 +1956,14 @@ func renderRepoStreamPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	paneID, session, liveAgent := repoStreamPane(r.Context(), ref.abs)
+	n, ok := sessionNumberParam(r.URL.Query())
+	if !ok {
+		http.Error(w, "bad session number", http.StatusBadRequest)
+		return
+	}
+	paneID, session, liveAgent := repoStreamPane(r.Context(), ref.abs, n)
 	if paneID == "" {
-		http.Redirect(w, r, "/agent"+ref.url+agentQuery(r.URL.Query().Get("agent")), http.StatusSeeOther)
+		http.Redirect(w, r, "/agent"+ref.url+sessionQuery(n, r.URL.Query().Get("agent")), http.StatusSeeOther)
 		return
 	}
 	// What's in the pane is the truth; `?agent=` is only a fallback for
@@ -1988,6 +2024,14 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 	if liveAgent != "" {
 		agentSession = session
 	}
+	// managed is true for a webdiff session. The links to the diff page
+	// and to a restarted session keep its session number n.
+	managed := isWebdiffSession(session)
+	sessionN := sessionNumber(session)
+	diffURL := repoURL
+	if repoURL != "" && managed {
+		diffURL += sessionQuery(sessionN, "")
+	}
 	var body strings.Builder
 	body.WriteString(`<div class="page-heading">`)
 	// A checkout gets the same first row as the diff page. A pane that
@@ -2002,7 +2046,10 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 	body.WriteString(`<div class="header-buttons">`)
 	body.WriteString(`<a class="toggle" href="/">home</a>`)
 	if repoURL != "" {
-		fmt.Fprintf(&body, `<a class="toggle" href="%s">diff</a>`, template.HTMLEscapeString(repoURL))
+		fmt.Fprintf(&body, `<a class="toggle" href="%s">diff</a>`, template.HTMLEscapeString(diffURL))
+	}
+	if tag := sessionTag(sessionN); managed && tag != "" {
+		fmt.Fprintf(&body, `<span class="session-tag" title="agent session %d of this checkout">%s</span>`, sessionN, tag)
 	}
 	// Same open and "+ worktree" buttons as the diff page, so the two
 	// pages have the same buttons at the top left.
@@ -2014,6 +2061,7 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		body.WriteString(`<button class="toggle" type="button" id="diff-more-toggle" aria-expanded="false" aria-controls="diff-more-menu">more &#x25be;</button>`)
 		body.WriteString(`<div class="diff-more-menu" id="diff-more-menu" hidden>`)
 		writeWorktreeNewButton(&body)
+		writeNewAgentButton(&body, ref.url, pageAgent)
 		if worktreeName != "" {
 			writeWorktreeRenameButton(&body, worktreeName, dir)
 		}
@@ -2040,16 +2088,20 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		// data-can-stop tells the modal to show a "stop session" button.
 		// It is the only stop control on narrow screens, where
 		// #stop-session is hidden.
+		//
+		// data-session-n is the session number, so the restart starts
+		// the same session of the checkout again.
 		canStop := ""
-		if strings.HasSuffix(session, "-wd") {
+		if managed {
 			canStop = ` data-can-stop="1"`
 		}
-		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="restart-session" data-repo-url="%s" data-agent-id="%s" data-agent-choices="%s"%s>restart session</button>`,
+		fmt.Fprintf(&body, `<button class="toggle danger" type="button" id="restart-session" data-repo-url="%s" data-session-n="%d" data-agent-id="%s" data-agent-choices="%s"%s>restart session</button>`,
 			template.HTMLEscapeString(repoURL),
+			sessionN,
 			template.HTMLEscapeString(pageAgent),
 			template.HTMLEscapeString(strings.Join(agentChoices(), ",")), canStop)
 	}
-	if strings.HasSuffix(session, "-wd") {
+	if managed {
 		// Stop only needs a webdiff-managed session, not a repo URL: the
 		// client goes to the home page after the kill. The server does the
 		// same `-wd` check, so this only hides a button that would fail.

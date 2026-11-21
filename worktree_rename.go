@@ -89,10 +89,22 @@ func renameWorktree(ctx context.Context, ref repoRef, branch string) (string, in
 	if branch != oldBranch && exec.Command("git", "-C", ref.abs, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil {
 		return fail(http.StatusConflict, "branch already exists")
 	}
-	oldSession, newSession := repoSessionName(ref.abs), repoSessionName(newPath)
-	live := sessionExists(ctx, oldSession)
-	if oldSession != newSession && sessionExists(ctx, newSession) {
-		return fail(http.StatusConflict, "agent session already exists")
+	// Every running agent session of the worktree gets the name for the
+	// new path, with the same session number.
+	type sessionRename struct {
+		old, new string
+	}
+	var sessions []sessionRename
+	for _, name := range checkoutSessionNames(ctx, ref.abs) {
+		sessions = append(sessions, sessionRename{
+			old: name,
+			new: checkoutSessionName(newPath, sessionNumber(name)),
+		})
+	}
+	for _, s := range sessions {
+		if s.old != s.new && sessionExists(ctx, s.new) {
+			return fail(http.StatusConflict, "agent session already exists")
+		}
 	}
 	git := func(dir string, args ...string) error {
 		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
@@ -101,8 +113,10 @@ func renameWorktree(ctx context.Context, ref repoRef, branch string) (string, in
 		}
 		return nil
 	}
-	if live && oldSession != newSession {
-		snapshotSessionHistory(ctx, oldSession)
+	for _, s := range sessions {
+		if s.old != s.new {
+			snapshotSessionHistory(ctx, s.old)
+		}
 	}
 	if branch != oldBranch {
 		if err := git(ref.abs, "branch", "-m", branch); err != nil {
@@ -122,28 +136,40 @@ func renameWorktree(ctx context.Context, ref repoRef, branch string) (string, in
 			return fail(http.StatusBadGateway, rollbackBranch(ref.abs, err).Error())
 		}
 	}
-	if live && oldSession != newSession {
-		if err := renameSession(ctx, oldSession, newSession); err != nil {
+	for i, s := range sessions {
+		if s.old == s.new {
+			continue
+		}
+		if err := renameSession(ctx, s.old, s.new); err != nil {
+			// Give the sessions that have the new name their old name
+			// again, then move the worktree back.
+			for _, done := range sessions[:i] {
+				if done.old != done.new {
+					_ = renameSession(ctx, done.new, done.old)
+				}
+			}
 			if moveErr := git(newPath, "worktree", "move", newPath, ref.abs); moveErr != nil {
 				return fail(http.StatusBadGateway, fmt.Sprintf("rename session: %v; rollback move failed: %v", err, moveErr))
 			}
 			return fail(http.StatusBadGateway, rollbackBranch(ref.abs, err).Error())
 		}
-		clearSessionLive(oldSession)
-		wdSessionsMu.Lock()
-		wdSpinning[newSession] = wdSpinning[oldSession]
-		wdLastRaw[newSession] = wdLastRaw[oldSession]
-		wdLastChange[newSession] = wdLastChange[oldSession]
-		delete(wdSpinning, oldSession)
-		delete(wdLastRaw, oldSession)
-		delete(wdLastChange, oldSession)
-		delete(wdSessionRepo, oldSession)
-		wdSessionsMu.Unlock()
 	}
-	if live {
-		recordRepoSession(newSession, newPath)
+	for _, s := range sessions {
+		if s.old != s.new {
+			clearSessionLive(s.old)
+			wdSessionsMu.Lock()
+			wdSpinning[s.new] = wdSpinning[s.old]
+			wdLastRaw[s.new] = wdLastRaw[s.old]
+			wdLastChange[s.new] = wdLastChange[s.old]
+			delete(wdSpinning, s.old)
+			delete(wdLastRaw, s.old)
+			delete(wdLastChange, s.old)
+			delete(wdSessionRepo, s.old)
+			wdSessionsMu.Unlock()
+		}
+		recordRepoSession(s.new, newPath)
 		if newPath != ref.abs {
-			relabelAgentWindow(ctx, newSession, newPath)
+			relabelAgentWindow(ctx, s.new, newPath)
 		}
 	}
 	if indexCache != nil {

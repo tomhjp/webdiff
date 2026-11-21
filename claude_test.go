@@ -178,18 +178,24 @@ func TestAgentChoicesIncludesConfiguredDefault(t *testing.T) {
 	}
 }
 
-func TestAgentQuery(t *testing.T) {
+func TestSessionQuery(t *testing.T) {
 	agentName, agentCmd = "claude", "claude"
 
-	cases := []struct{ id, want string }{
-		{"pi", "?agent=pi"},
-		{"claude", ""},
-		{"", ""},
-		{"bogus", ""},
+	cases := []struct {
+		n    int
+		id   string
+		want string
+	}{
+		{1, "pi", "?agent=pi"},
+		{1, "claude", ""},
+		{1, "", ""},
+		{1, "bogus", ""},
+		{2, "", "?n=2"},
+		{3, "pi", "?agent=pi&n=3"},
 	}
 	for _, tc := range cases {
-		if got := agentQuery(tc.id); got != tc.want {
-			t.Errorf("agentQuery(%q) = %q, want %q", tc.id, got, tc.want)
+		if got := sessionQuery(tc.n, tc.id); got != tc.want {
+			t.Errorf("sessionQuery(%d, %q) = %q, want %q", tc.n, tc.id, got, tc.want)
 		}
 	}
 }

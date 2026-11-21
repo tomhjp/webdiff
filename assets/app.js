@@ -121,8 +121,13 @@
         if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
         return r.json();
       }).then(function(data){
+        // The diff page keeps its query, which has the selection. The
+        // stream page keeps the number n of its agent session.
         var url=new URL((streamRoot?'/stream':'')+data.url,location.href);
         if(!streamRoot)url.search=location.search;
+        var restart=document.getElementById('restart-session');
+        var n=restart&&restart.dataset.sessionN;
+        if(streamRoot&&n&&n!=='1')url.searchParams.set('n',n);
         location.href=url.href;
       }).catch(function(e){
         btn.disabled=false;
@@ -731,7 +736,13 @@
                 body:JSON.stringify({paneID:paneID})
               }).then(function(r){
                 if(!r.ok)return r.text().then(function(t){throw new Error(t||r.statusText)});
-                window.location.href='/agent'+repoURL+(agent?'?agent='+encodeURIComponent(agent):'');
+                // Start the same session of the checkout again: keep
+                // its number n.
+                var u=new URL('/agent'+repoURL,location.href);
+                var n=restartBtn.dataset.sessionN;
+                if(n&&n!=='1')u.searchParams.set('n',n);
+                if(agent)u.searchParams.set('agent',agent);
+                window.location.href=u.pathname+u.search;
               }).catch(function(e){
                 done(new Error('restart failed: '+e.message));
               });
@@ -887,13 +898,13 @@
   var resumeBtn=document.getElementById('history-resume-btn');
   if(resumeBtn){
     resumeBtn.addEventListener('click',function(){
-      var repoURL=resumeBtn.dataset.repoUrl||'/';
+      var agentURL=resumeBtn.dataset.agentUrl||'/';
       showHistoryModal({
         title:'resume session',
         note:'A fresh '+AGENT_NAME+' session will be started for this repo — copy this URL to give it the previous session’s history:',
         confirmLabel:'start '+AGENT_NAME,
         historyURL:resumeBtn.dataset.historyUrl||'',
-        onConfirm:function(){window.location.href='/agent'+repoURL}
+        onConfirm:function(){window.location.href=agentURL}
       });
     });
   }
@@ -1359,6 +1370,9 @@
   var COMMENT_KEY='webdiff:comments:'+REPO_PATH;
   var sendBtn=document.getElementById('send-comments');
   var sendCount=sendBtn&&sendBtn.querySelector('.send-count');
+  // SESSION_N is the number of the agent session of this checkout that
+  // gets the comments. The page URL selects it with ?n=.
+  var SESSION_N=(sendBtn&&parseInt(sendBtn.dataset.sessionN,10))||1;
 
   function loadComments(){try{return JSON.parse(localStorage.getItem(COMMENT_KEY)||'[]')}catch(e){return []}}
   function saveComments(arr){try{localStorage.setItem(COMMENT_KEY,JSON.stringify(arr))}catch(e){}}
@@ -1654,7 +1668,7 @@
     return fetch('/api/comments/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({repo:REPO_PATH,comments:loadComments()})
+      body:JSON.stringify({repo:REPO_PATH,n:SESSION_N,comments:loadComments()})
     }).then(function(r){return r.json().then(function(j){return {status:r.status,body:j}})});
   }
 
@@ -1664,12 +1678,12 @@
         clearComments();
         document.querySelectorAll('.comment-bubble').forEach(function(b){b.remove()});
         refreshSendBtn();
-        // Each ref maps 1-1 to its tmux pane, so the stream URL is
-        // just /stream<refPath> — no paneID or label to thread
+        // The stream URL is /stream<refPath>, with ?n= for an agent
+        // session other than session 1 — no paneID or label to thread
         // through.
         var path=window.location.pathname;
         if(path.slice(-1)!=='/')path+='/';
-        window.location.href='/stream'+path;
+        window.location.href='/stream'+path+(SESSION_N>1?'?n='+SESSION_N:'');
         return;
       }
       flashStatus(res.body.error||('error '+res.status),'err');
