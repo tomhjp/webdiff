@@ -974,7 +974,14 @@
       }catch(e){}
     }
     var selectionURL=new URL(location.href);
-    if(selectionURL.searchParams.has('changes')){
+    if(diffPicker.dataset.reset){
+      // The server could not show the selection in the URL, so it
+      // shows all changes. Forget the selection. Do not load the page
+      // again: it already shows all changes.
+      try{localStorage.removeItem(selectionKey)}catch(e){}
+      selectionURL.searchParams.delete('changes');
+      if(!selectionURL.searchParams.has('mode'))history.replaceState(history.state,'',selectionURL.toString());
+    }else if(selectionURL.searchParams.has('changes')){
       saveSelection();
     }else{
       var excluded=[];

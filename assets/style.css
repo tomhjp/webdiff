@@ -248,6 +248,9 @@ a { color: var(--accent) }
 .session-stopped .dir-name { color: var(--muted) }
 .session-stopped .dir-branch { color: var(--muted) }
 .empty { color: var(--muted); padding: 16px }
+/* The selection in the URL could not be shown, so the page shows all
+   changes. The git error can be long, so it wraps. */
+.selection-reset { color: var(--color-3); padding: 8px 16px; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap }
 
 /* Repo/worktree rows read "repo … <stats> <branch>". The repo path is
    the flexible cell: it absorbs the slack (pushing stats+branch to the

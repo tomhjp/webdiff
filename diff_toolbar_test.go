@@ -67,3 +67,60 @@ func TestDiffToolbar(t *testing.T) {
 		})
 	}
 }
+
+// TestDiffSelectionReset checks that the diff page shows all changes
+// when it cannot show the selection in the URL.
+func TestDiffSelectionReset(t *testing.T) {
+	_, wt := renameTestWorktree(t)
+	selectionWrite(t, wt, "a", "a\n")
+	selectionGit(t, wt, "add", "a")
+	selectionGit(t, wt, "commit", "-qm", "add a")
+	first := selectionGit(t, wt, "rev-parse", "HEAD")
+	selectionWrite(t, wt, "f", "one\n")
+	selectionGit(t, wt, "add", "f")
+	selectionGit(t, wt, "commit", "-qm", "add f")
+	// The working tree needs the second commit.
+	selectionWrite(t, wt, "f", "two\n")
+	ref, ok := resolveRepoRef("/worktrees/repo-source/")
+	if !ok {
+		t.Fatal("cannot resolve worktree")
+	}
+	for _, tc := range []struct {
+		name  string
+		query string
+		reset string
+	}{
+		{"dependent", "?changes=working," + first, "prerequisite"},
+		{"stale", "?changes=" + strings.Repeat("0", 40), "no longer on this branch"},
+		{"empty", "?changes=", ""},
+		{"all", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			renderRepo(w, httptest.NewRequest(http.MethodGet, ref.url+tc.query, nil), ref)
+			if w.Code != http.StatusOK {
+				t.Fatalf("render: %d: %s", w.Code, w.Body)
+			}
+			html := w.Body.String()
+			marked := strings.Contains(html, `id="diff-picker" data-reset="1"`)
+			notice := strings.Contains(html, `class="selection-reset"`)
+			if tc.reset == "" {
+				if marked || notice {
+					t.Fatal("reset a selection that works")
+				}
+				return
+			}
+			if !marked || !notice || !strings.Contains(html, tc.reset) {
+				t.Fatalf("selection was not reset with the error %q", tc.reset)
+			}
+			for _, file := range []string{"a", "f"} {
+				if !strings.Contains(html, `href="#file-`+file+`"`) {
+					t.Errorf("all changes do not include %s", file)
+				}
+			}
+			if !strings.Contains(html, `value="working" checked`) || !strings.Contains(html, `value="`+first+`" checked`) {
+				t.Error("picker does not select all changes")
+			}
+		})
+	}
+}

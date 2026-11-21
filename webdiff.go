@@ -1540,11 +1540,6 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		http.Error(w, "list branch commits: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	selected, err := selectedChanges(r.URL.Query(), commits)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 
 	// `context=full` switches git diff to -U<MAX> so each file diff shows
 	// the entire file with hunks inlined. Per-view toggle, not threaded
@@ -1552,8 +1547,29 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// navigating somewhere else.
 	fullContext := r.URL.Query().Get("context") == "full"
 
-	env, base, working, cleanup, selectionErr := selectionIndex(r.Context(), repo, commits, selected)
-	defer cleanup()
+	// A selection from the URL can stop working: a commit can leave the
+	// branch, or the working tree can come to need a commit that is not
+	// selected. Then show all changes, and tell why. resetErr is the
+	// error of the selection from the URL.
+	var (
+		env          []string
+		base         string
+		working      = true
+		cleanup      = func() {}
+		resetErr     error
+		selectionErr error
+	)
+	selected, selectionErr := selectedChanges(r.URL.Query(), commits)
+	if selectionErr == nil {
+		env, base, working, cleanup, selectionErr = selectionIndex(r.Context(), repo, commits, selected)
+	}
+	if selectionErr != nil && r.URL.Query().Has("changes") {
+		cleanup()
+		resetErr = selectionErr
+		selected = allChanges(commits)
+		env, base, working, cleanup, selectionErr = selectionIndex(r.Context(), repo, commits, selected)
+	}
+	defer func() { cleanup() }()
 	var files []string
 	if selectionErr == nil {
 		files = changedFiles(env, repo, base)
@@ -1672,7 +1688,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// narrow screens. app.js changes the icon and the title.
 	body.WriteString(`<div class="diff-right">`)
 	body.WriteString(`<div class="header-buttons diff-primary">`)
-	writeDiffPicker(&body, commits, selected, working)
+	writeDiffPicker(&body, commits, selected, working, resetErr != nil)
 	if len(files) > 0 {
 		body.WriteString(`<button class="toggle icon-btn" type="button" id="toggle-all" title="expand all" aria-label="expand all"><svg class="icon" aria-hidden="true"><use href="#icon-expand-all"/></svg></button>`)
 	}
@@ -1706,6 +1722,11 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// footer button does the actual send and is the one that
 	// disables/enables based on comment count.
 	fmt.Fprintf(&body, `<div class="send-bar"><button class="toggle send-btn" type="button" id="send-comments">send to %s (<span class="send-count">0</span>)</button></div>`, template.HTMLEscapeString(pageAgent))
+
+	if resetErr != nil {
+		fmt.Fprintf(&body, `<p class="selection-reset">The selected changes cannot be shown, so all changes are shown. %s</p>`,
+			template.HTMLEscapeString(resetErr.Error()))
+	}
 
 	if len(files) == 0 {
 		msg := "No changes selected, or the selected changes are empty."

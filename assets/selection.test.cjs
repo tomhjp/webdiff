@@ -8,9 +8,9 @@ const start = app.indexOf('  // Store exclusions per checkout.');
 const end = app.indexOf('  // Agent picker', start);
 const script = '(function(){' + app.slice(start, end) + '})()';
 
-function picker(url, storage = new Map(), values = ['working', 'abc', 'def']) {
+function picker(url, storage = new Map(), values = ['working', 'abc', 'def'], reset = false) {
   const parsed = new URL(url);
-  const explicit = parsed.searchParams.get('changes');
+  const explicit = reset ? null : parsed.searchParams.get('changes');
   const choices = values.map(value => ({value, checked: explicit === null || explicit.split(',').includes(value)}));
   const elements = new Map();
   function element(id) {
@@ -20,12 +20,14 @@ function picker(url, storage = new Map(), values = ['working', 'abc', 'def']) {
       querySelectorAll() { return choices; },
       setAttribute() {},
       contains() { return false; },
+      dataset: id === 'diff-picker' && reset ? {reset: '1'} : {},
     });
     return elements.get(id);
   }
   const location = {href: url, pathname: parsed.pathname, replace(url) { this.replaced = url; }};
+  const history = {state: null, replaceState(state, title, url) { location.href = url; this.replaced = url; }};
   vm.runInNewContext(script, {
-    URL, location,
+    URL, location, history,
     localStorage: {
       getItem(key) { return storage.get(key) ?? null; },
       setItem(key, value) { storage.set(key, value); },
@@ -34,7 +36,7 @@ function picker(url, storage = new Map(), values = ['working', 'abc', 'def']) {
     document: {getElementById: element, body: {appendChild() {}}, addEventListener() {}},
     window: {addEventListener() {}},
   });
-  return {location, choices, click(id) { element(id).click(); }};
+  return {location, history, choices, click(id) { element(id).click(); }};
 }
 
 const url = 'http://localhost/worktrees/repo-feature/';
@@ -86,4 +88,13 @@ test('invalid or unavailable storage does not prevent navigation', () => {
   view.click('diff-picker-none');
   view.click('diff-picker-apply');
   assert.equal(view.location.href, url + '?changes=');
+});
+
+test('a selection that the server reset is forgotten without a reload', () => {
+  const storage = new Map([['webdiff:changes:/worktrees/repo-feature/', '["def"]']]);
+  const view = picker(url + '?changes=working,abc&context=full', storage, undefined, true);
+  assert.equal(storage.size, 0);
+  assert.equal(view.history.replaced, url + '?context=full');
+  assert.equal(view.location.replaced, undefined);
+  assert.equal(picker(url, storage).location.replaced, undefined);
 });

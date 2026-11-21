@@ -40,19 +40,25 @@ func branchCommits(ctx context.Context, repo string) ([]branchCommit, error) {
 	return commits, nil
 }
 
+// allChanges selects all commits and the working tree. This is the
+// selection when the URL has no changes parameter.
+func allChanges(commits []branchCommit) map[string]bool {
+	selected := map[string]bool{"working": true}
+	for _, commit := range commits {
+		selected[commit.SHA] = true
+	}
+	return selected
+}
+
 func selectedChanges(q url.Values, commits []branchCommit) (map[string]bool, error) {
+	if !q.Has("changes") {
+		return allChanges(commits), nil
+	}
 	selected := make(map[string]bool)
-	if q.Has("changes") {
-		for _, value := range strings.Split(q.Get("changes"), ",") {
-			if value != "" {
-				selected[value] = true
-			}
+	for _, value := range strings.Split(q.Get("changes"), ",") {
+		if value != "" {
+			selected[value] = true
 		}
-	} else {
-		for _, commit := range commits {
-			selected[commit.SHA] = true
-		}
-		selected["working"] = true
 	}
 	valid := map[string]bool{"working": true}
 	for _, commit := range commits {
@@ -199,12 +205,21 @@ func selectionIndex(ctx context.Context, repo string, commits []branchCommit, se
 // writeDiffPicker writes the "changes" menu. working tells if the
 // working tree has changes. When it has none, the working tree choice
 // is disabled and the count does not include it.
-func writeDiffPicker(body *strings.Builder, commits []branchCommit, selected map[string]bool, working bool) {
+//
+// reset tells that the selection in the URL could not be shown, and
+// that the page shows all changes instead. Then app.js removes the
+// saved selection and the changes parameter.
+func writeDiffPicker(body *strings.Builder, commits []branchCommit, selected map[string]bool, working, reset bool) {
 	count := len(selected)
 	if selected["working"] && !working {
 		count--
 	}
-	fmt.Fprintf(body, `<div class="diff-picker" id="diff-picker"><button class="toggle" type="button" id="diff-picker-toggle" aria-expanded="false" aria-controls="diff-picker-menu">changes (%d)</button><div class="diff-picker-menu" id="diff-picker-menu" hidden>`, count)
+	resetAttr := ""
+	if reset {
+		resetAttr = ` data-reset="1"`
+	}
+	fmt.Fprintf(body, `<div class="diff-picker" id="diff-picker"%s>`, resetAttr)
+	fmt.Fprintf(body, `<button class="toggle" type="button" id="diff-picker-toggle" aria-expanded="false" aria-controls="diff-picker-menu">changes (%d)</button><div class="diff-picker-menu" id="diff-picker-menu" hidden>`, count)
 	writeChoice := func(value, label string, enabled bool) {
 		attrs := ""
 		if selected[value] && enabled {

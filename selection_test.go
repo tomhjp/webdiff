@@ -176,7 +176,7 @@ func TestDiffPickerEscapesSubjects(t *testing.T) {
 		Subject: "<script>alert(1)</script>",
 	}}, map[string]bool{
 		sha: true,
-	}, true)
+	}, true, false)
 	if strings.Contains(body.String(), "<script>") || !strings.Contains(body.String(), "&lt;script&gt;") || !strings.Contains(body.String(), `value="`+sha+`" checked`) {
 		t.Fatalf("unsafe or incorrect picker: %s", body.String())
 	}
@@ -315,7 +315,7 @@ func TestDiffPickerCleanWorkingTree(t *testing.T) {
 		{false, "changes (1)", `value="working" disabled>`},
 	} {
 		var body strings.Builder
-		writeDiffPicker(&body, commits, selected, tc.working)
+		writeDiffPicker(&body, commits, selected, tc.working, false)
 		html := body.String()
 		if !strings.Contains(html, tc.count) || !strings.Contains(html, tc.input) {
 			t.Errorf("working %v: picker = %s", tc.working, html)
