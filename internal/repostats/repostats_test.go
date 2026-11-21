@@ -152,6 +152,41 @@ func TestAllChangesSummaryIncludesBranchAndWorkingTree(t *testing.T) {
 	}
 }
 
+// A repo with "master" and no "main" uses "master" as the diff base.
+func TestAllChangesSummaryUsesMaster(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-q", "-b", "master")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	runGit(t, repo, "commit", "--allow-empty", "-qm", "initial")
+	runGit(t, repo, "checkout", "-qb", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "file"), []byte("one\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "file")
+	runGit(t, repo, "commit", "-qm", "file")
+	m, err := New(Config{}, gitindex.New(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	got, err := m.calculate(context.Background(), Target{
+		Kind: Repo,
+		Name: "repo",
+		Path: repo,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Summary{
+		Files: 1,
+		Ins:   1,
+	}
+	if got.AllChanges != want {
+		t.Fatalf("all changes = %+v, want %+v", got.AllChanges, want)
+	}
+}
+
 // Watch gives a channel that closes when an edit changes the stats, and
 // the next Watch returns the new stats. No Current call is necessary.
 func TestManagerWatch(t *testing.T) {

@@ -313,24 +313,8 @@ func (m *Manager) calculate(ctx context.Context, t Target) (Target, error) {
 		return t, err
 	}
 	base := "HEAD"
-	var refs []string
-	if remotes, e := output("remote"); e == nil {
-		rs := strings.Fields(remotes)
-		remote := ""
-		for _, r := range rs {
-			if r == "origin" {
-				remote = r
-				break
-			}
-		}
-		if remote == "" && len(rs) == 1 {
-			remote = rs[0]
-		}
-		if remote != "" {
-			refs = append(refs, remote+"/main")
-		}
-	}
-	refs = append(refs, "origin/main", "main")
+	remote, _ := DefaultRemote(t.Path)
+	refs := MainRefs(remote)
 	for _, ref := range refs {
 		if b, e := output("merge-base", "HEAD", ref); e == nil && b != "" {
 			base = b
@@ -575,4 +559,58 @@ func (m *Manager) reconcile() error {
 		m.mu.Unlock()
 	}
 	return nil
+}
+
+// DefaultRemote returns the name of the remote to fetch from. It prefers
+// "origin" when present. Else it uses the remote that the local "main"
+// or "master" branch tracks (gvisor has the remotes "upstream" and
+// "gobranch"), else the sole remote when exactly one is configured
+// (repos like tailscale name their only remote "ro"). Returns ("", false)
+// when there's no unambiguous choice.
+func DefaultRemote(repo string) (string, bool) {
+	out, err := exec.Command("git", "-C", repo, "remote").Output()
+	if err != nil {
+		return "", false
+	}
+	remotes := strings.Fields(strings.TrimSpace(string(out)))
+	for _, r := range remotes {
+		if r == "origin" {
+			return "origin", true
+		}
+	}
+	for _, name := range MainBranchNames {
+		out, err := exec.Command("git", "-C", repo, "config", "--get", "branch."+name+".remote").Output()
+		if r := strings.TrimSpace(string(out)); err == nil && slices.Contains(remotes, r) {
+			return r, true
+		}
+	}
+	if len(remotes) == 1 {
+		return remotes[0], true
+	}
+	return "", false
+}
+
+// MainBranchNames are the supported names of the main branch, in order
+// of preference. Other names are not supported.
+var MainBranchNames = []string{"main", "master"}
+
+// MainRefs returns the refs that can be the main branch of a repo, in
+// order of preference. The refs of the remote come before the local
+// branches, because a local branch is often stale.
+func MainRefs(remote string) []string {
+	var prefixes []string
+	if remote != "" {
+		prefixes = append(prefixes, "refs/remotes/"+remote+"/")
+	}
+	if remote != "origin" {
+		prefixes = append(prefixes, "refs/remotes/origin/")
+	}
+	prefixes = append(prefixes, "refs/heads/")
+	var refs []string
+	for _, prefix := range prefixes {
+		for _, name := range MainBranchNames {
+			refs = append(refs, prefix+name)
+		}
+	}
+	return refs
 }

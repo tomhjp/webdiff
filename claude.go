@@ -532,32 +532,31 @@ func handleTurnEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// defaultRemote returns the name of the remote to fetch from. It prefers
-// "origin" when present, else falls back to the sole remote when exactly
-// one is configured (repos like tailscale name their only remote "ro").
-// Returns ("", false) when there's no unambiguous choice.
+// defaultRemote returns the name of the remote to fetch from. See
+// repostats.DefaultRemote.
 func defaultRemote(repo string) (string, bool) {
-	out, err := exec.Command("git", "-C", repo, "remote").Output()
-	if err != nil {
-		return "", false
-	}
-	remotes := strings.Fields(strings.TrimSpace(string(out)))
-	for _, r := range remotes {
-		if r == "origin" {
-			return "origin", true
+	return repostats.DefaultRemote(repo)
+}
+
+// mainBranch returns the name of the main branch of repo: "main" or
+// "master". It uses the name of the first ref from repostats.MainRefs
+// that exists.
+// It returns "main" when no ref exists.
+func mainBranch(repo, remote string) string {
+	for _, ref := range repostats.MainRefs(remote) {
+		if exec.Command("git", "-C", repo, "rev-parse", "--verify", "--quiet", ref).Run() == nil {
+			return ref[strings.LastIndex(ref, "/")+1:]
 		}
 	}
-	if len(remotes) == 1 {
-		return remotes[0], true
-	}
-	return "", false
+	return "main"
 }
 
 // fetchRemoteMain updates the tracking ref without moving the local main
-// branch. Do not force the update: a rewritten remote must not replace
-// the diff base without an explicit decision.
+// branch (see mainBranch). Do not force the update: a rewritten remote
+// must not replace the diff base without an explicit decision.
 func fetchRemoteMain(repo, remote string) error {
-	ref := "refs/heads/main:refs/remotes/" + remote + "/main"
+	name := mainBranch(repo, remote)
+	ref := "refs/heads/" + name + ":refs/remotes/" + remote + "/" + name
 	out, err := exec.Command("git", "-C", repo, "fetch", remote, ref).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
@@ -570,7 +569,7 @@ func fetchRemoteMain(repo, remote string) error {
 // and reports it under the flattened `<repo>-<leaf>` slug (see
 // worktreeSlug). If the branch already exists locally git just checks it
 // out into the new worktree; otherwise it's created via `-b` from the
-// fetched <remote>/main (when "from main" is set), the current HEAD, or
+// fetched <remote>/main or <remote>/master (when "from main" is set), the current HEAD, or
 // <remote>/<branch> if the branch already exists on the remote. The
 // remote is resolved via defaultRemote rather than hardcoding "origin".
 func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
@@ -655,10 +654,10 @@ func handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 	} else if remoteExists {
 		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath, remoteBranch)
 	} else if req.FromMain {
-		base := "main"
+		base := mainBranch(ref.abs, remote)
 		if hasRemote {
-			if exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/remotes/"+remote+"/main").Run() == nil {
-				base = "refs/remotes/" + remote + "/main"
+			if exec.Command("git", "-C", ref.abs, "rev-parse", "--verify", "refs/remotes/"+remote+"/"+base).Run() == nil {
+				base = "refs/remotes/" + remote + "/" + base
 			}
 		}
 		addCmd = exec.Command("git", "-C", ref.abs, "worktree", "add", "-b", req.Branch, wtPath, base)

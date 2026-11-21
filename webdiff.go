@@ -284,24 +284,21 @@ func indexKey(repo string) string {
 	return kind + "-" + worktreeSlug(repo)
 }
 
-// branchBase returns the merge-base SHA between HEAD and the remote's
-// main branch. It prefers <remote>/main (remote resolved via
-// defaultRemote, so repos whose sole remote is "ro" rather than "origin"
-// work) over a local "main" branch, which is often stale relative to the
+// branchBase returns the merge-base SHA between HEAD and the main
+// branch ("main" or "master"). It tries the refs from repostats.MainRefs
+// in order, so <remote>/main (remote resolved via defaultRemote, so
+// repos whose sole remote is "ro" rather than "origin" work) comes
+// before a local "main" branch, which is often stale relative to the
 // remote and would otherwise inflate the diff with hundreds of upstream
 // commits. Falls back to "HEAD" when no candidate resolves, giving the
 // original working-copy-only behaviour.
 func branchBase(repo string) (sha, label string) {
-	var refs []string
-	if remote, ok := defaultRemote(repo); ok {
-		refs = append(refs, remote+"/main")
-	}
-	refs = append(refs, "origin/main", "main")
-	for _, ref := range refs {
+	remote, _ := defaultRemote(repo)
+	for _, ref := range repostats.MainRefs(remote) {
 		out, err := exec.Command("git", "-C", repo, "merge-base", "HEAD", ref).Output()
 		if err == nil {
 			if s := strings.TrimSpace(string(out)); s != "" {
-				return s, "main"
+				return s, ref[strings.LastIndex(ref, "/")+1:]
 			}
 		}
 	}

@@ -75,3 +75,64 @@ func TestFetchRemoteMainWithExistingBranch(t *testing.T) {
 		t.Errorf("origin/main changed after rejected fetch: %s", got)
 	}
 }
+
+// TestMasterBranch checks that a repo whose remote has "master" and no
+// "main" uses "master" as its main branch for the fetch and the diff
+// base. Like the gvisor clone, the repo has no "origin" remote, has two
+// remotes, and has a stale local "main" branch.
+func TestMasterBranch(t *testing.T) {
+	dir := t.TempDir()
+	seed := filepath.Join(dir, "seed")
+	remote := filepath.Join(dir, "remote.git")
+	repo := filepath.Join(dir, "repo")
+	git := func(path string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", path}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git -C %s %s: %v: %s", path, strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if err := os.Mkdir(seed, 0700); err != nil {
+		t.Fatal(err)
+	}
+	git(seed, "init", "-q", "-b", "master")
+	git(seed, "config", "user.name", "Test")
+	git(seed, "config", "user.email", "test@example.com")
+	git(seed, "commit", "-qm", "first", "--allow-empty")
+	first := git(seed, "rev-parse", "HEAD")
+	if out, err := exec.Command("git", "clone", "-q", "--bare", seed, remote).CombinedOutput(); err != nil {
+		t.Fatalf("clone bare: %v: %s", err, out)
+	}
+	if out, err := exec.Command("git", "clone", "-q", "-o", "upstream", remote, repo).CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v: %s", err, out)
+	}
+	git(repo, "remote", "add", "other", remote)
+	git(repo, "config", "user.name", "Test")
+	git(repo, "config", "user.email", "test@example.com")
+	git(repo, "branch", "main")
+	git(repo, "checkout", "-qb", "feature")
+	git(repo, "commit", "-qm", "feature", "--allow-empty")
+
+	if got, ok := defaultRemote(repo); got != "upstream" || !ok {
+		t.Errorf("defaultRemote = %q, %v; want upstream, true", got, ok)
+	}
+	if got := mainBranch(repo, "upstream"); got != "master" {
+		t.Errorf("mainBranch = %q, want master", got)
+	}
+	if sha, label := branchBase(repo); sha != first || label != "master" {
+		t.Errorf("branchBase = %s, %q; want %s, master", sha, label, first)
+	}
+
+	git(seed, "remote", "add", "origin", remote)
+	git(seed, "commit", "-qm", "upstream", "--allow-empty")
+	git(seed, "push", "-q", "origin", "master")
+	upstream := git(seed, "rev-parse", "HEAD")
+	if err := fetchRemoteMain(repo, "upstream"); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(repo, "rev-parse", "upstream/master"); got != upstream {
+		t.Errorf("upstream/master = %s, want %s", got, upstream)
+	}
+}
