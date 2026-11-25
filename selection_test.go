@@ -79,7 +79,7 @@ func TestSelectionCombinations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("mask %d: %v", mask, err)
 		}
-		if !working {
+		if !working.Changed {
 			t.Errorf("mask %d: working tree has changes, but working = false", mask)
 		}
 		got := changedFiles(env, repo, base)
@@ -176,7 +176,9 @@ func TestDiffPickerEscapesSubjects(t *testing.T) {
 		Subject: "<script>alert(1)</script>",
 	}}, map[string]bool{
 		sha: true,
-	}, true, false)
+	}, workingTree{
+		Changed: true,
+	}, false, "/repos/r/", 1, "")
 	if strings.Contains(body.String(), "<script>") || !strings.Contains(body.String(), "&lt;script&gt;") || !strings.Contains(body.String(), `value="`+sha+`" checked`) {
 		t.Fatalf("unsafe or incorrect picker: %s", body.String())
 	}
@@ -204,9 +206,20 @@ func TestSelectedChanges(t *testing.T) {
 			t.Errorf("%s: %v, %v", tc.query, got, err)
 		}
 	}
-	q, _ := url.ParseQuery("changes=HEAD")
-	if _, err := selectedChanges(q, commits); err == nil {
-		t.Fatal("accepted an arbitrary ref")
+	// The commit view selects one commit, also with a changes
+	// parameter.
+	for _, query := range []string{"commit=def", "commit=def&changes=abc"} {
+		q, _ := url.ParseQuery(query)
+		got, err := selectedChanges(q, commits)
+		if want := map[string]bool{"def": true}; err != nil || !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %v, %v", query, got, err)
+		}
+	}
+	for _, query := range []string{"changes=HEAD", "commit=HEAD", "commit=working", "commit="} {
+		q, _ := url.ParseQuery(query)
+		if _, err := selectedChanges(q, commits); err == nil {
+			t.Errorf("%s: accepted an arbitrary ref", query)
+		}
 	}
 }
 
@@ -285,7 +298,7 @@ func TestSelectionWorkingChanged(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if working != want {
+			if working.Changed != want {
 				t.Errorf("selected working %v: working = %v, want %v", withWorking, working, want)
 			}
 		}
@@ -315,10 +328,82 @@ func TestDiffPickerCleanWorkingTree(t *testing.T) {
 		{false, "changes (1)", `value="working" disabled>`},
 	} {
 		var body strings.Builder
-		writeDiffPicker(&body, commits, selected, tc.working, false)
+		writeDiffPicker(&body, commits, selected, workingTree{
+			Changed: tc.working,
+		}, false, "/repos/r/", 1, "")
 		html := body.String()
 		if !strings.Contains(html, tc.count) || !strings.Contains(html, tc.input) {
 			t.Errorf("working %v: picker = %s", tc.working, html)
+		}
+	}
+}
+
+// branchCommits and selectionIndex count the lines that each change adds
+// and removes, and the picker shows the counts.
+func TestChangeLineStats(t *testing.T) {
+	repo := selectionRepo(t)
+	selectionWrite(t, repo, "a", "1\n2\n3\n")
+	selectionGit(t, repo, "add", "a")
+	selectionGit(t, repo, "commit", "-qm", "add a")
+	selectionWrite(t, repo, "a", "1\nx\n")
+	selectionWrite(t, repo, "bin", "\x00\x01")
+	selectionGit(t, repo, "add", "a", "bin")
+	selectionGit(t, repo, "commit", "-qm", "edit a")
+	// A merge counts the lines from its first parent.
+	selectionGit(t, repo, "checkout", "-qb", "side", "main")
+	selectionWrite(t, repo, "side", "s\n")
+	selectionGit(t, repo, "add", "side")
+	selectionGit(t, repo, "commit", "-qm", "side")
+	selectionGit(t, repo, "checkout", "-q", "feature")
+	selectionGit(t, repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+	selectionWrite(t, repo, "untracked", "u\nv\n")
+	selectionWrite(t, repo, "a", "1\n")
+
+	oldCache := indexCache
+	indexCache = gitindex.New(filepath.Join(t.TempDir(), "indexes"))
+	t.Cleanup(func() { indexCache = oldCache })
+	commits, err := branchCommits(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []lineStat
+	for _, commit := range commits {
+		got = append(got, commit.lineStat)
+	}
+	want := []lineStat{
+		{Ins: 3, Del: 0},
+		{Ins: 1, Del: 2},
+		{Ins: 1, Del: 0},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("commit stats = %v, want %v", got, want)
+	}
+	for _, withWorking := range []bool{false, true} {
+		_, _, working, cleanup, err := selectionIndex(context.Background(), repo, commits, map[string]bool{
+			"working": withWorking,
+		})
+		cleanup()
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantWorking := workingTree{
+			Changed:  true,
+			lineStat: lineStat{Ins: 2, Del: 1},
+		}
+		if working != wantWorking {
+			t.Errorf("selected working %v: working = %+v, want %+v", withWorking, working, wantWorking)
+		}
+
+		var body strings.Builder
+		writeDiffPicker(&body, commits, allChanges(commits), working, false, "/repos/r/", 1, "")
+		html := body.String()
+		for _, s := range []string{
+			`working tree</span><span class="diff-picker-stat"><span class="stats-ins" data-stat="+2"></span><span class="stats-del" data-stat="-1"></span></span>`,
+			`add a</a><span class="diff-picker-stat"><span class="stats-ins" data-stat="+3"></span></span>`,
+		} {
+			if !strings.Contains(html, s) {
+				t.Errorf("picker does not contain %s: %s", s, html)
+			}
 		}
 	}
 }

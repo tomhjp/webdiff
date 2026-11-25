@@ -70,8 +70,9 @@ few KB of path data each, which is too much to repeat on every home page row.
 
 ## Selecting changes
 
-The diff page's **changes** menu lists the working tree and first-parent commits
-since the merge base with remote main (or local main when no remote main exists).
+The diff page's **changes** menu lists the first-parent commits since the merge
+base with remote main (or local main when no remote main exists), oldest first,
+and then the working tree.
 A merge commit is one change relative to its first parent. Select any combination,
 then choose **apply**. **All** and **none** select or clear the complete list.
 All changes are selected by default. Picker choices are remembered in this browser
@@ -85,6 +86,13 @@ only selected changes in chronological order, with working-tree changes last.
 Working-tree changes include staged, unstaged, and untracked files. If omitted
 commits are required to apply a selected change, the page reports a conflict;
 select the prerequisite commits to resolve it. The real index is not changed.
+
+The diff page shows the full messages of the selected commits, oldest first, in
+a **commit messages** section before the files. The text of each commit in the
+**changes** menu, and the id of each commit in that section, links to the commit
+view, `?commit=<sha>`. The commit view shows only that commit: its message and
+its diff. It does not change the saved picker choices, and **apply** goes back
+to the normal diff page.
 
 The home page shows totals for all branch and working-tree changes, relative to
 the same merge base as the default diff. It shows these totals only for worktrees

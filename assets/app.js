@@ -984,8 +984,26 @@
         else localStorage.removeItem(selectionKey);
       }catch(e){}
     }
+    function savedExclusions(){
+      try{
+        var saved=JSON.parse(localStorage.getItem(selectionKey)||'[]');
+        if(Array.isArray(saved))return saved;
+      }catch(e){}
+      return [];
+    }
     var selectionURL=new URL(location.href);
-    if(diffPicker.dataset.reset){
+    if(diffPicker.dataset.commit){
+      // The commit view shows one commit and does not change the saved
+      // selection. The menu shows the saved selection, so that apply
+      // goes back to it.
+      var excludedNow=savedExclusions();
+      var checked=0;
+      choices.forEach(function(c){
+        c.checked=excludedNow.indexOf(c.value)===-1;
+        if(c.checked)checked++;
+      });
+      pickerToggle.textContent='changes ('+checked+')';
+    }else if(diffPicker.dataset.reset){
       // The server could not show the selection in the URL, so it
       // shows all changes. Forget the selection. Do not load the page
       // again: it already shows all changes.
@@ -995,11 +1013,7 @@
     }else if(selectionURL.searchParams.has('changes')){
       saveSelection();
     }else{
-      var excluded=[];
-      try{
-        var saved=JSON.parse(localStorage.getItem(selectionKey)||'[]');
-        if(Array.isArray(saved))excluded=saved;
-      }catch(e){}
+      var excluded=savedExclusions();
       var restored=[];
       choices.forEach(function(c){if(excluded.indexOf(c.value)===-1)restored.push(c.value)});
       if(restored.length!==choices.length)selectionURL.searchParams.set('changes',restored.join(','));
@@ -1034,6 +1048,7 @@
       var u=new URL(location.href);
       u.searchParams.delete('mode');
       u.searchParams.delete('context');
+      u.searchParams.delete('commit');
       saveSelection();
       if(selected.length===choices.length)u.searchParams.delete('changes');
       else u.searchParams.set('changes',selected.join(','));

@@ -1626,18 +1626,23 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// selected. Then show all changes, and tell why. resetErr is the
 	// error of the selection from the URL.
 	var (
-		env          []string
-		base         string
-		working      = true
+		env     []string
+		base    string
+		working = workingTree{
+			Changed: true,
+		}
 		cleanup      = func() {}
 		resetErr     error
 		selectionErr error
 	)
+	// viewCommit is the commit of the commit view (?commit=<sha>),
+	// which shows one commit with its message.
+	viewCommit := r.URL.Query().Get("commit")
 	selected, selectionErr := selectedChanges(r.URL.Query(), commits)
 	if selectionErr == nil {
 		env, base, working, cleanup, selectionErr = selectionIndex(r.Context(), repo, commits, selected)
 	}
-	if selectionErr != nil && r.URL.Query().Has("changes") {
+	if selectionErr != nil && viewCommit == "" && r.URL.Query().Has("changes") {
 		cleanup()
 		resetErr = selectionErr
 		selected = allChanges(commits)
@@ -1779,7 +1784,14 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// narrow screens. app.js changes the icon and the title.
 	body.WriteString(`<div class="diff-right">`)
 	body.WriteString(`<div class="header-buttons diff-primary">`)
-	writeDiffPicker(&body, commits, selected, working, resetErr != nil)
+	// The commit view does not change the saved selection, so the
+	// menu does not show the one commit of the view as the selection.
+	// app.js sets the choices from the saved selection.
+	pickerSelected := selected
+	if viewCommit != "" {
+		pickerSelected = allChanges(commits)
+	}
+	writeDiffPicker(&body, commits, pickerSelected, working, resetErr != nil, urlPath, sessionN, viewCommit)
 	if len(files) > 0 {
 		body.WriteString(`<button class="toggle icon-btn" type="button" id="toggle-all" title="expand all" aria-label="expand all"><svg class="icon" aria-hidden="true"><use href="#icon-expand-all"/></svg></button>`)
 	}
@@ -1820,17 +1832,44 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 			template.HTMLEscapeString(resetErr.Error()))
 	}
 
-	if len(files) == 0 {
-		msg := "No changes selected, or the selected changes are empty."
-		if selectionErr != nil {
-			msg = selectionErr.Error()
+	// The messages of the selected commits, oldest first. The commit
+	// view selects one commit, so it shows one message.
+	var msgs []commitMessage
+	if selectionErr == nil {
+		var shas []string
+		for _, commit := range commits {
+			if selected[commit.SHA] {
+				shas = append(shas, commit.SHA)
+			}
 		}
-		fmt.Fprintf(&body, `<p class="empty">%s</p>`, template.HTMLEscapeString(msg))
+		if len(shas) > 0 {
+			var err error
+			msgs, err = readCommitMessages(r.Context(), repo, shas)
+			if err != nil {
+				// The diff is still correct without the messages.
+				fmt.Fprintf(&body, `<p class="selection-reset">Cannot read the commit messages: %s</p>`,
+					template.HTMLEscapeString(err.Error()))
+			}
+		}
+	}
+
+	emptyMsg := "No changes selected, or the selected changes are empty."
+	if len(files) == 0 && len(msgs) == 0 {
+		if selectionErr != nil {
+			emptyMsg = selectionErr.Error()
+		}
+		fmt.Fprintf(&body, `<p class="empty">%s</p>`, template.HTMLEscapeString(emptyMsg))
 		writePageForAgent(w, body.String(), pageAgent)
 		return
 	}
 
+	// app.js matches the pills to the <details> sections by their
+	// order, so the pill of the commit messages is first, as is its
+	// section.
 	body.WriteString(`<nav class="pillbar">`)
+	if len(msgs) > 0 {
+		fmt.Fprintf(&body, `<a class="pill" href="#%s">commits</a>`, commitMessagesID)
+	}
 	for _, file := range files {
 		slug := strings.ReplaceAll(file, "/", "-")
 		slug = strings.ReplaceAll(slug, ".", "-")
@@ -1842,6 +1881,13 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 			template.HTMLEscapeString(slug), template.HTMLEscapeString(name))
 	}
 	body.WriteString(`</nav>`)
+
+	if len(msgs) > 0 {
+		writeCommitMessages(&body, msgs, urlPath, sessionN)
+	}
+	if len(files) == 0 {
+		fmt.Fprintf(&body, `<p class="empty">%s</p>`, template.HTMLEscapeString(emptyMsg))
+	}
 
 	for _, file := range files {
 		canon, raw := fileDiff(env, repo, base, file, cols, fullContext)

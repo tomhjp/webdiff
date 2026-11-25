@@ -9,32 +9,71 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/tomhjp/webdiff/internal/gitindex"
 )
 
+// lineStat counts the lines that a change adds and removes. Binary
+// files do not add to the counts.
+type lineStat struct {
+	Ins int
+	Del int
+}
+
+// addNumstat adds one line of "git diff --numstat" output to s.
+func (s *lineStat) addNumstat(line string) {
+	fields := strings.SplitN(line, "\t", 3)
+	if len(fields) != 3 {
+		return
+	}
+	// Binary files show "-" in place of the counts.
+	if n, err := strconv.Atoi(fields[0]); err == nil {
+		s.Ins += n
+	}
+	if n, err := strconv.Atoi(fields[1]); err == nil {
+		s.Del += n
+	}
+}
+
 type branchCommit struct {
 	SHA     string
 	Subject string
+	lineStat
 }
 
-// branchCommits lists first-parent commits. A merge is one selectable change.
+// workingTree tells about the changes in the working tree from HEAD.
+type workingTree struct {
+	Changed bool
+	lineStat
+}
+
+// branchCommits lists first-parent commits. A merge is one selectable
+// change, and its line counts are from its first parent.
 func branchCommits(ctx context.Context, repo string) ([]branchCommit, error) {
 	base, _ := branchBase(repo)
-	cmd := exec.CommandContext(ctx, "git", "-C", repo, "log", "--first-parent", "--reverse", "--format=%H %s", base+"..HEAD")
+	// Each commit line starts with NUL, so that it is different from
+	// the numstat lines that follow it.
+	cmd := exec.CommandContext(ctx, "git", "-C", repo, "log", "--first-parent", "--diff-merges=first-parent", "--numstat", "--no-ext-diff", "--reverse", "--format=%x00%H %s", base+"..HEAD")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
 	var commits []branchCommit
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		sha, subject, ok := strings.Cut(line, " ")
-		if ok {
-			commits = append(commits, branchCommit{
-				SHA:     sha,
-				Subject: subject,
-			})
+	for _, line := range strings.Split(string(out), "\n") {
+		if header, ok := strings.CutPrefix(line, "\x00"); ok {
+			sha, subject, ok := strings.Cut(header, " ")
+			if ok {
+				commits = append(commits, branchCommit{
+					SHA:     sha,
+					Subject: subject,
+				})
+			}
+			continue
+		}
+		if len(commits) > 0 {
+			commits[len(commits)-1].addNumstat(line)
 		}
 	}
 	return commits, nil
@@ -50,7 +89,22 @@ func allChanges(commits []branchCommit) map[string]bool {
 	return selected
 }
 
+// selectedChanges returns the changes that the URL selects. The commit
+// parameter selects one commit of the branch, for the commit view. Else
+// the changes parameter selects the changes, and no changes parameter
+// selects all changes.
 func selectedChanges(q url.Values, commits []branchCommit) (map[string]bool, error) {
+	if q.Has("commit") {
+		sha := q.Get("commit")
+		for _, commit := range commits {
+			if commit.SHA == sha {
+				return map[string]bool{
+					sha: true,
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("commit %q is not on this branch", sha)
+	}
 	if !q.Has("changes") {
 		return allChanges(commits), nil
 	}
@@ -75,17 +129,18 @@ func selectedChanges(q url.Values, commits []branchCommit) (map[string]bool, err
 // selectionIndex builds one temporary index. No selected combination is cached.
 // The base is the parent of the oldest selected commit, or HEAD for working changes.
 //
-// working tells if the working tree has changes from HEAD. It is true
-// when selectionIndex fails before it can find out, so that the caller
-// continues to show the working tree as a choice.
-func selectionIndex(ctx context.Context, repo string, commits []branchCommit, selected map[string]bool) (env []string, base string, working bool, cleanup func(), err error) {
-	working = true
+// working tells if the working tree has changes from HEAD, and counts
+// their lines. working.Changed is true when selectionIndex fails before
+// it can find out, so that the caller continues to show the working
+// tree as a choice.
+func selectionIndex(ctx context.Context, repo string, commits []branchCommit, selected map[string]bool) (env []string, base string, working workingTree, cleanup func(), err error) {
+	working.Changed = true
 	dir, err := os.MkdirTemp("", "webdiff-selection-")
 	if err != nil {
 		return nil, "", working, func() {}, err
 	}
 	cleanup = func() { os.RemoveAll(dir) }
-	fail := func(e error) ([]string, string, bool, func(), error) {
+	fail := func(e error) ([]string, string, workingTree, func(), error) {
 		cleanup()
 		return nil, "", working, func() {}, e
 	}
@@ -135,23 +190,23 @@ func selectionIndex(ctx context.Context, repo string, commits []branchCommit, se
 		}
 		base = strings.TrimSpace(string(out))
 	}
+	// numstat shows a line for each changed file, also when the change
+	// has no added or removed lines (for example, a mode change).
+	numstat, err := run(warm, nil, "diff", "--cached", "--numstat", "--no-ext-diff", head)
+	if err != nil {
+		return fail(err)
+	}
+	working = workingTree{
+		Changed: len(bytes.TrimSpace(numstat)) > 0,
+	}
+	for _, line := range strings.Split(string(numstat), "\n") {
+		working.addNumstat(line)
+	}
 	var workingPatch []byte
-	if selected["working"] {
+	if selected["working"] && working.Changed {
 		workingPatch, err = run(warm, nil, "diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-color", head)
 		if err != nil {
 			return fail(err)
-		}
-		working = len(workingPatch) > 0
-	} else {
-		// Do not make the full patch when it is not used. --quiet
-		// exits with status 1 when there are changes.
-		cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet", "--no-ext-diff", head)
-		cmd.Dir = repo
-		cmd.Env = warm
-		if err := cmd.Run(); err == nil {
-			working = false
-		} else if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
-			return fail(fmt.Errorf("git diff --cached --quiet: %w", err))
 		}
 	}
 	// Keep new objects temporary, but permit reads from the warm object cache.
@@ -202,25 +257,121 @@ func selectionIndex(ctx context.Context, repo string, commits []branchCommit, se
 	return env, base, working, cleanup, nil
 }
 
+// commitMessage is the id, author, date, and full message of a commit.
+type commitMessage struct {
+	SHA    string
+	Author string
+	Date   string
+	Body   string
+}
+
+// readCommitMessages returns the messages of the commits shas in repo,
+// in the order of shas.
+func readCommitMessages(ctx context.Context, repo string, shas []string) ([]commitMessage, error) {
+	// Each record ends with the record separator 0x1e, and the fields
+	// are separated by NUL. --no-walk=unsorted keeps the order of shas.
+	args := []string{"-C", repo, "log", "--no-walk=unsorted", "--date=format:%Y-%m-%d %H:%M", "--format=%H%x00%an%x00%ad%x00%B%x1e"}
+	args = append(args, shas...)
+	out, err := exec.CommandContext(ctx, "git", args...).Output()
+	if err != nil {
+		return nil, err
+	}
+	var msgs []commitMessage
+	for _, record := range strings.Split(string(out), "\x1e") {
+		record = strings.TrimLeft(record, "\n")
+		if record == "" {
+			continue
+		}
+		fields := strings.SplitN(record, "\x00", 4)
+		if len(fields) != 4 {
+			return nil, fmt.Errorf("git log: bad output")
+		}
+		msgs = append(msgs, commitMessage{
+			SHA:    fields[0],
+			Author: fields[1],
+			Date:   fields[2],
+			Body:   strings.TrimRight(fields[3], "\n"),
+		})
+	}
+	return msgs, nil
+}
+
+// commitMessagesID is the id of the "commit messages" section of the
+// diff page. The pill of the section links to it.
+const commitMessagesID = "commit-messages"
+
+// writeCommitMessages writes the "commit messages" section of the diff
+// page. It has the same form as the section of a file, so that it
+// opens, closes, and has a pill as a file does. It has no data-file,
+// so it does not get review comments. It shows the id, author, date,
+// and full message of each commit in msgs. The id links to the commit
+// view of the commit. refURL and n are the checkout and the session
+// number of the page.
+func writeCommitMessages(body *strings.Builder, msgs []commitMessage, refURL string, n int) {
+	noun := "commits"
+	if len(msgs) == 1 {
+		noun = "commit"
+	}
+	fmt.Fprintf(body, `<details id="%s" open><summary><span class="filename">commit messages</span><span class="filestats"><span class="stats-files">%d %s</span></span></summary><div class="commit-messages">`,
+		commitMessagesID, len(msgs), noun)
+	for _, m := range msgs {
+		body.WriteString(`<div class="commit-view">`)
+		fmt.Fprintf(body, `<div class="commit-meta"><a class="commit-sha" href="%s" title="view commit %s">%s</a><span>%s</span><span>%s</span></div>`,
+			template.HTMLEscapeString(commitViewURL(refURL, n, m.SHA)),
+			template.HTMLEscapeString(m.SHA),
+			template.HTMLEscapeString(m.SHA[:min(12, len(m.SHA))]),
+			template.HTMLEscapeString(m.Author),
+			template.HTMLEscapeString(m.Date))
+		fmt.Fprintf(body, `<pre class="commit-message">%s</pre>`, template.HTMLEscapeString(m.Body))
+		body.WriteString(`</div>`)
+	}
+	body.WriteString(`</div></details>`)
+}
+
+// commitViewURL returns the URL of the commit view of commit sha in the
+// checkout at refURL. The URL keeps session number n, so the comments
+// of the commit view go to the same session.
+func commitViewURL(refURL string, n int, sha string) string {
+	v := url.Values{}
+	if n > 1 {
+		v.Set("n", strconv.Itoa(n))
+	}
+	v.Set("commit", sha)
+	return refURL + "?" + v.Encode()
+}
+
 // writeDiffPicker writes the "changes" menu. working tells if the
 // working tree has changes. When it has none, the working tree choice
 // is disabled and the count does not include it.
 //
+// The choices are in the order of the changes: the oldest commit
+// first, then the newer commits, and the working tree last. The text of
+// each commit is a link to its commit view. refURL and n are the
+// checkout and the session number of the page. current is the commit
+// that the commit view shows, or "".
+//
 // reset tells that the selection in the URL could not be shown, and
 // that the page shows all changes instead. Then app.js removes the
 // saved selection and the changes parameter.
-func writeDiffPicker(body *strings.Builder, commits []branchCommit, selected map[string]bool, working, reset bool) {
+func writeDiffPicker(body *strings.Builder, commits []branchCommit, selected map[string]bool, working workingTree, reset bool, refURL string, n int, current string) {
 	count := len(selected)
-	if selected["working"] && !working {
+	if selected["working"] && !working.Changed {
 		count--
 	}
 	resetAttr := ""
 	if reset {
 		resetAttr = ` data-reset="1"`
 	}
+	// data-commit tells app.js that the page is the commit view. Then
+	// app.js shows the saved selection in the menu, and does not
+	// change the URL.
+	if current != "" {
+		resetAttr += ` data-commit="1"`
+	}
 	fmt.Fprintf(body, `<div class="diff-picker" id="diff-picker"%s>`, resetAttr)
 	fmt.Fprintf(body, `<button class="toggle" type="button" id="diff-picker-toggle" aria-expanded="false" aria-controls="diff-picker-menu">changes (%d)</button><div class="diff-picker-menu" id="diff-picker-menu" hidden>`, count)
-	writeChoice := func(value, label string, enabled bool) {
+	// href is "" for the working tree, which has no commit view.
+	writeChoice := func(value, label, href string, stat lineStat, enabled bool) {
 		attrs := ""
 		if selected[value] && enabled {
 			attrs = " checked"
@@ -232,12 +383,40 @@ func writeDiffPicker(body *strings.Builder, commits []branchCommit, selected map
 			attrs += " disabled"
 			label += " (no changes)"
 		}
-		fmt.Fprintf(body, `<label><input type="checkbox" value="%s"%s> %s</label>`, template.HTMLEscapeString(value), attrs, template.HTMLEscapeString(label))
+		cls := ""
+		if value == current {
+			cls = ` class="diff-picker-current"`
+		}
+		fmt.Fprintf(body, `<label%s><input type="checkbox" value="%s"%s> `, cls, template.HTMLEscapeString(value), attrs)
+		// A click on a link in a <label> follows the link and does
+		// not change the checkbox.
+		if href != "" {
+			fmt.Fprintf(body, `<a class="diff-picker-label" href="%s" title="view this commit">%s</a>`, template.HTMLEscapeString(href), template.HTMLEscapeString(label))
+		} else {
+			fmt.Fprintf(body, `<span class="diff-picker-label">%s</span>`, template.HTMLEscapeString(label))
+		}
+		writeLineStat(body, stat)
+		body.WriteString(`</label>`)
 	}
-	writeChoice("working", "working tree", working)
-	for i := len(commits) - 1; i >= 0; i-- {
-		commit := commits[i]
-		writeChoice(commit.SHA, commit.SHA[:12]+" "+commit.Subject, true)
+	for _, commit := range commits {
+		writeChoice(commit.SHA, commit.SHA[:12]+" "+commit.Subject, commitViewURL(refURL, n, commit.SHA), commit.lineStat, true)
 	}
+	writeChoice("working", "working tree", "", working.lineStat, working.Changed)
 	body.WriteString(`<div class="header-buttons"><button class="toggle" type="button" id="diff-picker-all">all</button><button class="toggle" type="button" id="diff-picker-none">none</button><button class="toggle send-btn" type="button" id="diff-picker-apply">apply</button></div></div></div>`)
+}
+
+// writeLineStat writes the line counts of one change. The counts are in
+// data-stat and not in a text node; see .stats-ins in style.css.
+func writeLineStat(body *strings.Builder, stat lineStat) {
+	if stat.Ins == 0 && stat.Del == 0 {
+		return
+	}
+	body.WriteString(`<span class="diff-picker-stat">`)
+	if stat.Ins > 0 {
+		fmt.Fprintf(body, `<span class="stats-ins" data-stat="+%d"></span>`, stat.Ins)
+	}
+	if stat.Del > 0 {
+		fmt.Fprintf(body, `<span class="stats-del" data-stat="-%d"></span>`, stat.Del)
+	}
+	body.WriteString(`</span>`)
 }

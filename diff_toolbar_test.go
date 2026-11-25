@@ -124,3 +124,111 @@ func TestDiffSelectionReset(t *testing.T) {
 		})
 	}
 }
+
+// The diff page shows the messages of the selected commits, oldest
+// first, in one section before the files. The commit view shows one
+// commit: its message and its changes only.
+func TestDiffCommitMessages(t *testing.T) {
+	_, wt := renameTestWorktree(t)
+	selectionWrite(t, wt, "a", "a\n")
+	selectionGit(t, wt, "add", "a")
+	selectionGit(t, wt, "commit", "-qm", "add a\n\nThe body of <a>.")
+	first := selectionGit(t, wt, "rev-parse", "HEAD")
+	selectionWrite(t, wt, "b", "b\n")
+	selectionGit(t, wt, "add", "b")
+	selectionGit(t, wt, "commit", "-qm", "add b")
+	second := selectionGit(t, wt, "rev-parse", "HEAD")
+	selectionWrite(t, wt, "c", "c\n")
+	ref, ok := resolveRepoRef("/worktrees/repo-source/")
+	if !ok {
+		t.Fatal("cannot resolve worktree")
+	}
+	render := func(t *testing.T, query string) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		renderRepo(w, httptest.NewRequest(http.MethodGet, ref.url+query, nil), ref)
+		if w.Code != http.StatusOK {
+			t.Fatalf("render: %d: %s", w.Code, w.Body)
+		}
+		return w.Body.String()
+	}
+	firstLink := `<a class="commit-sha" href="/worktrees/repo-source/?commit=` + first + `"`
+	secondLink := `<a class="commit-sha" href="/worktrees/repo-source/?commit=` + second + `"`
+	firstBody := `<pre class="commit-message">add a
+
+The body of &lt;a&gt;.</pre>`
+
+	t.Run("all", func(t *testing.T) {
+		html := render(t, "")
+		section := strings.Index(html, `<details id="commit-messages" open>`)
+		if section < 0 {
+			t.Fatal("missing commit messages section")
+		}
+		if f := strings.Index(html, `<details id="file-`); f < section {
+			t.Error("commit messages are not before the files")
+		}
+		if !strings.Contains(html, `<nav class="pillbar"><a class="pill" href="#commit-messages">commits</a>`) {
+			t.Error("commits pill is not first")
+		}
+		if !strings.Contains(html, `<span class="stats-files">2 commits</span>`) {
+			t.Error("wrong commit count")
+		}
+		i1, i2 := strings.Index(html, firstLink), strings.Index(html, secondLink)
+		if i1 < section || i2 < i1 {
+			t.Error("messages are not oldest first")
+		}
+		if !strings.Contains(html, firstBody) {
+			t.Error("missing the full message of the first commit")
+		}
+		// The picker lists the commits oldest first, then the working
+		// tree. The text of each commit links to its commit view.
+		p1 := strings.Index(html, `<a class="diff-picker-label" href="/worktrees/repo-source/?commit=`+first+`" title="view this commit">`+first[:12]+` add a</a>`)
+		p2 := strings.Index(html, `<a class="diff-picker-label" href="/worktrees/repo-source/?commit=`+second+`"`)
+		pw := strings.Index(html, `value="working"`)
+		if p1 < 0 || p2 < p1 || pw < p2 {
+			t.Errorf("picker order is wrong: %d %d %d", p1, p2, pw)
+		}
+	})
+
+	t.Run("working only", func(t *testing.T) {
+		html := render(t, "?changes=working")
+		if strings.Contains(html, `id="commit-messages"`) {
+			t.Error("commit messages without a selected commit")
+		}
+	})
+
+	t.Run("commit view", func(t *testing.T) {
+		html := render(t, "?n=2&commit="+first)
+		if !strings.Contains(html, `id="diff-picker" data-commit="1"`) {
+			t.Error("picker does not know the commit view")
+		}
+		if !strings.Contains(html, `<label class="diff-picker-current"><input type="checkbox" value="`+first+`" checked>`) {
+			t.Error("picker does not mark the commit of the view")
+		}
+		if !strings.Contains(html, firstBody) || strings.Contains(html, secondLink) {
+			t.Error("commit view does not show only its own message")
+		}
+		if !strings.Contains(html, `<span class="stats-files">1 commit</span>`) {
+			t.Error("wrong commit count")
+		}
+		// The links keep the session number.
+		if !strings.Contains(html, `href="/worktrees/repo-source/?commit=`+first+`&amp;n=2"`) {
+			t.Error("commit link does not keep the session number")
+		}
+		for file, want := range map[string]bool{"a": true, "b": false, "c": false} {
+			if got := strings.Contains(html, `href="#file-`+file+`"`); got != want {
+				t.Errorf("file %s shown = %v, want %v", file, got, want)
+			}
+		}
+	})
+
+	t.Run("unknown commit", func(t *testing.T) {
+		html := render(t, "?commit="+strings.Repeat("0", 40))
+		if !strings.Contains(html, "is not on this branch") {
+			t.Error("missing error for a commit that is not on the branch")
+		}
+		if strings.Contains(html, `class="selection-reset"`) {
+			t.Error("commit view reset to all changes")
+		}
+	})
+}
