@@ -108,24 +108,17 @@ func captureScrollback(ctx context.Context, name string) (string, error) {
 	return tmuxOut(ctx, "capture-pane", "-p", "-e", "-S", "-", "-t", name+":0.0")
 }
 
-// capturePaneTail returns about the last lines rows of a pane, with ANSI
-// styles.
-func capturePaneTail(ctx context.Context, paneID string, lines int) (string, error) {
+// capturePane returns the whole screen and scrollback of a pane, with
+// ANSI styles.
+func capturePane(ctx context.Context, paneID string) (string, error) {
 	if sessionID, blockID, ok := parseRexPaneID(paneID); ok {
-		// Rex can only cut its output by bytes. Pi's styled rows run to
-		// a few hundred bytes, so this covers about `lines` rows; the
-		// result is then cut to exactly that.
-		out, err := rexc.formatTail(ctx, sessionID, blockID, "vt", int64(lines)*256)
+		out, err := rexc.formatScreen(ctx, sessionID, blockID, "vt")
 		if err != nil {
 			return "", err
 		}
-		out = normalizeVT(out)
-		if rows := strings.Split(out, "\n"); len(rows) > lines {
-			out = strings.Join(rows[len(rows)-lines:], "\n")
-		}
-		return out, nil
+		return normalizeVT(out), nil
 	}
-	return tmuxOut(ctx, "capture-pane", "-p", "-e", "-S", strconv.Itoa(-lines), "-t", paneID)
+	return tmuxOut(ctx, "capture-pane", "-p", "-e", "-S", "-", "-t", paneID)
 }
 
 // normalizeVT turns Rex's vt rows, which end in CRLF, into the

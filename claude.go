@@ -1190,14 +1190,11 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 	// at a steady ~750 ms cadence so mobile clients don't pay for every
 	// cursor blink. An idle Rex pane costs nothing.
 	//
-	// The capture starts above the visible area, so the reviewer sees
-	// the scrollback the agent has produced too. But a capture of the
-	// whole history costs O(history) on every emit, so cap it at the
-	// most recent streamCaptureLines lines.
+	// The capture includes the whole scrollback, so the reviewer sees
+	// all the output the agent has produced, not only the visible area.
 	const (
 		streamPollInterval    = 250 * time.Millisecond
 		streamEmitMinInterval = 750 * time.Millisecond
-		streamCaptureLines    = 2000
 	)
 	var changes <-chan struct{}
 	var poll <-chan time.Time
@@ -1237,7 +1234,7 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 			return true
 		}
 		dirty = false
-		out, err := capturePaneTail(ctx, paneID, streamCaptureLines)
+		out, err := capturePane(ctx, paneID)
 		if err != nil {
 			send(map[string]string{"error": err.Error()})
 			return false
