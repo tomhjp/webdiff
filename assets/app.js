@@ -165,6 +165,7 @@
     var paneID=root.dataset.paneId;
     var inner=root.querySelector('.term-inner');
     var jumpBtn=document.getElementById('jump-bottom');
+    var paneNav=document.getElementById('pane-nav');
     var favicon=document.getElementById('favicon');
     var agentSession=root.dataset.agentSession;
     var faviconWasSpinning=false;
@@ -203,7 +204,7 @@
       window.scrollTo(0,document.documentElement.scrollHeight);
     }
     function refreshFollowUI(){
-      if(jumpBtn)jumpBtn.hidden=follow;
+      if(paneNav)paneNav.hidden=follow;
     }
     window.addEventListener('scroll',function(){
       follow=nearBottom();
@@ -215,6 +216,132 @@
         scrollToBottom();
         refreshFollowUI();
       });
+    }
+    setupPromptNav();
+    // setupPromptNav connects the previous and next buttons. They go to
+    // the start of each prompt and of each answer, so repeated presses
+    // go from a prompt to its answer, then to the next prompt.
+    //
+    // Pi draws each user prompt as a block of rows with one background
+    // colour, and the first row of the block is blank. Tool calls are
+    // drawn the same way, but the first text of a tool call is bold, and
+    // the first text of a prompt is not. The answer is the first
+    // paragraph after the last tool call of the turn that is not
+    // thinking, which is mostly italic, and not a spinner.
+    function setupPromptNav(){
+      var prevBtn=document.getElementById('nav-prev');
+      var nextBtn=document.getElementById('nav-next');
+      if(!prevBtn||!nextBtn)return;
+      // rowBg returns the background of the first cell of a row, or ''.
+      function rowBg(row){
+        var span=row.querySelector('span');
+        if(!span)return '';
+        var m=/(?:^|\s)(term-bgx?\d+)(?:\s|$)/.exec(span.className);
+        return span.style.backgroundColor||(m?m[1]:'');
+      }
+      function text(el){return el.textContent.replace(/\u00a0/g,' ')}
+      function blank(el){return !text(el).trim()}
+      // textSpans returns the innermost spans of a row that have text.
+      function textSpans(row){
+        var spans=row.querySelectorAll('span');
+        var out=[];
+        for(var i=0;i<spans.length;i++){
+          if(spans[i].querySelector('span')||blank(spans[i]))continue;
+          out.push(spans[i]);
+        }
+        return out;
+      }
+      function firstTextBold(row){
+        var spans=textSpans(row);
+        return spans.length>0&&spans[0].classList.contains('term-fg1');
+      }
+      function textLen(t){return t.replace(/\s/g,'').length}
+      // italicLen returns how much text of a row is italic.
+      function italicLen(row){
+        var spans=textSpans(row);
+        var n=0;
+        for(var i=0;i<spans.length;i++){
+          if(spans[i].classList.contains('term-fg3'))n+=textLen(text(spans[i]));
+        }
+        return n;
+      }
+      var spinnerRE=/^\s*[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f]/;
+      function border(t){return /^\u2500/.test(t)}
+      // navRows returns the first row of each prompt and each answer, in
+      // order. For a prompt, that is its blank first row.
+      function navRows(){
+        var rows=inner.children;
+        var prompts=[];
+        var prevBg='';
+        for(var i=0;i<rows.length;i++){
+          var bg=rowBg(rows[i]);
+          var start=bg&&bg!==prevBg;
+          prevBg=bg;
+          if(!start||!blank(rows[i]))continue;
+          var end=i+1;
+          while(end<rows.length&&rowBg(rows[end])===bg)end++;
+          for(var j=i+1;j<end;j++){
+            if(blank(rows[j]))continue;
+            if(!firstTextBold(rows[j]))prompts.push({start:i,end:end});
+            break;
+          }
+        }
+        var out=[];
+        for(var k=0;k<prompts.length;k++){
+          out.push(rows[prompts[k].start]);
+          var stop=k+1<prompts.length?prompts[k+1].start:rows.length;
+          var from=prompts[k].end;
+          for(var a=from;a<stop;a++){
+            if(rowBg(rows[a]))from=a+1;
+          }
+          // Look at one paragraph at a time. Thinking can have code in
+          // it, which is not italic, so a paragraph is thinking if most
+          // of its text is italic.
+          var b=from;
+          while(b<stop){
+            var t=text(rows[b]);
+            if(!t.trim()){b++;continue}
+            // The editor box below the conversation starts with a
+            // border row, which has no left padding.
+            if(border(t))break;
+            var q=b,italic=0,all=0;
+            while(q<stop&&!blank(rows[q])&&!border(text(rows[q]))){
+              italic+=italicLen(rows[q]);
+              all+=textLen(text(rows[q]));
+              q++;
+            }
+            if(spinnerRE.test(t)||italic*2>all){b=q;continue}
+            out.push(rows[b]);
+            break;
+          }
+        }
+        return out;
+      }
+      function headingOffset(){
+        var s=getComputedStyle(document.documentElement);
+        return (parseFloat(s.getPropertyValue('--page-heading-h'))||0)+8;
+      }
+      // scrollToNav scrolls to the previous (dir<0) or next (dir>0)
+      // prompt or answer from the top of the viewport. If there is no
+      // next one, it goes to the bottom.
+      function scrollToNav(dir){
+        var off=headingOffset();
+        var rows=navRows();
+        var target=null;
+        for(var i=0;i<rows.length;i++){
+          var top=rows[i].getBoundingClientRect().top-off;
+          if(dir<0&&top<-2)target=rows[i];
+          if(dir>0&&top>2){target=rows[i];break}
+        }
+        if(dir>0&&(!target||nearBottom())){
+          follow=true;scrollToBottom();refreshFollowUI();
+          return;
+        }
+        if(!target)return;
+        window.scrollTo(0,target.getBoundingClientRect().top+window.scrollY-off);
+      }
+      prevBtn.addEventListener('click',function(){scrollToNav(-1)});
+      nextBtn.addEventListener('click',function(){scrollToNav(1)});
     }
     // tagDiffBgLines: walks the freshly-rendered rows and stamps a
     // line-bg-add / line-bg-del class on any `.line` whose content

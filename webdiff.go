@@ -2251,10 +2251,20 @@ func writeStreamPage(ctx context.Context, w http.ResponseWriter, paneID, repoURL
 	}
 	fmt.Fprintf(&body, `<div id="pane-tail" data-pane-id="%s" data-agent-session="%s" data-repo-url="%s" class="term-container"><div class="term-inner"></div></div>`,
 		template.HTMLEscapeString(paneID), template.HTMLEscapeString(agentSession), template.HTMLEscapeString(streamRepo))
-	// The jump button floats over the top-right corner of the pane, below
-	// the sticky heading. It is not in the header row, because there it
-	// made the row too wide on narrow screens.
-	body.WriteString(`<button class="toggle jump-bottom" type="button" id="jump-bottom" hidden>jump to bottom</button>`)
+	// The previous, next and jump buttons float over the top-right corner
+	// of the pane, below the sticky heading. They are not in the header
+	// row, because there they made the row too wide on narrow screens.
+	// Previous and next go to each prompt and answer. Only Pi panes get
+	// them: app.js finds the prompts and answers from how Pi draws them.
+	// app.js hides all the buttons while the page follows the bottom of
+	// the pane.
+	body.WriteString(`<div class="pane-nav" id="pane-nav" hidden>`)
+	if pageAgent == piAgentName {
+		body.WriteString(`<button class="toggle" type="button" id="nav-prev" title="scroll to the previous prompt or answer">&#x2191; prev</button>`)
+		body.WriteString(`<button class="toggle" type="button" id="nav-next" title="scroll to the next prompt or answer">&#x2193; next</button>`)
+	}
+	body.WriteString(`<button class="toggle" type="button" id="jump-bottom">jump to bottom</button>`)
+	body.WriteString(`</div>`)
 	body.WriteString(`<div class="stream-toolbar">`)
 	body.WriteString(`<div class="stream-toolbar-row">`)
 	body.WriteString(`<button class="toggle stream-key" type="button" data-key="Escape" title="send Escape">esc</button>`)
