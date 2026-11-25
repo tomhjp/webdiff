@@ -360,6 +360,31 @@ func TestStreamPageRestartCanStop(t *testing.T) {
 	}
 }
 
+// The stream page header has a "stop session" button only when there
+// is no restart modal to stop the session from. That is, for a
+// webdiff-managed session without a repo URL.
+func TestStreamPageStopButton(t *testing.T) {
+	renameTestWorktree(t)
+	for _, tc := range []struct {
+		name    string
+		repoURL string
+		session string
+		want    bool
+	}{
+		{"repo", "/worktrees/repo-source/", "repo-source-wd", false},
+		{"no repo", "", "gone-wd", true},
+		{"unmanaged", "", "other", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeStreamPage(t.Context(), w, "%0", tc.repoURL, "pane", tc.session, "")
+			if got := strings.Contains(w.Body.String(), `id="stop-session"`); got != tc.want {
+				t.Fatalf("stop button shown = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // Remove is the last button in the right group of the stream page
 // header, so it is always at the right edge.
 func TestStreamPageRemoveLast(t *testing.T) {

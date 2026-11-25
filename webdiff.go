@@ -2072,8 +2072,8 @@ func writeStreamPage(ctx context.Context, w http.ResponseWriter, paneID, repoURL
 	}
 	body.WriteString(`<div class="header-buttons-right">`)
 	if hasRef {
-		// .wide-only hides this and "stop session" on narrow screens,
-		// where they make the row too wide. Restart stays because it is
+		// .wide-only hides this on narrow screens, where it makes the
+		// row too wide. Restart stays because it is
 		// the one used most.
 		fmt.Fprintf(&body, `<a class="toggle wide-only" href="%s" title="previous sessions of this checkout">session history</a>`,
 			template.HTMLEscapeString(historyListURL(ref.kind, ref.name)))
@@ -2089,8 +2089,8 @@ func writeStreamPage(ctx context.Context, w http.ResponseWriter, paneID, repoURL
 		// data-agent-choices is everything selectable.
 		//
 		// data-can-stop tells the modal to show a "stop session" button.
-		// It is the only stop control on narrow screens, where
-		// #stop-session is hidden.
+		// It is the only stop control when the page has a repo URL, on
+		// all screen widths.
 		//
 		// data-session-n is the session number, so the restart starts
 		// the same session of the checkout again.
@@ -2104,11 +2104,13 @@ func writeStreamPage(ctx context.Context, w http.ResponseWriter, paneID, repoURL
 			template.HTMLEscapeString(pageAgent),
 			template.HTMLEscapeString(strings.Join(agentChoices(), ",")), canStop)
 	}
-	if managed {
-		// Stop only needs a webdiff-managed session, not a repo URL: the
-		// client goes to the home page after the kill. The server does the
-		// same `-wd` check, so this only hides a button that would fail.
-		body.WriteString(`<button class="toggle danger wide-only" type="button" id="stop-session">stop session</button>`)
+	if managed && repoURL == "" {
+		// Without a repo URL there is no restart button, and thus no
+		// restart modal with its stop button. Stop only needs a
+		// webdiff-managed session: the client goes to the home page
+		// after the kill. The server does the same `-wd` check, so this
+		// only hides a button that would fail.
+		body.WriteString(`<button class="toggle danger" type="button" id="stop-session">stop session</button>`)
 	}
 	// Remove is the last button, so it is always at the right edge, as
 	// on the diff page.
