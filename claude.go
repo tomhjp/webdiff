@@ -838,6 +838,8 @@ var allowedPaneKeys = map[string]bool{
 	"Right":  true,
 	"Escape": true,
 	"Enter":  true,
+	// Ctrl-T collapses or expands Pi's thinking blocks.
+	"C-t": true,
 }
 
 type paneInputRequest struct {

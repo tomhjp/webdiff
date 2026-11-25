@@ -918,34 +918,44 @@ func (c *rexClient) paste(ctx context.Context, sessionID, blockID, text string, 
 	if !enter {
 		return nil
 	}
-	return c.key(ctx, sessionID, blockID, "enter")
+	return c.key(ctx, sessionID, blockID, rexKeys["Enter"])
+}
+
+// rexKey is a physical key in Rex, with the modifiers to hold down.
+// Codepoint is the character that the key makes without modifiers, or 0
+// for a key that makes no character.
+type rexKey struct {
+	Key       string
+	Mods      string
+	Codepoint int
 }
 
 // rexKeys maps the tmux key names the stream toolbar sends to Rex's
 // physical key names.
-var rexKeys = map[string]string{
-	"Left":   "arrow_left",
-	"Up":     "arrow_up",
-	"Down":   "arrow_down",
-	"Right":  "arrow_right",
-	"Escape": "escape",
-	"Enter":  "enter",
+var rexKeys = map[string]rexKey{
+	"Left":   {Key: "arrow_left"},
+	"Up":     {Key: "arrow_up"},
+	"Down":   {Key: "arrow_down"},
+	"Right":  {Key: "arrow_right"},
+	"Escape": {Key: "escape"},
+	"Enter":  {Key: "enter"},
+	"C-t":    {Key: "key_t", Mods: "ctrl", Codepoint: 't'},
 }
 
-// key presses one key with no modifiers. Rex encodes it for the
-// keyboard mode the program has turned on.
-func (c *rexClient) key(ctx context.Context, sessionID, blockID, key string) error {
+// key presses one key. Rex encodes it for the keyboard mode the program
+// has turned on.
+func (c *rexClient) key(ctx context.Context, sessionID, blockID string, k rexKey) error {
 	return c.call(ctx, "block.event", map[string]any{
 		"session_id": sessionID,
 		"block_id":   blockID,
 		"event": map[string]any{
 			"type": "key",
 			"payload": map[string]any{
-				"key":                 key,
-				"mods":                "",
+				"key":                 k.Key,
+				"mods":                k.Mods,
 				"consumed_mods":       "",
 				"text":                "",
-				"unshifted_codepoint": 0,
+				"unshifted_codepoint": k.Codepoint,
 				"composing":           false,
 				"action":              "press",
 			},

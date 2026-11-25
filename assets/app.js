@@ -395,6 +395,9 @@
     Array.prototype.forEach.call(document.querySelectorAll('.stream-key'),function(b){
       b.addEventListener('click',function(){postInput({key:b.dataset.key})});
     });
+    // Pi collapses or expands its thinking blocks on Ctrl-T.
+    var thinkingBtn=document.getElementById('pane-toggle-thinking');
+    if(thinkingBtn)thinkingBtn.addEventListener('click',function(){postInput({key:'C-t'})});
     var msgInput=document.getElementById('pane-msg');
     var sendMsgBtn=document.getElementById('pane-send');
 

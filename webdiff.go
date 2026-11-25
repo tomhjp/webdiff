@@ -2184,6 +2184,10 @@ func writeStreamPage(ctx context.Context, w http.ResponseWriter, paneID, repoURL
 		if worktreeName != "" {
 			writeWorktreeRenameButton(&body, worktreeName, dir)
 		}
+		// Pi collapses or expands its thinking blocks on Ctrl-T.
+		if pageAgent == piAgentName {
+			body.WriteString(`<button class="toggle" type="button" id="pane-toggle-thinking" title="collapse or expand the agent's thinking blocks (ctrl+t)">toggle thinking</button>`)
+		}
 		body.WriteString(`</div>`)
 	}
 	body.WriteString(`<div class="header-buttons-right">`)
