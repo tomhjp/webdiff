@@ -1693,6 +1693,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	body.WriteString(`<div class="diff-more-menu" id="diff-more-menu" hidden>`)
 	writeWorktreeNewButton(&body)
 	writeNewAgentButton(&body, urlPath, pageAgent)
+	writeOtherSessionLinks(&body, urlPath, sessionN, liveCheckoutSessions(r.Context(), repo))
 	fmt.Fprintf(&body, `<a class="toggle" href="/file/%s/%s/" title="browse repo files">files</a>`,
 		ref.kind, template.HTMLEscapeString(ref.name))
 	if ref.kind == "worktrees" {
@@ -1971,7 +1972,7 @@ func renderRepoStreamPage(w http.ResponseWriter, r *http.Request) {
 	if liveAgent == "" {
 		liveAgent = r.URL.Query().Get("agent")
 	}
-	writeStreamPage(w, paneID, ref.url, "", session, liveAgent)
+	writeStreamPage(r.Context(), w, paneID, ref.url, "", session, liveAgent)
 }
 
 // renderArbitraryPanePage is the streaming view for panes that
@@ -1990,10 +1991,10 @@ func renderArbitraryPanePage(w http.ResponseWriter, r *http.Request) {
 	}
 	session, agent, err := paneSession(r.Context(), paneID)
 	if err != nil {
-		writeStreamPage(w, paneID, "", paneID, "", "")
+		writeStreamPage(r.Context(), w, paneID, "", paneID, "", "")
 		return
 	}
-	writeStreamPage(w, paneID, paneRepoURL(session), session, session, agent)
+	writeStreamPage(r.Context(), w, paneID, paneRepoURL(session), session, session, agent)
 }
 
 // writeStreamPage derives the heading from repoURL (so the title is the
@@ -2001,7 +2002,7 @@ func renderArbitraryPanePage(w http.ResponseWriter, r *http.Request) {
 // point routed us here. fallbackTitle is only used for arbitrary panes
 // that don't resolve to a known repo. liveAgent is the agent detected
 // in the pane, "" when it isn't one we recognise.
-func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, session, liveAgent string) {
+func writeStreamPage(ctx context.Context, w http.ResponseWriter, paneID, repoURL, fallbackTitle, session, liveAgent string) {
 	title := strings.Trim(repoURL, "/")
 	if title == "" {
 		title = fallbackTitle
@@ -2062,6 +2063,8 @@ func writeStreamPage(w http.ResponseWriter, paneID, repoURL, fallbackTitle, sess
 		body.WriteString(`<div class="diff-more-menu" id="diff-more-menu" hidden>`)
 		writeWorktreeNewButton(&body)
 		writeNewAgentButton(&body, ref.url, pageAgent)
+		// The other running sessions of the checkout.
+		writeOtherSessionLinks(&body, ref.url, sessionN, liveCheckoutSessions(ctx, ref.abs))
 		if worktreeName != "" {
 			writeWorktreeRenameButton(&body, worktreeName, dir)
 		}

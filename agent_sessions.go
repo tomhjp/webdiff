@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"html/template"
 	"net/url"
 	"slices"
 	"strconv"
@@ -185,6 +186,51 @@ func checkoutSessionNames(ctx context.Context, repoPath string) []string {
 		return sessionNumber(a) - sessionNumber(b)
 	})
 	return out
+}
+
+// checkoutSession is a running agent session of a checkout.
+type checkoutSession struct {
+	n     int
+	agent string // agent id, "" if not known
+}
+
+// liveCheckoutSessions returns the running agent sessions of the
+// checkout at repoPath, ordered by session number.
+func liveCheckoutSessions(ctx context.Context, repoPath string) []checkoutSession {
+	var out []checkoutSession
+	for _, name := range checkoutSessionNames(ctx, repoPath) {
+		n := sessionNumber(name)
+		// The session can stop after checkoutSessionNames.
+		paneID, _, agent := repoStreamPane(ctx, repoPath, n)
+		if paneID == "" {
+			continue
+		}
+		out = append(out, checkoutSession{
+			n:     n,
+			agent: agent,
+		})
+	}
+	return out
+}
+
+// writeOtherSessionLinks emits a link to the stream page of each
+// session in sessions, other than session current. The "more" menus of
+// the diff page and the stream page show these links. refURL is the URL
+// of the checkout. The label of a link is the same as the label of the
+// agent button on the diff page, for example "pi #2".
+func writeOtherSessionLinks(b *strings.Builder, refURL string, current int, sessions []checkoutSession) {
+	for _, s := range sessions {
+		if s.n == current {
+			continue
+		}
+		agent, _ := resolveAgent(s.agent)
+		label := agent
+		if tag := sessionTag(s.n); tag != "" {
+			label += " " + tag
+		}
+		fmt.Fprintf(b, `<a class="toggle other-session" href="%s" title="open agent session %d of this checkout">%s</a>`,
+			template.HTMLEscapeString("/stream"+refURL+sessionQuery(s.n, "")), s.n, template.HTMLEscapeString(label))
+	}
 }
 
 // sessionsStarting holds the names of the sessions that a request has

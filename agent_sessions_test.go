@@ -1,8 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -97,5 +101,83 @@ func TestNewAgentURL(t *testing.T) {
 	}
 	if got, want := newAgentURL("/repos/corp/", "pi"), "/agent/repos/corp/?agent=pi&new=1"; got != want {
 		t.Errorf("newAgentURL = %q, want %q", got, want)
+	}
+}
+
+// The "more" menus of the diff page and the stream page link to the
+// other running sessions of the checkout, but not to the session of
+// the page.
+func TestMoreMenuOtherSessions(t *testing.T) {
+	_, wt := renameTestWorktree(t)
+	ref, ok := resolveRepoRef("/worktrees/repo-source/")
+	if !ok {
+		t.Fatal("cannot resolve worktree")
+	}
+	saved := rexc
+	t.Cleanup(func() { rexc = saved })
+	rexc = &rexClient{
+		sessions: map[string]*rexSession{
+			"s1": {
+				ID:         "s1",
+				Label:      checkoutSessionName(wt, 1),
+				Agent:      "b1",
+				AgentLabel: "pi",
+			},
+			"s3": {
+				ID:         "s3",
+				Label:      checkoutSessionName(wt, 3),
+				Agent:      "b3",
+				AgentLabel: "claude",
+			},
+		},
+	}
+	link1 := `<a class="toggle other-session" href="/stream/worktrees/repo-source/" title="open agent session 1 of this checkout">pi</a>`
+	link3 := `<a class="toggle other-session" href="/stream/worktrees/repo-source/?n=3" title="open agent session 3 of this checkout">claude #3</a>`
+	menu := func(t *testing.T, body string) string {
+		t.Helper()
+		start := strings.Index(body, `<div class="diff-more-menu" id="diff-more-menu" hidden>`)
+		if start < 0 {
+			t.Fatal("missing more menu")
+		}
+		return body[start : strings.Index(body[start:], `</div>`)+start]
+	}
+	for _, tc := range []struct {
+		n          int
+		want, skip []string
+	}{
+		{1, []string{link3}, []string{link1}},
+		{2, []string{link1, link3}, nil},
+		{3, []string{link1}, []string{link3}},
+	} {
+		t.Run(fmt.Sprintf("diff n=%d", tc.n), func(t *testing.T) {
+			w := httptest.NewRecorder()
+			renderRepo(w, httptest.NewRequest(http.MethodGet, ref.url+sessionQuery(tc.n, ""), nil), ref)
+			m := menu(t, w.Body.String())
+			for _, s := range tc.want {
+				if !strings.Contains(m, s) {
+					t.Errorf("menu is missing %s", s)
+				}
+			}
+			for _, s := range tc.skip {
+				if strings.Contains(m, s) {
+					t.Errorf("menu has %s", s)
+				}
+			}
+		})
+		t.Run(fmt.Sprintf("stream n=%d", tc.n), func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeStreamPage(t.Context(), w, "%0", ref.url, "pane", checkoutSessionName(wt, tc.n), "")
+			m := menu(t, w.Body.String())
+			for _, s := range tc.want {
+				if !strings.Contains(m, s) {
+					t.Errorf("menu is missing %s", s)
+				}
+			}
+			for _, s := range tc.skip {
+				if strings.Contains(m, s) {
+					t.Errorf("menu has %s", s)
+				}
+			}
+		})
 	}
 }

@@ -236,7 +236,7 @@ func TestWorktreeRenameButtonPages(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			if tc.pane {
-				writeStreamPage(w, "%0", tc.url, "pane", "", "")
+				writeStreamPage(t.Context(), w, "%0", tc.url, "pane", "", "")
 			} else {
 				ref, ok := resolveRepoRef(tc.url)
 				if !ok {
@@ -294,7 +294,7 @@ func TestStreamPageHeaderButtons(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			writeStreamPage(w, "%0", tc.url, "pane", "", "")
+			writeStreamPage(t.Context(), w, "%0", tc.url, "pane", "", "")
 			body := w.Body.String()
 			for _, s := range []string{
 				`href="zed://ssh/slop`,
@@ -346,7 +346,7 @@ func TestStreamPageRestartCanStop(t *testing.T) {
 	} {
 		t.Run(tc.session, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			writeStreamPage(w, "%0", "/worktrees/repo-source/", "pane", tc.session, "")
+			writeStreamPage(t.Context(), w, "%0", "/worktrees/repo-source/", "pane", tc.session, "")
 			body := w.Body.String()
 			start := strings.Index(body, `id="restart-session"`)
 			if start < 0 {
@@ -365,7 +365,7 @@ func TestStreamPageRestartCanStop(t *testing.T) {
 func TestStreamPageRemoveLast(t *testing.T) {
 	renameTestWorktree(t)
 	w := httptest.NewRecorder()
-	writeStreamPage(w, "%0", "/worktrees/repo-source/", "pane", "repo-source-wd", "")
+	writeStreamPage(t.Context(), w, "%0", "/worktrees/repo-source/", "pane", "repo-source-wd", "")
 	body := w.Body.String()
 	right := strings.Index(body, `<div class="header-buttons-right">`)
 	remove := strings.Index(body, `id="wt-remove-btn"`)
@@ -388,7 +388,7 @@ func TestStreamPageTitleRow(t *testing.T) {
 	var want strings.Builder
 	writeHeadingTitleRow(&want, ref, cachedStats(ref))
 	w := httptest.NewRecorder()
-	writeStreamPage(w, "%0", ref.url, "pane", "", "")
+	writeStreamPage(t.Context(), w, "%0", ref.url, "pane", "", "")
 	body := w.Body.String()
 	if !strings.Contains(body, `<div class="page-heading">`+want.String()) {
 		t.Fatalf("stream page does not start with the shared title row: %s", body)
@@ -416,7 +416,7 @@ func TestStreamPageSessionNumber(t *testing.T) {
 	} {
 		t.Run(tc.session, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			writeStreamPage(w, "%0", "/worktrees/repo-source/", "pane", tc.session, "")
+			writeStreamPage(t.Context(), w, "%0", "/worktrees/repo-source/", "pane", tc.session, "")
 			body := w.Body.String()
 			for _, want := range []string{tc.diffHref, tc.n, `href="/agent/worktrees/repo-source/?new=1"`} {
 				if !strings.Contains(body, want) {
