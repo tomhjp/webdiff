@@ -369,6 +369,13 @@ summary::before { content: "▾"; color: var(--accent); font-weight: bold; margi
 details:not([open]) > summary::before { content: "▸" }
 .filename { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: bold; color: var(--fg) }
 .filestats { font-size: 12px; color: var(--muted); white-space: nowrap }
+/* Zed and VS Code links in the heading of each file. Emitted by
+   writeFileOpenLinks in webdiff.go. Like .dir-open, without a button
+   frame. */
+.file-open-links { gap: 4px; flex: 0 0 auto }
+.file-open { color: var(--muted); padding: 0 4px; text-decoration: none; -webkit-tap-highlight-color: transparent }
+.file-open:hover { color: var(--accent) }
+.file-open .icon { width: 13px; height: 13px }
 details { margin-bottom: 0 }
 details .term-container { margin: 0 }
 

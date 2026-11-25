@@ -424,6 +424,31 @@ func fileDiff(env []string, repo, base, file string, cols int, fullContext bool)
 	return canon, colored
 }
 
+// firstChangedLine returns the line in the new version of the file at
+// which the first change of canon starts. A deleted line has no line in
+// the new version, so for a deletion it returns the line that is now
+// where the deleted lines were.
+func firstChangedLine(canon []diffLine) int {
+	next := 1
+	for _, l := range canon {
+		switch l.kind {
+		case ' ':
+			next = l.newLine + 1
+		case '+':
+			return l.newLine
+		case '-':
+			return next
+		}
+	}
+	return 1
+}
+
+// isFileOnDisk reports whether file, relative to dir, is a regular file.
+func isFileOnDisk(dir, file string) bool {
+	fi, err := os.Stat(filepath.Join(dir, filepath.FromSlash(file)))
+	return err == nil && fi.Mode().IsRegular()
+}
+
 // diffLine is one source line of a unified diff: an add (`+`), a del
 // (`-`), or a context line (` `). text is the line content with its
 // leading kind byte stripped. oldLine / newLine are 1-based; only the
@@ -1126,18 +1151,56 @@ func writeOpenButtons(b *strings.Builder, dir, cls string) {
 	if dir == "" || sshHost == "" {
 		return
 	}
-	// dir is absolute, so it supplies the separator after the host.
-	zed := template.HTMLEscapeString("zed://ssh/" + sshHost + dir)
-	vscode := template.HTMLEscapeString("vscode://vscode-remote/ssh-remote+" + sshHost + dir)
+	short := tildePath(dir)
+	writeEditorLinks(b, dir, short, cls)
 	ghostty := template.HTMLEscapeString("webdiff://ghostty?host=" +
 		url.QueryEscape(sshHost) + "&dir=" + url.QueryEscape(dir))
-	short := template.HTMLEscapeString(tildePath(dir))
-	fmt.Fprintf(b, `<a class="%s open-link" href="%s" title="open %s in Zed">%s</a>`,
-		cls, zed, short, icon("icon-zed"))
-	fmt.Fprintf(b, `<a class="%s open-link" href="%s" title="open %s in VS Code">%s</a>`,
-		cls, vscode, short, icon("icon-vscode"))
 	fmt.Fprintf(b, `<a class="%s open-link" href="%s" title="open a shell in %s">%s</a>`,
-		cls, ghostty, short, icon("icon-ghostty"))
+		cls, ghostty, template.HTMLEscapeString(short), icon("icon-ghostty"))
+}
+
+// writeFileOpenLinks emits links that open file at line in Zed and VS
+// Code. file is relative to dir. The diff page puts them in the heading
+// of each file.
+func writeFileOpenLinks(b *strings.Builder, dir, file string, line int) {
+	if dir == "" || sshHost == "" {
+		return
+	}
+	// The wrapper is one item of the flex <summary>, so the gap between
+	// the two links is smaller than the gap between the summary items.
+	b.WriteString(`<span class="file-open-links open-link">`)
+	writeEditorLinks(b, editorFileTarget(dir, file, line), file, "file-open")
+	b.WriteString(`</span>`)
+}
+
+// writeEditorLinks emits the Zed and VS Code links that open target
+// over SSH. target is an absolute path, with an optional ":line"
+// suffix. name is the text that the link titles use for target.
+func writeEditorLinks(b *strings.Builder, target, name, cls string) {
+	// target is absolute, so it supplies the separator after the host.
+	zed := template.HTMLEscapeString("zed://ssh/" + sshHost + target)
+	vscode := template.HTMLEscapeString("vscode://vscode-remote/ssh-remote+" + sshHost + target)
+	name = template.HTMLEscapeString(name)
+	fmt.Fprintf(b, `<a class="%s open-link" href="%s" title="open %s in Zed">%s</a>`,
+		cls, zed, name, icon("icon-zed"))
+	fmt.Fprintf(b, `<a class="%s open-link" href="%s" title="open %s in VS Code">%s</a>`,
+		cls, vscode, name, icon("icon-vscode"))
+}
+
+// editorFileTarget returns the editor link target for line of file.
+// file is relative to dir. Each segment of file is percent-encoded, so
+// characters such as "#" and "?" stay in the path. Both editors decode
+// the path.
+//
+// The target always has a ":line" suffix. VS Code opens a remote path
+// as a file only if it has this suffix. Without it, VS Code opens the
+// path as a folder.
+func editorFileTarget(dir, file string, line int) string {
+	segs := strings.Split(file, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.TrimSuffix(dir, "/") + "/" + strings.Join(segs, "/") + ":" + strconv.Itoa(max(line, 1))
 }
 
 // icon references one of the <symbol>s in the assets/icons.svg sprite that
@@ -1803,10 +1866,17 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		// (and its <summary>) from a stored Comment without recomputing
 		// the slug — important because the slug is lossy (slashes and
 		// dots both collapse to dashes) and can't be inverted.
-		fmt.Fprintf(&body, `<details id="file-%s" data-file="%s" open><summary><span class="filename">%s</span><span class="filestats">`,
+		fmt.Fprintf(&body, `<details id="file-%s" data-file="%s" open><summary><span class="filename">%s</span>`,
 			template.HTMLEscapeString(slug),
 			template.HTMLEscapeString(file),
 			template.HTMLEscapeString(display))
+		// An editor cannot open a file that is not on disk, for
+		// example a deleted file. A click on a link in a <summary>
+		// follows the link and does not toggle the <details>.
+		if isFileOnDisk(ref.abs, file) {
+			writeFileOpenLinks(&body, ref.abs, file, firstChangedLine(canon))
+		}
+		body.WriteString(`<span class="filestats">`)
 		switch {
 		case binary:
 			body.WriteString(`<span class="stats-files">binary</span>`)

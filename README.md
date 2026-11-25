@@ -29,9 +29,16 @@ Webdiff doesn't try to replace your existing tools. If you need the full termina
 Every repo and worktree — on the home page rows and in the diff page toolbar —
 carries three links that jump straight from reviewing to working, marked with
 the Zed, VS Code, and Ghostty icons: the first two open the checkout in their
-respective editor, and the third opens a Ghostty window with a shell in it. All
-target the checkout *on this host* over SSH, so they need to know how your
-desktop reaches it:
+respective editor, and the third opens a Ghostty window with a shell in it.
+
+On the diff page, the heading of each changed file also has Zed and VS Code
+links that open that file at its first change. A deep link can name only one
+path, so these links can't open the checkout as well. If a window for the
+checkout is already open, the file opens in that window. If not, the editor
+opens the file by itself.
+
+All the links target the checkout *on this host* over SSH, so they need to
+know how your desktop reaches it:
 
 ```
 webdiff -ssh-host=<alias> [port]
