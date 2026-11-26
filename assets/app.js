@@ -1119,6 +1119,46 @@
     openCommits=openCommits.filter(function(id){return present.indexOf(id)!==-1});
   }
 
+  // Listing page: the issue numbers on the line of a branch. The edit
+  // button ("+ issue", or a pencil for issues that the user wrote)
+  // changes into a text field. Enter saves the list and loads the page
+  // again, and Escape or a click elsewhere cancels. An empty list
+  // removes the issues that the user wrote. See writeGroupIssues.
+  setupBranchIssues();
+  function setupBranchIssues(){
+    document.querySelectorAll('.branch-issues .issue-edit').forEach(function(btn){
+      var box=btn.closest('.branch-issues');
+      btn.addEventListener('click',function(){
+        var input=document.createElement('input');
+        input.type='text';
+        input.className='issue-input';
+        input.value=box.dataset.manual||'';
+        input.placeholder=box.dataset.repo?'#123, corp#45':'corp#45, owner/repo#6';
+        input.setAttribute('aria-label','issue numbers');
+        input.autocapitalize='off';input.spellcheck=false;input.autocomplete='off';
+        var saving=false;
+        function cancel(){if(!saving&&input.parentNode){input.replaceWith(btn)}}
+        input.addEventListener('keydown',function(ev){
+          if(ev.key==='Escape'){ev.preventDefault();cancel();return}
+          if(ev.key!=='Enter')return;
+          ev.preventDefault();
+          saving=true;input.disabled=true;
+          postJSON('/api/branch-issues',{branch:box.dataset.branch,repo:box.dataset.repo,issues:input.value})
+            .then(function(){location.reload()})
+            .catch(function(e){
+              input.disabled=false;
+              window.alert('cannot save the issues: '+e.message);
+              saving=false;input.focus();
+            });
+        });
+        input.addEventListener('blur',function(){setTimeout(cancel,0)});
+        btn.replaceWith(input);
+        input.focus();
+        input.setSelectionRange(input.value.length,input.value.length);
+      });
+    });
+  }
+
   // Listing page: poll for spinning *-wd sessions and reflect that
   // state on the tmux rows with a CSS spinner via .session-spinning.
   var tmuxRows=document.querySelectorAll('.tmux-row[data-session]');

@@ -856,6 +856,7 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 		writeSectionStart(&body, "worktrees", "worktrees", len(worktrees))
 		groups := groupByBranch(worktrees)
 		lookupGroupPRs(r.Context(), groups)
+		lookupGroupIssues(groups)
 		for _, g := range groups {
 			writeBranchGroup(&body, g, takeSessions)
 		}
@@ -969,6 +970,8 @@ type branchGroup struct {
 	// PRs are the pull requests of the worktrees, in the order of
 	// Worktrees. A worktree with no pull request has no entry.
 	PRs []*pullRequest
+	// Issues are the GitHub issues of the branch.
+	Issues groupIssues
 }
 
 // lookupGroupPRs sets the PRs of each group.
@@ -1035,6 +1038,7 @@ func writeBranchGroup(b *strings.Builder, g branchGroup, sessions func(repostats
 	for _, pr := range g.PRs {
 		b.WriteString(prBadgeHTML(pr, withRepo))
 	}
+	writeGroupIssues(b, g.Issues)
 	b.WriteString(`</div>`)
 	for _, target := range g.Worktrees {
 		label := target.ParentRepo
@@ -2617,6 +2621,7 @@ func main() {
 		os.Exit(1)
 	}
 	startRepoPuller(context.Background(), filepath.Join(cacheRoot, "pull.json"))
+	branchIssues = loadBranchIssueStore(defaultBranchIssuesPath())
 	if c := (prConfig{
 		Maintner:    strings.TrimSpace(*maintnerFlag),
 		GitPoll:     *prPollFlag,

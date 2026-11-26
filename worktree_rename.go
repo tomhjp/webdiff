@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -41,10 +42,16 @@ func handleWorktreeRename(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown worktree", http.StatusNotFound)
 		return
 	}
-	path, status, err := renameWorktree(r.Context(), ref, strings.TrimSpace(req.Branch))
+	oldBranch := currentBranch(ref.abs)
+	newBranch := strings.TrimSpace(req.Branch)
+	path, status, err := renameWorktree(r.Context(), ref, newBranch)
 	if err != nil {
 		http.Error(w, err.Error(), status)
 		return
+	}
+	// The issues that the user wrote for the branch go with it.
+	if err := branchIssues.rename(oldBranch, newBranch); err != nil {
+		log.Printf("rename branch issues: %v", err)
 	}
 	if statsManager != nil {
 		// The rename is complete. A discovery failure must not report it as failed.

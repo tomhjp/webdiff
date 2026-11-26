@@ -154,6 +154,17 @@ a { color: var(--accent) }
 .pr-pending .pr-mark { color: var(--color-11) }
 .pr-unknown .pr-mark { color: var(--muted) }
 .pr-state { margin-left: 4px }
+/* The GitHub issues of a branch, at the right end of the line of the
+   branch on the home page, apart from the pull request after the branch
+   name. Emitted by writeGroupIssues in issues.go; app.js changes the
+   edit button into .issue-input. */
+.branch-issues { flex-shrink: 0; margin-left: auto; display: inline-flex; align-items: baseline; gap: 6px; font-size: 12px; font-weight: normal }
+.issue-link { color: var(--muted); text-decoration: none; white-space: nowrap }
+.issue-link:hover { color: var(--accent) }
+.issue-edit { background: transparent; border: none; padding: 0; font: inherit; color: var(--muted); cursor: pointer; opacity: .7 }
+.issue-edit:hover { color: var(--accent); opacity: 1 }
+.issue-input { font: inherit; font-size: 12px; width: 16em; padding: 1px 4px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px }
+.issue-input:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
 /* Row 2 is the controls strip. Horizontal scroll instead of wrapping
    on narrow viewports — buttons always sit on a single line. */
 .page-heading-row-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch }
