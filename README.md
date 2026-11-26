@@ -165,6 +165,29 @@ branch is checked out as before. API callers can select a source worktree with
 `{"kind":"worktrees", "repo":"<repo>-<worktree>", "branch":"..."}`;
 `kind` defaults to `repos` for existing callers, and `fromMain` is optional.
 
+## Pull requests
+
+With `-maintner=<url>` (for example `-maintner=http://maintner.corp.ts.net`),
+webdiff shows the GitHub pull request of each branch next to the branch name:
+in the worktree groups on the home page, and in the heading of the diff and
+stream pages. The link has a green tick when the pull request is approved, and
+a yellow circle when it is not. It also says "draft", "merged" or "closed" when
+that applies. A branch with more than one pull request shows the newest open
+one, or the newest one if none is open.
+
+The data comes from [maintner](https://github.com/tailscale/corp/tree/main/maintner),
+which keeps a copy of the GitHub data of the Tailscale repos and gets GitHub
+webhooks. Webdiff looks up each branch one time, and then follows the maintner
+mutation log with one long poll. It looks up a branch again only when a
+mutation is about its pull request or about a pull request that has the branch
+as its head, so a change shows in some seconds without polling. A full refresh
+each hour catches changes that the long poll missed. The stream page updates
+its heading when the pull request changes; the other pages show the value when
+they load.
+
+The GitHub repo of a checkout comes from the URL of its default remote. Repos
+that maintner does not watch show no pull requests.
+
 ## Install
 
 ```

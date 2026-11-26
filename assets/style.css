@@ -142,6 +142,16 @@ a { color: var(--accent) }
 .head-meta { display: flex; align-items: baseline; gap: 8px; font-size: 12px; min-width: 0 }
 .head-branch { color: var(--branch); font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0 }
 .head-meta .stats { flex-shrink: 0 }
+/* The GitHub pull request of the branch, next to the branch on the home
+   page and in the page heading. Emitted by prBadgeHTML in pr.go. The
+   mark is a green tick when the pull request is approved, and a yellow
+   circle when it is not. */
+.pr-badge { flex-shrink: 0; font-size: 12px; font-weight: normal; color: var(--muted); text-decoration: none; white-space: nowrap }
+.pr-badge:hover { color: var(--accent) }
+.pr-mark { margin-right: 3px }
+.pr-approved .pr-mark { color: var(--added) }
+.pr-pending .pr-mark { color: var(--color-11) }
+.pr-state { margin-left: 4px }
 /* Row 2 is the controls strip. Horizontal scroll instead of wrapping
    on narrow viewports — buttons always sit on a single line. */
 .page-heading-row-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch }
@@ -344,7 +354,8 @@ a { color: var(--accent) }
 /* A group of the worktrees section: the branch as the title, then a
    row for each repo that has a worktree on the branch. Emitted by
    writeBranchGroup in webdiff.go. */
-.branch-title { padding: 8px 12px 0; color: var(--branch); font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.branch-title { padding: 8px 12px 0; color: var(--branch); font-weight: bold; display: flex; align-items: baseline; gap: 8px; min-width: 0 }
+.branch-title-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0 }
 .branch-group > .dir-row-wrap > .repo-row { padding-top: 4px; padding-bottom: 4px }
 .branch-group > .session-row { padding-top: 0; padding-bottom: 4px }
 .branch-group { padding-bottom: 4px }

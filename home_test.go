@@ -312,7 +312,7 @@ func TestWriteBranchGroup(t *testing.T) {
 	writeBranchGroup(&b, g, sessions)
 	got := b.String()
 	for _, want := range []string{
-		`<div class="dir-group branch-group"><div class="branch-title">foo</div>`,
+		`<div class="dir-group branch-group"><div class="branch-title"><span class="branch-title-name">foo</span></div>`,
 		`<span class="title-short">corp</span>`,
 		`<div class="dir-row repo-row"><a class="dir-link" href="/worktrees/corp-foo/"><span class="dir-name">`,
 		`<button class="dir-commits commit-toggle" type="button" aria-expanded="false" aria-controls="commits-worktrees-corp-foo" title="show or hide the commits">3 commits</button><span class="dir-dirty" title="uncommitted changes" aria-label="uncommitted changes">●</span>`,

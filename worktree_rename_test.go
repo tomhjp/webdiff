@@ -411,7 +411,7 @@ func TestStreamPageTitleRow(t *testing.T) {
 		t.Fatal("cannot resolve worktree")
 	}
 	var want strings.Builder
-	writeHeadingTitleRow(&want, ref, cachedStats(ref))
+	writeHeadingTitleRow(t.Context(), &want, ref, cachedStats(ref))
 	w := httptest.NewRecorder()
 	writeStreamPage(t.Context(), w, "%0", ref.url, "pane", "", "")
 	body := w.Body.String()

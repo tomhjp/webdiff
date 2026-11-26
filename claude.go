@@ -1306,16 +1306,19 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 	// stays current without more requests. The repostats cache sends
 	// the change signal, so this does not run git. The first meta goes
 	// at once, so a reconnect after a hidden tab gets current stats.
-	var metaChanged <-chan struct{}
+	// A change of the pull request of the branch also sends the meta.
+	var metaChanged, prChanged <-chan struct{}
 	var lastMeta string
 	var metaRef repoRef
 	sendMeta := func() bool {
 		target, ok, changed := statsManager.Watch(repostats.Kind(metaRef.kind), metaRef.name)
 		metaChanged = changed
+		prChanged = prs.changes()
 		if !ok || target.Branch == "" {
 			return true
 		}
-		meta := headMetaHTML(target.Branch, summaryHTML(target.AllChanges))
+		pr := prs.lookupOne(ctx, target.Path, target.Branch)
+		meta := headMetaHTML(target.Branch, pr, summaryHTML(target.AllChanges))
 		if meta == lastMeta {
 			return true
 		}
@@ -1344,6 +1347,11 @@ func handlePaneStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			continue
 		case <-metaChanged:
+			if !sendMeta() {
+				return
+			}
+			continue
+		case <-prChanged:
 			if !sendMeta() {
 				return
 			}

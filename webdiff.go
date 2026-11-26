@@ -854,7 +854,9 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 	sortByAgentActivity(worktrees, bySession)
 	if len(worktrees) > 0 {
 		writeSectionStart(&body, "worktrees", "worktrees", len(worktrees))
-		for _, g := range groupByBranch(worktrees) {
+		groups := groupByBranch(worktrees)
+		lookupGroupPRs(r.Context(), groups)
+		for _, g := range groups {
 			writeBranchGroup(&body, g, takeSessions)
 		}
 		writeSectionEnd(&body)
@@ -964,6 +966,31 @@ type branchGroup struct {
 	// the worktree directory.
 	Title     string
 	Worktrees []repostats.Target
+	// PRs are the pull requests of the worktrees, in the order of
+	// Worktrees. A worktree with no pull request has no entry.
+	PRs []*pullRequest
+}
+
+// lookupGroupPRs sets the PRs of each group.
+func lookupGroupPRs(ctx context.Context, groups []branchGroup) {
+	var queries []prQuery
+	for _, g := range groups {
+		for _, target := range g.Worktrees {
+			queries = append(queries, prQuery{
+				Dir:    target.Path,
+				Branch: target.Branch,
+			})
+		}
+	}
+	found := prs.lookup(ctx, queries)
+	for i := range groups {
+		for range groups[i].Worktrees {
+			if pr := found[0]; pr != nil {
+				groups[i].PRs = append(groups[i].PRs, pr)
+			}
+			found = found[1:]
+		}
+	}
 }
 
 // groupByBranch puts the worktrees that have the same branch into one
@@ -998,7 +1025,17 @@ func groupByBranch(targets []repostats.Target) []branchGroup {
 // of its sessions. sessions returns the session rows of a worktree.
 func writeBranchGroup(b *strings.Builder, g branchGroup, sessions func(repostats.Target) []homeSession) {
 	b.WriteString(`<div class="dir-group branch-group">`)
-	fmt.Fprintf(b, `<div class="branch-title">%s</div>`, template.HTMLEscapeString(g.Title))
+	fmt.Fprintf(b, `<div class="branch-title"><span class="branch-title-name">%s</span>`, template.HTMLEscapeString(g.Title))
+	// Show the repo of each pull request only when they are not all
+	// of the same repo.
+	withRepo := false
+	for _, pr := range g.PRs {
+		withRepo = withRepo || pr.Repo != g.PRs[0].Repo
+	}
+	for _, pr := range g.PRs {
+		b.WriteString(prBadgeHTML(pr, withRepo))
+	}
+	b.WriteString(`</div>`)
 	for _, target := range g.Worktrees {
 		label := target.ParentRepo
 		if label == "" {
@@ -1402,7 +1439,7 @@ func writeTitle(b *strings.Builder, label, dir string) {
 // repo instead so the heading reads "repo … branch" like the home-page
 // rows do. Broken worktrees have no resolvable parent — fall back to
 // the slug, which at least identifies which worktree you're looking at.
-func writeHeadingTitleRow(b *strings.Builder, ref repoRef, stats string) {
+func writeHeadingTitleRow(ctx context.Context, b *strings.Builder, ref repoRef, stats string) {
 	title := worktreeSlug(ref.abs)
 	if ref.kind == "worktrees" {
 		if parent, ok := worktreeParentRepo(ref.abs); ok {
@@ -1413,16 +1450,19 @@ func writeHeadingTitleRow(b *strings.Builder, ref repoRef, stats string) {
 	b.WriteString(`<span class="branch">`)
 	writeTitle(b, title, ref.abs)
 	b.WriteString(`</span>`)
+	branch := currentBranch(ref.abs)
 	b.WriteString(`<span class="head-meta">`)
-	b.WriteString(headMetaHTML(currentBranch(ref.abs), stats))
+	b.WriteString(headMetaHTML(branch, prs.lookupOne(ctx, ref.abs, branch), stats))
 	b.WriteString(`</span></div>`)
 }
 
 // headMetaHTML returns the contents of the .head-meta element: the
-// branch, then the stats HTML. The pane stream sends the same HTML when
-// the branch or the stats change, so the stream page can replace it.
-func headMetaHTML(branch, stats string) string {
-	return `<span class="head-branch">` + template.HTMLEscapeString(branch) + `</span>` + stats
+// branch, then the pull request of the branch if pr is not nil, then
+// the stats HTML. The pane stream sends the same HTML when the branch,
+// the pull request or the stats change, so the stream page can replace
+// it.
+func headMetaHTML(branch string, pr *pullRequest, stats string) string {
+	return `<span class="head-branch">` + template.HTMLEscapeString(branch) + `</span>` + prBadgeHTML(pr, false) + stats
 }
 
 // summaryHTML returns the stats HTML for s, or "" when s has no files.
@@ -1911,7 +1951,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// live in a separate info bar is folded in here so only the
 	// streaming diff body scrolls.
 	body.WriteString(`<div class="page-heading">`)
-	writeHeadingTitleRow(&body, ref, stats)
+	writeHeadingTitleRow(r.Context(), &body, ref, stats)
 
 	// Keep diff controls on a separate row on narrow screens.
 	body.WriteString(`<div class="page-heading-row diff-toolbar">`)
@@ -2313,7 +2353,7 @@ func writeStreamPage(ctx context.Context, w http.ResponseWriter, paneID, repoURL
 	// A checkout gets the same first row as the diff page. A pane that
 	// is not in a known checkout shows only its name.
 	if hasRef {
-		writeHeadingTitleRow(&body, ref, cachedStats(ref))
+		writeHeadingTitleRow(ctx, &body, ref, cachedStats(ref))
 	} else {
 		body.WriteString(`<div class="page-heading-row"><span class="branch">`)
 		writeTitle(&body, title, dir)
@@ -2476,6 +2516,7 @@ func main() {
 	branchPrefixFlag := flag.String("branch-prefix", "", "default branch prefix to prepopulate when creating worktrees and hide on the home page")
 	onMainFlag := flag.String("develop-on-main", "", "comma-separated repos under the root that are developed directly on main; the home page shows them above the repos section with their branch and diff stats, and shows the other repos with buttons to start a worktree or an agent")
 	sshHostFlag := flag.String("ssh-host", "", "how the browser's machine reaches this one over SSH (e.g. an ~/.ssh/config alias); defaults to this node's MagicDNS name")
+	maintnerFlag := flag.String("maintner", "", "base URL of a maintner server (e.g. http://maintner.corp.ts.net) that supplies the GitHub pull request of each branch")
 	flag.Parse()
 	args := flag.Args()
 
@@ -2573,6 +2614,12 @@ func main() {
 		os.Exit(1)
 	}
 	startRepoPuller(context.Background(), filepath.Join(cacheRoot, "pull.json"))
+	if c := (prConfig{
+		Maintner: strings.TrimSpace(*maintnerFlag),
+	}); c.enabled() {
+		prs = newPRTracker(c)
+		startPRTracker(prs)
+	}
 
 	browserMux := http.NewServeMux()
 	browserMux.HandleFunc("/app.js", serveAppJS)
