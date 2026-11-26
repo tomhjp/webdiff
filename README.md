@@ -108,6 +108,44 @@ are cached. Saved picker choices do not change the home-page totals. Arbitrary
 combinations are computed on request in temporary indexes and are not retained
 or precomputed.
 
+## Desktop client
+
+`webdiff client` runs on your laptop. It is a reverse proxy in front of the
+webdiff on the sandbox, and it adds the controls that need the credentials of
+the laptop. All other pages work the same as on the sandbox.
+
+```
+webdiff client [-hostname=webdiff] [-listen=<addr>,...] [-github-url='git@github.com:{repo}.git'] [<sandbox-host[:port]>]
+```
+
+With no host, the client finds your LLM sandbox VM. With no port, it uses port
+80 of the sandbox. By default the client listens on port 80 of each Tailscale IP
+of the laptop. These are not the wildcard address, so on macOS the client needs
+no privileges for port 80. Add an `/etc/hosts` entry for the Tailscale IPv4
+address of the laptop (`tailscale ip -4`), and then open http://webdiff/:
+
+```
+100.x.y.z webdiff
+```
+
+The client accepts only connections from the laptop itself and only the host
+names that it listens on, and `/_local/` accepts only same-origin JSON
+requests.
+
+Through the client, the diff page has a **send to github** button. It asks for
+the name of the branch on GitHub, with the current branch as the default. The
+client then fetches the commits of the branch, up to HEAD, from the sandbox,
+pushes them to that branch on GitHub, and opens the GitHub page that compares
+the branch with main. It replaces the branch on GitHub if it is there already.
+It does not send the working tree; to send those changes, commit them first
+(see [Selecting changes](#selecting-changes)). If HEAD changed after the page
+loaded, the send stops. The client pushes from a bare repo at
+`<user cache dir>/webdiff/send/<owner>/<repo>.git`, not from your checkouts.
+The repo stays between sends, so each send transfers only the new objects. It
+is safe to delete. The GitHub repo is the last two segments of the path of the
+sandbox remote URL, so a GitHub mirror or proxy also works. `-github-url` sets
+the URL to push to.
+
 ## Managed worktrees
 
 Webdiff can create git worktrees for you (`POST /api/worktrees/create` with

@@ -1281,35 +1281,6 @@
     });
   }
 
-  // Sync buttons (push/pull) — relative POSTs land on the desktop
-  // client's /_local/sync mux (the page is served via the desktop
-  // reverse proxy, so same-origin = desktop). Brief visual feedback
-  // states the request outcome without taking the user off the page.
-  Array.prototype.forEach.call(document.querySelectorAll('button[data-sync-dir]'),function(b){
-    var origLabel=b.textContent;
-    b.addEventListener('click',function(){
-      var dir=b.dataset.syncDir;
-      var body={kind:b.dataset.kind,name:b.dataset.name};
-      b.disabled=true;b.title='';
-      b.classList.remove('sync-ok','sync-err');
-      b.classList.add('sync-busy');
-      b.textContent=(dir==='push'?'pushing…':'pulling…');
-      fetch('/_local/sync/'+dir,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-        .then(function(r){
-          if(!r.ok)return r.text().then(function(t){throw new Error(t||('status '+r.status))});
-          b.classList.remove('sync-busy');b.classList.add('sync-ok');
-          b.textContent=origLabel;
-          setTimeout(function(){b.classList.remove('sync-ok');b.disabled=false},1200);
-        })
-        .catch(function(err){
-          b.classList.remove('sync-busy');b.classList.add('sync-err');
-          b.title=String(err&&err.message||err);
-          b.textContent=origLabel;
-          setTimeout(function(){b.classList.remove('sync-err');b.disabled=false},2500);
-        });
-    });
-  });
-
   // postJSON sends body as JSON to url and returns the JSON response.
   // An error has the "error" field of the response as its message.
   function postJSON(url,body){
@@ -1322,6 +1293,88 @@
           return data;
         });
       });
+  }
+
+  // "send to github" is on the diff page only through the desktop
+  // client (webdiff client). The dialog asks for the name of the
+  // branch on GitHub. The client fetches the commits of the branch
+  // from the sandbox, pushes them, and returns the GitHub page that
+  // compares the branch with main. The tab for that page opens on the
+  // click, because a browser can block a tab that opens later.
+  var sendGitHubBtn=document.getElementById('send-github');
+  if(sendGitHubBtn)sendGitHubBtn.addEventListener('click',openSendGitHubModal);
+  function openSendGitHubModal(){
+    var d=sendGitHubBtn.dataset;
+    var backdrop=document.createElement('div');backdrop.className='modal-backdrop';
+    var modal=document.createElement('div');modal.className='modal send-github-modal';
+    var header=document.createElement('div');header.className='modal-header';
+    var title=document.createElement('span');title.textContent='send to github';
+    var cancel=document.createElement('button');cancel.type='button';cancel.className='toggle';cancel.textContent='cancel';
+    cancel.addEventListener('click',function(){backdrop.remove()});
+    header.appendChild(title);header.appendChild(cancel);
+    var bodyEl=document.createElement('div');bodyEl.className='modal-body';
+    var n=parseInt(d.commits,10)||0;
+    var note=document.createElement('p');note.className='modal-note';
+    note.textContent='Push '+n+' '+(n===1?'commit':'commits')+', up to '+d.head.slice(0,12)+', to a branch on GitHub. If the branch is on GitHub already, this replaces it.';
+    bodyEl.appendChild(note);
+    if(d.dirty){
+      var dirty=document.createElement('p');dirty.className='modal-note modal-warning';
+      dirty.textContent='The working tree has changes that are not committed. They are not sent. To send them, commit them first with the edit button of the working tree in the commit messages.';
+      bodyEl.appendChild(dirty);
+    }
+    var row=document.createElement('label');row.className='modal-agent-row';
+    var lbl=document.createElement('span');lbl.textContent='branch';
+    var input=document.createElement('input');input.type='text';input.className='modal-input';
+    input.value=d.branch||'';input.spellcheck=false;input.autocapitalize='off';
+    input.placeholder='branch name';
+    row.appendChild(lbl);row.appendChild(input);
+    bodyEl.appendChild(row);
+    var status=document.createElement('p');status.className='modal-note';status.hidden=true;
+    bodyEl.appendChild(status);
+    var footer=document.createElement('div');footer.className='modal-footer';
+    var go=document.createElement('button');go.type='button';go.className='toggle send-btn';go.textContent='send';
+    footer.appendChild(go);
+    function showStatus(text,cls){
+      status.hidden=false;
+      status.className='modal-note'+(cls?' '+cls:'');
+      status.textContent=text;
+    }
+    function send(){
+      var branch=input.value.trim();
+      if(!branch){input.focus();return}
+      if(branch===d.main){showStatus('Use a branch name that is not '+d.main+'.','modal-error');return}
+      go.disabled=true;input.disabled=true;
+      showStatus('Sending to GitHub…');
+      var tab=window.open('','_blank');
+      if(tab){
+        try{tab.document.title='Sending to GitHub…';tab.document.body.textContent='Sending '+branch+' to GitHub…'}catch(e){}
+      }
+      postJSON('/_local/github/send',{kind:d.kind,name:d.name,branch:branch,head:d.head}).then(function(res){
+        if(tab&&!tab.closed)tab.location.href=res.compareURL;
+        status.hidden=false;status.className='modal-note';
+        status.textContent='Sent '+res.branch+' to '+res.repo+'. ';
+        var link=document.createElement('a');link.href=res.compareURL;link.target='_blank';link.rel='noopener';
+        link.textContent='compare with '+d.main;
+        status.appendChild(link);
+        go.textContent='done';go.disabled=false;
+        go.removeEventListener('click',send);
+        go.addEventListener('click',function(){backdrop.remove()});
+      }).catch(function(err){
+        if(tab)tab.close();
+        go.disabled=false;input.disabled=false;
+        showStatus('Send failed: '+err.message,'modal-error');
+      });
+    }
+    go.addEventListener('click',send);
+    input.addEventListener('keydown',function(ev){
+      // Do not let the review shortcut of the page see Enter.
+      if(ev.key==='Enter'){ev.preventDefault();ev.stopPropagation();if(!go.disabled&&input.disabled===false)send()}
+    });
+    modal.appendChild(header);modal.appendChild(bodyEl);modal.appendChild(footer);
+    backdrop.appendChild(modal);
+    backdrop.addEventListener('click',function(ev){if(ev.target===backdrop)backdrop.remove()});
+    document.body.appendChild(backdrop);
+    setTimeout(function(){input.focus();input.select()},0);
   }
 
   // Commit message edits, on all screens. Save

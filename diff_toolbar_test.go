@@ -246,8 +246,10 @@ The body of &lt;a&gt;.</pre>`
 	})
 }
 
-// The commit messages have edit buttons, also one for the working tree.
-func TestDiffEditControls(t *testing.T) {
+// Through the desktop client, the diff page has a "send to github"
+// button. Without the client it does not. The commit messages have edit
+// buttons in both cases, also one for the working tree.
+func TestDiffEditAndSendControls(t *testing.T) {
 	_, wt := renameTestWorktree(t)
 	selectionWrite(t, wt, "a", "a\n")
 	selectionGit(t, wt, "add", "a")
@@ -258,9 +260,12 @@ func TestDiffEditControls(t *testing.T) {
 	if !ok {
 		t.Fatal("cannot resolve worktree")
 	}
-	render := func(t *testing.T, query string) string {
+	render := func(t *testing.T, query string, desktop bool) string {
 		t.Helper()
 		r := httptest.NewRequest(http.MethodGet, ref.url+query, nil)
+		if desktop {
+			r.Header.Set(clientHeader, "1")
+		}
 		w := httptest.NewRecorder()
 		renderRepo(w, r, ref)
 		if w.Code != http.StatusOK {
@@ -271,7 +276,12 @@ func TestDiffEditControls(t *testing.T) {
 	commitEdit := `<button class="toggle commit-edit" type="button" data-commit="` + head + `"`
 	workingEdit := `data-commit="working"`
 
-	html := render(t, "")
+	html := render(t, "", true)
+	if !strings.Contains(html, `id="send-github" data-kind="worktrees" data-name="repo-source"`) ||
+		!strings.Contains(html, `data-head="`+head+`" data-commits="1"`) ||
+		!strings.Contains(html, `data-dirty="1">send to github</button>`) {
+		t.Error("missing or wrong send to github button")
+	}
 	if !strings.Contains(html, `<div class="commit-messages" data-kind="worktrees" data-name="repo-source">`) {
 		t.Error("commit messages have no checkout")
 	}
@@ -280,13 +290,21 @@ func TestDiffEditControls(t *testing.T) {
 	}
 
 	// The working tree has an entry also with no commit selected.
-	html = render(t, "?changes=working")
+	html = render(t, "?changes=working", true)
 	if !strings.Contains(html, `id="commit-messages"`) || !strings.Contains(html, workingEdit) || strings.Contains(html, commitEdit) {
 		t.Error("working tree entry is wrong with only the working tree selected")
 	}
 	// The commit view has no working tree entry.
-	html = render(t, "?commit="+head)
+	html = render(t, "?commit="+head, true)
 	if !strings.Contains(html, commitEdit) || strings.Contains(html, workingEdit) {
 		t.Error("commit view edit buttons are wrong")
+	}
+
+	html = render(t, "", false)
+	if strings.Contains(html, `id="send-github"`) {
+		t.Error("page without the client has send to github")
+	}
+	if !strings.Contains(html, commitEdit) || !strings.Contains(html, workingEdit) {
+		t.Error("page without the client is missing edit buttons")
 	}
 }

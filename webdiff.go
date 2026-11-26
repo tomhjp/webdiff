@@ -1847,6 +1847,11 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	}
 	paneID, _, liveAgent := repoStreamPane(r.Context(), repo, sessionN)
 
+	// desktop tells that the page comes through the desktop client
+	// (see runClient). Only then does the page show "send to github",
+	// which needs the client.
+	desktop := r.Header.Get(clientHeader) != ""
+
 	// Which agent this page's copy names. A running session wins — it's
 	// a fact, not a preference — otherwise it's the `?agent=` the spawn
 	// picker will act on, defaulting to the -agent flag's value.
@@ -1949,18 +1954,8 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	if len(files) > 0 {
 		body.WriteString(`<button class="toggle icon-btn" type="button" id="toggle-all" title="expand all" aria-label="expand all"><svg class="icon" aria-hidden="true"><use href="#icon-expand-all"/></svg></button>`)
 	}
-	// Sync buttons: hand-off to the desktop client's /_local/sync mux.
-	// The browser is reverse-proxied through the client, so a relative
-	// POST lands on the desktop, never on the sandbox. data-sync-dir
-	// is the only differentiator the JS needs. Only emit them when the
-	// request came through the client's proxy (it tags requests with
-	// X-Webdiff-Client) — on direct web-app access the /_local/sync
-	// endpoints don't exist, so the buttons would be dead.
-	if r.Header.Get("X-Webdiff-Client") != "" {
-		fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="pull" data-kind="%s" data-name="%s" title="pull sandbox state into this desktop repo">&#x2193; pull</button>`,
-			template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
-		fmt.Fprintf(&body, `<button class="toggle" type="button" data-sync-dir="push" data-kind="%s" data-name="%s" title="push this desktop repo into the sandbox">&#x2191; push</button>`,
-			template.HTMLEscapeString(ref.kind), template.HTMLEscapeString(ref.name))
+	if desktop {
+		writeSendToGitHubButton(&body, ref, commits, working)
 	}
 	body.WriteString(`</div>`)
 	if ref.kind == "worktrees" {
@@ -2611,7 +2606,6 @@ func main() {
 
 	apiMux := http.NewServeMux()
 	registerAgentRoutes(apiMux)
-	registerSyncRoutes(apiMux)
 	registerGitRoutes(apiMux)
 
 	// safeweb's DefaultCSP is strict-by-default; everything except

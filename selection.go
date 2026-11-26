@@ -359,6 +359,42 @@ type commitEdit struct {
 	Working bool
 }
 
+// writeSendToGitHubButton writes the "send to github" button of the
+// diff page. The desktop client does the send (see githubSender). The
+// button sends the commits of the branch, up to HEAD. It does not send
+// the working tree. commits are the commits of the branch, the oldest
+// first, and working tells about the working tree.
+func writeSendToGitHubButton(body *strings.Builder, ref repoRef, commits []branchCommit, working workingTree) {
+	remote, _ := defaultRemote(ref.abs)
+	main := mainBranch(ref.abs, remote)
+	branch := currentBranch(ref.abs)
+	if branch == "HEAD" || branch == "unknown" || branch == main {
+		branch = ""
+	}
+	head := ""
+	if len(commits) > 0 {
+		head = commits[len(commits)-1].SHA
+	}
+	attrs := ""
+	title := "push the commits of this branch to a branch on GitHub"
+	if head == "" {
+		attrs = " disabled"
+		title = "the branch has no commits to send"
+	}
+	if working.Changed {
+		attrs += ` data-dirty="1"`
+	}
+	fmt.Fprintf(body, `<button class="toggle" type="button" id="send-github" data-kind="%s" data-name="%s" data-branch="%s" data-main="%s" data-head="%s" data-commits="%d" title="%s"%s>send to github</button>`,
+		template.HTMLEscapeString(ref.kind),
+		template.HTMLEscapeString(ref.name),
+		template.HTMLEscapeString(branch),
+		template.HTMLEscapeString(main),
+		template.HTMLEscapeString(head),
+		len(commits),
+		template.HTMLEscapeString(title),
+		attrs)
+}
+
 // commitViewURL returns the URL of the commit view of commit sha in the
 // checkout at refURL. The URL keeps session number n, so the comments
 // of the commit view go to the same session.
