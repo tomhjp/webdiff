@@ -191,8 +191,12 @@ The body of &lt;a&gt;.</pre>`
 	})
 
 	t.Run("working only", func(t *testing.T) {
+		// The section has only the entry of the working tree.
 		html := render(t, "?changes=working")
-		if strings.Contains(html, `id="commit-messages"`) {
+		if !strings.Contains(html, `<span class="stats-files">0 commits</span>`) || !strings.Contains(html, `data-commit="working"`) {
+			t.Error("no working tree entry without a selected commit")
+		}
+		if strings.Contains(html, firstLink) || strings.Contains(html, secondLink) {
 			t.Error("commit messages without a selected commit")
 		}
 	})
@@ -240,4 +244,49 @@ The body of &lt;a&gt;.</pre>`
 			t.Error("commit view reset to all changes")
 		}
 	})
+}
+
+// The commit messages have edit buttons, also one for the working tree.
+func TestDiffEditControls(t *testing.T) {
+	_, wt := renameTestWorktree(t)
+	selectionWrite(t, wt, "a", "a\n")
+	selectionGit(t, wt, "add", "a")
+	selectionGit(t, wt, "commit", "-qm", "add a")
+	head := selectionGit(t, wt, "rev-parse", "HEAD")
+	selectionWrite(t, wt, "b", "b\n")
+	ref, ok := resolveRepoRef("/worktrees/repo-source/")
+	if !ok {
+		t.Fatal("cannot resolve worktree")
+	}
+	render := func(t *testing.T, query string) string {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, ref.url+query, nil)
+		w := httptest.NewRecorder()
+		renderRepo(w, r, ref)
+		if w.Code != http.StatusOK {
+			t.Fatalf("render: %d: %s", w.Code, w.Body)
+		}
+		return w.Body.String()
+	}
+	commitEdit := `<button class="toggle commit-edit" type="button" data-commit="` + head + `"`
+	workingEdit := `data-commit="working"`
+
+	html := render(t, "")
+	if !strings.Contains(html, `<div class="commit-messages" data-kind="worktrees" data-name="repo-source">`) {
+		t.Error("commit messages have no checkout")
+	}
+	if !strings.Contains(html, commitEdit) || !strings.Contains(html, workingEdit) {
+		t.Error("missing edit buttons")
+	}
+
+	// The working tree has an entry also with no commit selected.
+	html = render(t, "?changes=working")
+	if !strings.Contains(html, `id="commit-messages"`) || !strings.Contains(html, workingEdit) || strings.Contains(html, commitEdit) {
+		t.Error("working tree entry is wrong with only the working tree selected")
+	}
+	// The commit view has no working tree entry.
+	html = render(t, "?commit="+head)
+	if !strings.Contains(html, commitEdit) || strings.Contains(html, workingEdit) {
+		t.Error("commit view edit buttons are wrong")
+	}
 }

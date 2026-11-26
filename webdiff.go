@@ -2007,8 +2007,18 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 		}
 	}
 
+	// Each commit message has an edit button. The working tree has an
+	// entry in the commit messages section when it is selected and has
+	// changes. Its edit button commits it with a new message.
+	edit := &commitEdit{
+		Kind:    ref.kind,
+		Name:    ref.name,
+		Working: selectionErr == nil && viewCommit == "" && selected["working"] && working.Changed,
+	}
+	hasMsgs := len(msgs) > 0 || edit.Working
+
 	emptyMsg := "No changes selected, or the selected changes are empty."
-	if len(files) == 0 && len(msgs) == 0 {
+	if len(files) == 0 && !hasMsgs {
 		if selectionErr != nil {
 			emptyMsg = selectionErr.Error()
 		}
@@ -2021,7 +2031,7 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// order, so the pill of the commit messages is first, as is its
 	// section.
 	body.WriteString(`<nav class="pillbar">`)
-	if len(msgs) > 0 {
+	if hasMsgs {
 		fmt.Fprintf(&body, `<a class="pill" href="#%s">commits</a>`, commitMessagesID)
 	}
 	for _, file := range files {
@@ -2036,8 +2046,8 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	}
 	body.WriteString(`</nav>`)
 
-	if len(msgs) > 0 {
-		writeCommitMessages(&body, msgs, urlPath, sessionN)
+	if hasMsgs {
+		writeCommitMessages(&body, msgs, urlPath, sessionN, edit)
 	}
 	if len(files) == 0 {
 		fmt.Fprintf(&body, `<p class="empty">%s</p>`, template.HTMLEscapeString(emptyMsg))
@@ -2602,6 +2612,7 @@ func main() {
 	apiMux := http.NewServeMux()
 	registerAgentRoutes(apiMux)
 	registerSyncRoutes(apiMux)
+	registerGitRoutes(apiMux)
 
 	// safeweb's DefaultCSP is strict-by-default; everything except
 	// same-origin URLs is blocked. The application JavaScript is now

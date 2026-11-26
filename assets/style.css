@@ -259,6 +259,29 @@ a { color: var(--accent) }
 .commit-sha { color: var(--branch); text-decoration: none }
 .commit-sha:hover { text-decoration: underline }
 .commit-message { margin: 8px 0 0; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; font: inherit }
+/* The edit controls of the commit messages. The working tree has no
+   message, so its message is empty. */
+.commit-meta { align-items: baseline }
+.commit-meta .commit-edit { margin-left: auto; padding: 0 8px; font-size: 12px }
+.commit-view-working .commit-sha { color: var(--color-3) }
+.commit-view-working .commit-sha:hover { text-decoration: none }
+.commit-view-working .commit-message:empty { display: none }
+.commit-editor { margin-top: 8px }
+/* The vertical line in the textarea shows column 72, the usual git
+   limit for the lines of a commit message. The font is monospace, so
+   72ch is the width of 72 characters. The 8px is the left padding. */
+.commit-editor textarea { --wrap-col: calc(8px + 72ch); width: 100%; resize: vertical; font: inherit; font-size: 13px; color: var(--fg); background-color: var(--bg); background-image: linear-gradient(to right, transparent var(--wrap-col), var(--border) var(--wrap-col), var(--border) calc(var(--wrap-col) + 1px), transparent calc(var(--wrap-col) + 1px)); border: 1px solid var(--border); padding: 6px 8px; box-sizing: border-box }
+.commit-editor textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent) }
+.commit-editor-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 6px }
+.commit-editor-note { margin-right: auto; color: var(--muted); font-size: 12px }
+.commit-editor .send-btn { background: var(--branch); color: var(--bg); font-weight: bold; border-color: var(--branch) }
+.commit-editor .send-btn:disabled { background: transparent; color: var(--muted); border-color: var(--border) }
+/* A touch screen needs a larger target, and a 16px textarea so that
+   iOS Safari does not zoom (see .comment-composer below). */
+@media (pointer: coarse) {
+  .commit-meta .commit-edit { padding: 6px 12px; margin: -6px 0 }
+  .commit-editor textarea { font-size: 16px }
+}
 /* The selection in the URL could not be shown, so the page shows all
    changes. The git error can be long, so it wraps. */
 .selection-reset { color: var(--color-3); padding: 8px 16px; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap }

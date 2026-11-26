@@ -1310,6 +1310,99 @@
     });
   });
 
+  // postJSON sends body as JSON to url and returns the JSON response.
+  // An error has the "error" field of the response as its message.
+  function postJSON(url,body){
+    return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){
+        return r.text().then(function(t){
+          var data=null;
+          try{data=JSON.parse(t)}catch(e){}
+          if(!r.ok)throw new Error((data&&data.error)||t||r.statusText);
+          return data;
+        });
+      });
+  }
+
+  // Commit message edits, on all screens. Save
+  // changes the message of the commit and makes the commits after it
+  // again, so they get new ids. For the working tree, save commits
+  // all of its changes with the message. The page then loads again,
+  // with the new ids in place of the old ones in the URL and in the
+  // saved selection.
+  var commitMsgs=document.querySelector('.commit-messages[data-kind]');
+  if(commitMsgs){
+    commitMsgs.querySelectorAll('.commit-edit').forEach(function(btn){
+      btn.addEventListener('click',function(){openCommitEditor(btn)});
+    });
+  }
+  function openCommitEditor(btn){
+    var view=btn.closest('.commit-view');
+    if(!view||view.querySelector('.commit-editor'))return;
+    var pre=view.querySelector('.commit-message');
+    var working=btn.dataset.commit==='working';
+    var ed=document.createElement('div');ed.className='commit-editor';
+    var ta=document.createElement('textarea');
+    ta.value=working?'':pre.textContent;
+    ta.spellcheck=true;
+    ta.rows=Math.min(30,Math.max(6,ta.value.split('\n').length+2));
+    ta.placeholder=working?'Commit message. A Signed-off-by trailer is added.':'';
+    var actions=document.createElement('div');actions.className='commit-editor-actions';
+    var note=document.createElement('span');note.className='commit-editor-note';
+    note.textContent=working?'Commits all the changes in the working tree, including files that are not tracked.':'The commits after this one get new ids.';
+    var cancel=document.createElement('button');cancel.type='button';cancel.className='toggle';cancel.textContent='cancel';
+    var save=document.createElement('button');save.type='button';save.className='toggle send-btn';save.textContent=working?'commit':'save';
+    actions.appendChild(note);actions.appendChild(cancel);actions.appendChild(save);
+    ed.appendChild(ta);ed.appendChild(actions);
+    pre.hidden=true;btn.hidden=true;
+    pre.parentNode.insertBefore(ed,pre.nextSibling);
+    function close(){ed.remove();pre.hidden=false;btn.hidden=false}
+    function submit(){
+      if(!ta.value.trim()){ta.focus();return}
+      save.disabled=true;cancel.disabled=true;ta.disabled=true;
+      save.textContent=working?'committing…':'saving…';
+      postJSON('/api/commits/message',{kind:commitMsgs.dataset.kind,name:commitMsgs.dataset.name,commit:btn.dataset.commit,message:ta.value})
+        .then(function(res){reloadAfterRewrite((res&&res.rewritten)||{})})
+        .catch(function(err){
+          save.disabled=false;cancel.disabled=false;ta.disabled=false;
+          save.textContent=working?'commit':'save';
+          window.alert((working?'commit':'save')+' failed: '+err.message);
+        });
+    }
+    cancel.addEventListener('click',close);
+    save.addEventListener('click',submit);
+    ta.addEventListener('keydown',function(ev){
+      if(ev.key==='Escape'){ev.preventDefault();ev.stopPropagation();close()}
+      else if(ev.key==='Enter'&&(ev.metaKey||ev.ctrlKey)){ev.preventDefault();ev.stopPropagation();submit()}
+    });
+    ta.focus();
+  }
+  // reloadAfterRewrite loads the page again after a commit edit.
+  // rewritten maps each old commit id to its new id, and "working" to
+  // the new commit of the working tree.
+  function reloadAfterRewrite(rewritten){
+    var u=new URL(location.href);
+    var c=u.searchParams.get('commit');
+    if(c&&rewritten[c])u.searchParams.set('commit',rewritten[c]);
+    if(u.searchParams.has('changes')){
+      var out=[];
+      u.searchParams.get('changes').split(',').forEach(function(v){
+        if(!v)return;
+        if(v==='working'&&rewritten.working)out.push(rewritten.working);
+        out.push(rewritten[v]&&v!=='working'?rewritten[v]:v);
+      });
+      u.searchParams.set('changes',out.join(','));
+    }
+    var key='webdiff:changes:'+location.pathname;
+    try{
+      var excluded=JSON.parse(localStorage.getItem(key)||'[]');
+      if(Array.isArray(excluded)&&excluded.length){
+        localStorage.setItem(key,JSON.stringify(excluded.map(function(v){return v!=='working'&&rewritten[v]||v})));
+      }
+    }catch(e){}
+    location.href=u.toString();
+  }
+
   // Worktree creation is available on the diff and stream pages.
   // Clicking "+ worktree"
   // reveals an inline form; submitting POSTs to /api/worktrees/create

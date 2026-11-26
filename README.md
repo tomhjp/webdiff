@@ -94,6 +94,13 @@ view, `?commit=<sha>`. The commit view shows only that commit: its message and
 its diff. It does not change the saved picker choices, and **apply** goes back
 to the normal diff page.
 
+Each message in the **commit messages** section has an **edit** button. Save
+changes the message of the commit, and makes the commits after it again on top
+of it, with the same trees and messages. The index and the working tree do not
+change. When the working tree is selected and has changes, it has an entry in
+the section too: its edit button commits all of its changes, including files
+that are not tracked, with the message and `git commit -s`.
+
 The home page shows totals for all branch and working-tree changes, relative to
 the same merge base as the default diff. It shows these totals only for worktrees
 and for the repos that `-develop-on-main` names. These totals and the working-tree index

@@ -307,25 +307,56 @@ const commitMessagesID = "commit-messages"
 // and full message of each commit in msgs. The id links to the commit
 // view of the commit. refURL and n are the checkout and the session
 // number of the page.
-func writeCommitMessages(body *strings.Builder, msgs []commitMessage, refURL string, n int) {
+//
+// If edit is not nil, each message has an edit button (see
+// handleCommitMessage), and if edit.Working is true, the working tree
+// has an entry after the commits, with no message.
+func writeCommitMessages(body *strings.Builder, msgs []commitMessage, refURL string, n int, edit *commitEdit) {
 	noun := "commits"
 	if len(msgs) == 1 {
 		noun = "commit"
 	}
-	fmt.Fprintf(body, `<details id="%s" open><summary><span class="filename">commit messages</span><span class="filestats"><span class="stats-files">%d %s</span></span></summary><div class="commit-messages">`,
+	fmt.Fprintf(body, `<details id="%s" open><summary><span class="filename">commit messages</span><span class="filestats"><span class="stats-files">%d %s</span></span></summary>`,
 		commitMessagesID, len(msgs), noun)
+	if edit != nil {
+		fmt.Fprintf(body, `<div class="commit-messages" data-kind="%s" data-name="%s">`,
+			template.HTMLEscapeString(edit.Kind), template.HTMLEscapeString(edit.Name))
+	} else {
+		body.WriteString(`<div class="commit-messages">`)
+	}
 	for _, m := range msgs {
 		body.WriteString(`<div class="commit-view">`)
-		fmt.Fprintf(body, `<div class="commit-meta"><a class="commit-sha" href="%s" title="view commit %s">%s</a><span>%s</span><span>%s</span></div>`,
+		fmt.Fprintf(body, `<div class="commit-meta"><a class="commit-sha" href="%s" title="view commit %s">%s</a><span>%s</span><span>%s</span>`,
 			template.HTMLEscapeString(commitViewURL(refURL, n, m.SHA)),
 			template.HTMLEscapeString(m.SHA),
 			template.HTMLEscapeString(m.SHA[:min(12, len(m.SHA))]),
 			template.HTMLEscapeString(m.Author),
 			template.HTMLEscapeString(m.Date))
+		if edit != nil {
+			fmt.Fprintf(body, `<button class="toggle commit-edit" type="button" data-commit="%s" title="edit the message; the commits after it get new ids">edit</button>`,
+				template.HTMLEscapeString(m.SHA))
+		}
+		body.WriteString(`</div>`)
 		fmt.Fprintf(body, `<pre class="commit-message">%s</pre>`, template.HTMLEscapeString(m.Body))
 		body.WriteString(`</div>`)
 	}
+	if edit != nil && edit.Working {
+		body.WriteString(`<div class="commit-view commit-view-working">`)
+		body.WriteString(`<div class="commit-meta"><span class="commit-sha">working tree</span><span>not committed</span>`)
+		body.WriteString(`<button class="toggle commit-edit" type="button" data-commit="working" title="write a message and commit the working tree">edit</button></div>`)
+		body.WriteString(`<pre class="commit-message"></pre>`)
+		body.WriteString(`</div>`)
+	}
 	body.WriteString(`</div></details>`)
+}
+
+// commitEdit tells writeCommitMessages to add the controls that edit
+// the commit messages of the checkout Kind/Name.
+type commitEdit struct {
+	Kind string
+	Name string
+	// Working tells to add an entry for the working tree.
+	Working bool
 }
 
 // commitViewURL returns the URL of the commit view of commit sha in the
