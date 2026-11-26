@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tomhjp/webdiff/internal/repostats"
 )
@@ -138,11 +139,16 @@ func TestWriteRepoActionsGroup(t *testing.T) {
 }
 
 func TestSortByAgentActivity(t *testing.T) {
+	created := func(sec int64) time.Time { return time.Unix(sec, 0) }
 	targets := []repostats.Target{
-		{Name: "a-none", Path: "/tmp/wt/a/none"},
+		{Name: "a-none", Path: "/tmp/wt/a/none", Created: created(10)},
 		{Name: "b-old", Path: "/tmp/wt/b/old"},
 		{Name: "c-new", Path: "/tmp/wt/c/new"},
 		{Name: "d-old", Path: "/tmp/wt/d/old"},
+		// The targets with no session show the most recently
+		// created first.
+		{Name: "e-none-newest", Path: "/tmp/wt/e/none", Created: created(30)},
+		{Name: "f-none-newer", Path: "/tmp/wt/f/none", Created: created(20)},
 	}
 	session := func(name string) string {
 		return repoSessionName(filepath.Join("/tmp/wt", name))
@@ -165,7 +171,7 @@ func TestSortByAgentActivity(t *testing.T) {
 	for _, target := range targets {
 		got = append(got, target.Name)
 	}
-	want := []string{"c-new", "b-old", "d-old", "a-none"}
+	want := []string{"c-new", "b-old", "d-old", "e-none-newest", "f-none-newer", "a-none"}
 	if !slices.Equal(got, want) {
 		t.Errorf("order = %v, want %v", got, want)
 	}
@@ -223,5 +229,167 @@ func TestCheckoutSessionRows(t *testing.T) {
 	want := []string{"pi · /srv/corp", "claude #2 · /srv/corp", "stopped", "stopped #3"}
 	if !slices.Equal(got, want) {
 		t.Errorf("rows = %q, want %q", got, want)
+	}
+}
+
+func TestGroupByBranch(t *testing.T) {
+	old := defaultBranchPrefix
+	defaultBranchPrefix = "tomhjp/"
+	defer func() { defaultBranchPrefix = old }()
+	targets := []repostats.Target{
+		{Name: "corp-foo", Path: "/tmp/wt/corp/foo", Branch: "tomhjp/foo"},
+		{Name: "corp-bar", Path: "/tmp/wt/corp/bar", Branch: "tomhjp/bar"},
+		{Name: "tailscale-foo", Path: "/tmp/wt/tailscale/foo", Branch: "tomhjp/foo"},
+		{Name: "corp-old", Path: "/tmp/wt/corp/old", Broken: true},
+		{Name: "tailscale-old", Path: "/tmp/wt/tailscale/old", Broken: true},
+		{Name: "corp-det", Path: "/tmp/wt/corp/det", Branch: "HEAD"},
+	}
+	var got []string
+	for _, g := range groupByBranch(targets) {
+		var names []string
+		for _, target := range g.Worktrees {
+			names = append(names, target.Name)
+		}
+		got = append(got, g.Title+": "+strings.Join(names, " "))
+	}
+	want := []string{
+		"foo: corp-foo tailscale-foo",
+		"bar: corp-bar",
+		"old: corp-old",
+		"old: tailscale-old",
+		"det: corp-det",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("groups =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestWriteBranchGroup(t *testing.T) {
+	g := branchGroup{
+		Title: "foo",
+		Worktrees: []repostats.Target{
+			{
+				Kind:       repostats.Worktree,
+				Name:       "corp-foo",
+				Path:       "/tmp/wt/corp/foo",
+				ParentRepo: "corp",
+				Branch:     "tomhjp/foo",
+				Commits:    3,
+				AllChanges: repostats.Summary{
+					Files: 2,
+					Ins:   5,
+				},
+				Uncommitted: repostats.Summary{
+					Files: 1,
+					Ins:   2,
+				},
+			},
+			{
+				Kind:       repostats.Worktree,
+				Name:       "tailscale-foo",
+				Path:       "/tmp/wt/tailscale/foo",
+				ParentRepo: "tailscale",
+				Branch:     "tomhjp/foo",
+				Commits:    1,
+			},
+		},
+	}
+	sessions := func(target repostats.Target) []homeSession {
+		if target.Name != "corp-foo" {
+			return nil
+		}
+		return []homeSession{
+			{
+				Session: "corp-foo-wd",
+				Label:   "corp-foo-wd:0.0",
+				Href:    "/pane?paneID=%251",
+				Desc:    "pi · working",
+				When:    "now",
+			},
+		}
+	}
+	var b strings.Builder
+	writeBranchGroup(&b, g, sessions)
+	got := b.String()
+	for _, want := range []string{
+		`<div class="dir-group branch-group"><div class="branch-title">foo</div>`,
+		`<span class="title-short">corp</span>`,
+		`<div class="dir-row repo-row"><a class="dir-link" href="/worktrees/corp-foo/"><span class="dir-name">`,
+		`<button class="dir-commits commit-toggle" type="button" aria-expanded="false" aria-controls="commits-worktrees-corp-foo" title="show or hide the commits">3 commits</button><span class="dir-dirty" title="uncommitted changes" aria-label="uncommitted changes">●</span>`,
+		`<span class="dir-stats"><span class="stats-files">2 files</span> <span class="stats-ins" data-stat="+5"></span></span></a>`,
+		`<div class="commit-list" id="commits-worktrees-corp-foo" hidden>`,
+		`<span class="title-short">tailscale</span>`,
+		`<button class="dir-commits commit-toggle" type="button" aria-expanded="false" aria-controls="commits-worktrees-tailscale-foo" title="show or hide the commits">1 commit</button><span class="dir-dirty"></span>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output does not contain\n%s\ngot:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "dir-branch\">tomhjp/foo") || strings.Contains(got, "dir-branch\">foo") {
+		t.Errorf("repo row shows the branch:\n%s", got)
+	}
+	// A worktree with no commits and no changes has a plain count.
+	var clean strings.Builder
+	writeWorktreeRow(&clean, repostats.Target{
+		Kind: repostats.Worktree,
+		Name: "corp-bar",
+		Path: "/tmp/wt/corp/bar",
+	}, "corp")
+	if got, want := clean.String(), `<span class="dir-commits">0 commits</span><span class="dir-dirty"></span>`; !strings.Contains(got, want) || strings.Contains(got, "commit-toggle") {
+		t.Errorf("clean worktree row does not contain %s, or has a toggle:\n%s", want, got)
+	}
+	// The session row of corp comes before the tailscale row.
+	if i, j := strings.Index(got, "session-row"), strings.Index(got, "tailscale"); i < 0 || i > j {
+		t.Errorf("session row is not below its repo row:\n%s", got)
+	}
+}
+
+func TestWriteCommitList(t *testing.T) {
+	target := repostats.Target{
+		Kind:    repostats.Worktree,
+		Name:    "corp-foo",
+		Path:    "/tmp/wt/corp/foo",
+		Commits: 3,
+		CommitList: []repostats.Commit{
+			{
+				SHA:     "1111111111111111111111111111111111111111",
+				Subject: "first <change>",
+				Summary: repostats.Summary{
+					Files: 1,
+					Ins:   2,
+					Del:   1,
+				},
+			},
+			{
+				SHA:     "2222222222222222222222222222222222222222",
+				Subject: "second",
+			},
+		},
+		Uncommitted: repostats.Summary{
+			Files: 1,
+			Del:   4,
+		},
+	}
+	var b strings.Builder
+	writeCommitList(&b, target)
+	got := b.String()
+	want := `<div class="commit-list" id="commits-worktrees-corp-foo" hidden>` +
+		`<div class="dir-row commit-row commit-more"><span class="dir-name">… 1 earlier commit</span></div>` +
+		`<a class="dir-row commit-row" href="/worktrees/corp-foo/?commit=1111111111111111111111111111111111111111" title="view commit 1111111111111111111111111111111111111111"><span class="commit-row-sha">1111111</span><span class="dir-name">first &lt;change&gt;</span><span class="dir-stats"><span class="stats-ins" data-stat="+2"></span> <span class="stats-del" data-stat="-1"></span></span></a>` +
+		`<a class="dir-row commit-row" href="/worktrees/corp-foo/?commit=2222222222222222222222222222222222222222" title="view commit 2222222222222222222222222222222222222222"><span class="commit-row-sha">2222222</span><span class="dir-name">second</span><span class="dir-stats"></span></a>` +
+		`<div class="dir-row commit-row commit-uncommitted"><span class="commit-row-sha">●</span><span class="dir-name">uncommitted</span><span class="dir-stats"><span class="stats-del" data-stat="-4"></span></span></div>` +
+		`</div>`
+	if got != want {
+		t.Errorf("writeCommitList =\n%s\nwant:\n%s", got, want)
+	}
+
+	// A clean worktree with no commits has no list.
+	b.Reset()
+	writeCommitList(&b, repostats.Target{
+		Kind: repostats.Worktree,
+		Name: "corp-bar",
+	})
+	if got := b.String(); got != "" {
+		t.Errorf("writeCommitList for a clean worktree = %q, want \"\"", got)
 	}
 }

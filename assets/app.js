@@ -1080,6 +1080,45 @@
     });
   }
 
+  // Listing page: the commit count of a worktree row shows or hides
+  // the commit rows below it. Keep the names of the open lists, so that
+  // they stay open when the page loads again.
+  var HOME_COMMITS_KEY='webdiff:homeCommits';
+  var commitToggles=document.querySelectorAll('.commit-toggle[aria-controls]');
+  if(commitToggles.length>0){
+    var openCommits=[];
+    try{
+      var savedCommits=JSON.parse(localStorage.getItem(HOME_COMMITS_KEY)||'[]');
+      if(Array.isArray(savedCommits))openCommits=savedCommits;
+    }catch(e){}
+    function setCommitsOpen(btn,list,open){
+      list.hidden=!open;
+      btn.setAttribute('aria-expanded',open?'true':'false');
+    }
+    var present=[];
+    commitToggles.forEach(function(btn){
+      var id=btn.getAttribute('aria-controls');
+      var list=document.getElementById(id);
+      if(!list)return;
+      present.push(id);
+      setCommitsOpen(btn,list,openCommits.indexOf(id)!==-1);
+      btn.addEventListener('click',function(){
+        var open=list.hidden;
+        setCommitsOpen(btn,list,open);
+        var i=openCommits.indexOf(id);
+        if(open&&i===-1)openCommits.push(id);
+        if(!open&&i!==-1)openCommits.splice(i,1);
+        try{
+          if(openCommits.length)localStorage.setItem(HOME_COMMITS_KEY,JSON.stringify(openCommits));
+          else localStorage.removeItem(HOME_COMMITS_KEY);
+        }catch(e){}
+      });
+    });
+    // Forget the lists of worktrees that are gone, so the saved state
+    // does not grow without limit.
+    openCommits=openCommits.filter(function(id){return present.indexOf(id)!==-1});
+  }
+
   // Listing page: poll for spinning *-wd sessions and reflect that
   // state on the tmux rows with a CSS spinner via .session-spinning.
   var tmuxRows=document.querySelectorAll('.tmux-row[data-session]');

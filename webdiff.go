@@ -847,15 +847,15 @@ func renderHome(w http.ResponseWriter, r *http.Request) {
 		writeSectionEnd(&body)
 	}
 
+	// Worktrees show in groups by branch, so a branch that has a
+	// worktree in more than one repo shows as one group. The group with
+	// the most recent agent activity comes first. The worktrees with no
+	// agent follow, the most recently created first.
 	sortByAgentActivity(worktrees, bySession)
 	if len(worktrees) > 0 {
 		writeSectionStart(&body, "worktrees", "worktrees", len(worktrees))
-		for _, target := range worktrees {
-			label := target.ParentRepo
-			if label == "" {
-				label = target.Name
-			}
-			writeDirGroup(&body, target, label, takeSessions(target))
+		for _, g := range groupByBranch(worktrees) {
+			writeBranchGroup(&body, g, takeSessions)
 		}
 		writeSectionEnd(&body)
 	}
@@ -909,8 +909,10 @@ func checkoutSessionRows(rows []homeSession, dir string) []homeSession {
 
 // sortByAgentActivity puts the targets with the most recent agent
 // activity first. The activity of a target is the latest LastUsed of its
-// sessions in bySession, live or stopped. Targets with the same time, or
-// with no session, keep the name order from the stats snapshot.
+// sessions in bySession, live or stopped. The targets with no session
+// follow, the most recently created first (see repostats.Target.Created).
+// Targets with the same activity time and the same creation time keep the
+// name order from the stats snapshot.
 func sortByAgentActivity(targets []repostats.Target, bySession map[string][]homeSession) {
 	activity := make(map[string]int64, len(targets))
 	for _, target := range targets {
@@ -921,7 +923,10 @@ func sortByAgentActivity(targets []repostats.Target, bySession map[string][]home
 		activity[target.Path] = latest
 	}
 	slices.SortStableFunc(targets, func(a, b repostats.Target) int {
-		return cmp.Compare(activity[b.Path], activity[a.Path])
+		if c := cmp.Compare(activity[b.Path], activity[a.Path]); c != 0 {
+			return c
+		}
+		return b.Created.Compare(a.Created)
 	})
 }
 
@@ -940,13 +945,70 @@ func writeSectionEnd(b *strings.Builder) {
 	b.WriteString(`</div></details>`)
 }
 
-// writeDirGroup emits a repo or worktree row and, below it, the rows of
-// the sessions that belong to it.
+// writeDirGroup emits a repo row and, below it, the rows of the sessions
+// that belong to it.
 func writeDirGroup(b *strings.Builder, target repostats.Target, label string, sessions []homeSession) {
 	b.WriteString(`<div class="dir-group">`)
 	writeDirRow(b, target, label)
 	for _, s := range sessions {
 		writeSessionRow(b, s, true)
+	}
+	b.WriteString(`</div>`)
+}
+
+// branchGroup is one group of the worktrees section on the home page:
+// the worktrees that have the same branch, one for each repo.
+type branchGroup struct {
+	// Title is the branch without the configured prefix. For a worktree
+	// with no known branch, or with a detached HEAD, it is the name of
+	// the worktree directory.
+	Title     string
+	Worktrees []repostats.Target
+}
+
+// groupByBranch puts the worktrees that have the same branch into one
+// group. The groups and the worktrees in each group keep the order of
+// targets. A worktree with no known branch, or with a detached HEAD, is
+// in a group of its own.
+func groupByBranch(targets []repostats.Target) []branchGroup {
+	var groups []branchGroup
+	index := make(map[string]int)
+	for _, target := range targets {
+		title := homeBranchName(target.Branch)
+		key := "branch:" + title
+		if target.Branch == "" || target.Branch == "HEAD" {
+			title = filepath.Base(target.Path)
+			key = "path:" + target.Path
+		}
+		i, ok := index[key]
+		if !ok {
+			i = len(groups)
+			index[key] = i
+			groups = append(groups, branchGroup{
+				Title: title,
+			})
+		}
+		groups[i].Worktrees = append(groups[i].Worktrees, target)
+	}
+	return groups
+}
+
+// writeBranchGroup emits one group of the worktrees section: the branch
+// as the title, then for each worktree a row for its repo and the rows
+// of its sessions. sessions returns the session rows of a worktree.
+func writeBranchGroup(b *strings.Builder, g branchGroup, sessions func(repostats.Target) []homeSession) {
+	b.WriteString(`<div class="dir-group branch-group">`)
+	fmt.Fprintf(b, `<div class="branch-title">%s</div>`, template.HTMLEscapeString(g.Title))
+	for _, target := range g.Worktrees {
+		label := target.ParentRepo
+		if label == "" {
+			label = target.Name
+		}
+		writeWorktreeRow(b, target, label)
+		writeCommitList(b, target)
+		for _, s := range sessions(target) {
+			writeSessionRow(b, s, true)
+		}
 	}
 	b.WriteString(`</div>`)
 }
@@ -984,12 +1046,11 @@ func writeRepoActionsGroup(b *strings.Builder, target repostats.Target, sessions
 	b.WriteString(`</div>`)
 }
 
-// writeDirRow emits one <a class="dir-row repo-row"> for a repo or
-// worktree on the home page. slug is the URL/stats path component; label
-// is what shows on the left (the repo name for a repo, the parent repo
-// for a worktree, so every row reads "repo … branch"); dir is the
-// checkout's full path, shown in place of label on wide viewports. The
-// branch and diff stats come from the authoritative repostats snapshot.
+// writeDirRow emits one <a class="dir-row repo-row"> for a repo on the
+// home page. label is what shows on the left; the checkout's full path
+// shows in place of label on wide viewports. At the right are the diff
+// stats and the branch. These values come from the authoritative
+// repostats snapshot.
 // A failed query hides stale stats and adds an unavailable label to that row.
 // Broken worktrees get the dir-broken class so they're greyed out but
 // still clickable through to the diff page where the
@@ -1026,6 +1087,127 @@ func writeDirRow(b *strings.Builder, target repostats.Target, label string) {
 	writeOpenButtons(b, target.Path, "dir-open")
 	writeCopyButton(b, target.Path, "dir-copy")
 	b.WriteString(`</div>`)
+}
+
+// writeWorktreeRow emits the row of one worktree in a branch group. It
+// looks like the row of writeDirRow, but at the right it shows the
+// number of commits and a mark for uncommitted changes in place of the
+// branch, because the title of the group shows the branch. One link to
+// the diff page holds the repo name and the diff stats. The full row is
+// not a link, because the commit count is a button that shows and hides
+// the commit rows (see writeCommitList).
+func writeWorktreeRow(b *strings.Builder, target repostats.Target, label string) {
+	url := "/" + string(target.Kind) + "/" + target.Name + "/"
+	cls := "dir-row repo-row"
+	if target.Broken {
+		cls += " dir-broken"
+	}
+	b.WriteString(`<div class="dir-row-wrap">`)
+	fmt.Fprintf(b, `<div class="%s"><a class="dir-link" href="%s"><span class="dir-name">`, cls, template.HTMLEscapeString(url))
+	writeTitle(b, label, target.Path)
+	b.WriteString(`</span><span class="dir-stats">`)
+	if !target.Broken && target.Error == "" {
+		writeSummary(b, target.AllChanges)
+	}
+	b.WriteString(`</span></a>`)
+	if target.Broken {
+		b.WriteString(`<span class="dir-branch dir-folder-tag">broken</span>`)
+	} else if target.Error != "" {
+		fmt.Fprintf(b, `<span class="dir-branch dir-folder-tag" title="%s">unavailable</span>`, template.HTMLEscapeString(target.Error))
+	} else {
+		writeCommitState(b, target)
+	}
+	b.WriteString(`</div>`)
+	writeOpenButtons(b, target.Path, "dir-open")
+	writeCopyButton(b, target.Path, "dir-copy")
+	b.WriteString(`</div>`)
+}
+
+// commitListID returns the id of the commit rows of target.
+func commitListID(target repostats.Target) string {
+	return "commits-" + string(target.Kind) + "-" + target.Name
+}
+
+// hasCommitList reports whether writeCommitList writes rows for target.
+func hasCommitList(target repostats.Target) bool {
+	return !target.Broken && (target.Commits > 0 || target.Dirty())
+}
+
+// writeCommitState emits the number of commits of target that are not
+// on the main branch, then a mark if target has uncommitted changes.
+// The mark element is always there, so that the commit counts of the
+// rows in a group align. If target has commit rows, the count is a
+// button that shows and hides them. app.js keeps the state of each
+// button.
+func writeCommitState(b *strings.Builder, target repostats.Target) {
+	noun := "commits"
+	if target.Commits == 1 {
+		noun = "commit"
+	}
+	if hasCommitList(target) {
+		fmt.Fprintf(b, `<button class="dir-commits commit-toggle" type="button" aria-expanded="false" aria-controls="%s" title="show or hide the commits">%d %s</button>`,
+			template.HTMLEscapeString(commitListID(target)), target.Commits, noun)
+	} else {
+		fmt.Fprintf(b, `<span class="dir-commits">%d %s</span>`, target.Commits, noun)
+	}
+	if target.Dirty() {
+		b.WriteString(`<span class="dir-dirty" title="uncommitted changes" aria-label="uncommitted changes">●</span>`)
+	} else {
+		b.WriteString(`<span class="dir-dirty"></span>`)
+	}
+}
+
+// writeCommitList emits a row for each commit of target, the oldest
+// first, and then a row for the uncommitted changes if there are some.
+// Each commit row links to the commit view of its commit. The list is
+// hidden until the commit count of the row above it shows it (see
+// writeCommitState). A broken target, or a target with no commits and
+// no changes, has no list.
+func writeCommitList(b *strings.Builder, target repostats.Target) {
+	if !hasCommitList(target) {
+		return
+	}
+	refURL := "/" + string(target.Kind) + "/" + target.Name + "/"
+	fmt.Fprintf(b, `<div class="commit-list" id="%s" hidden>`, template.HTMLEscapeString(commitListID(target)))
+	if earlier := target.Commits - len(target.CommitList); earlier > 0 {
+		noun := "commits"
+		if earlier == 1 {
+			noun = "commit"
+		}
+		fmt.Fprintf(b, `<div class="dir-row commit-row commit-more"><span class="dir-name">… %d earlier %s</span></div>`, earlier, noun)
+	}
+	for _, c := range target.CommitList {
+		fmt.Fprintf(b, `<a class="dir-row commit-row" href="%s" title="view commit %s"><span class="commit-row-sha">%s</span><span class="dir-name">%s</span><span class="dir-stats">`,
+			template.HTMLEscapeString(commitViewURL(refURL, 0, c.SHA)),
+			template.HTMLEscapeString(c.SHA),
+			template.HTMLEscapeString(c.SHA[:min(7, len(c.SHA))]),
+			template.HTMLEscapeString(c.Subject))
+		writeLineCounts(b, c.Summary)
+		b.WriteString(`</span></a>`)
+	}
+	// The uncommitted changes have no view of their own, so the row is
+	// not a link. A link with ?changes=working would change the saved
+	// selection of the diff page.
+	if target.Dirty() {
+		b.WriteString(`<div class="dir-row commit-row commit-uncommitted"><span class="commit-row-sha">●</span><span class="dir-name">uncommitted</span><span class="dir-stats">`)
+		writeLineCounts(b, target.Uncommitted)
+		b.WriteString(`</span></div>`)
+	}
+	b.WriteString(`</div>`)
+}
+
+// writeLineCounts emits the inserted and deleted line counts of s. A
+// count of zero does not show.
+func writeLineCounts(b *strings.Builder, s repostats.Summary) {
+	if s.Ins > 0 {
+		fmt.Fprintf(b, `<span class="stats-ins" data-stat="+%d"></span>`, s.Ins)
+	}
+	if s.Ins > 0 && s.Del > 0 {
+		b.WriteString(` `)
+	}
+	if s.Del > 0 {
+		fmt.Fprintf(b, `<span class="stats-del" data-stat="-%d"></span>`, s.Del)
+	}
 }
 
 // homeBranchName removes the configured prefix from a branch shown on the
