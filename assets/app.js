@@ -1186,24 +1186,6 @@
     });
   }
 
-  // Agent picker beside the diff page's spawn button. Only rendered
-  // when no session is running yet, and it retargets the sibling
-  // anchor rather than navigating itself — the button stays a plain
-  // link, and the choice is only committed when it's clicked. Changing
-  // it doesn't reload, so the page's other agent labels keep naming the
-  // default until the session actually starts.
-  var agentSelect=document.getElementById('agent-select');
-  var agentBtn=document.getElementById('agent-btn');
-  if(agentSelect&&agentBtn){
-    agentSelect.addEventListener('change',function(){
-      var u=new URL(agentBtn.href,location.href);
-      u.searchParams.set('agent',agentSelect.value);
-      agentBtn.href=u.pathname+u.search;
-      agentBtn.textContent=agentSelect.value;
-      agentBtn.title='start a '+agentSelect.value+' session for this repo';
-    });
-  }
-
   function setupDiffMore(){
     var toggle=document.getElementById('diff-more-toggle');
     var menu=document.getElementById('diff-more-menu');

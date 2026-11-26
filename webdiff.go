@@ -137,22 +137,6 @@ func agentChoices() []string {
 	return ids
 }
 
-// writeAgentSelect emits the agent drop-down with selected pre-picked.
-// Uses .chrome-select for the same style as other header controls. Both read
-// as the same kind of control.
-func writeAgentSelect(b *strings.Builder, id, selected string) {
-	fmt.Fprintf(b, `<select class="chrome-select" id="%s" title="which agent to start">`, id)
-	for _, choice := range agentChoices() {
-		sel := ""
-		if choice == selected {
-			sel = ` selected`
-		}
-		fmt.Fprintf(b, `<option value="%s"%s>%s</option>`,
-			template.HTMLEscapeString(choice), sel, template.HTMLEscapeString(choice))
-	}
-	b.WriteString(`</select>`)
-}
-
 // sshHost is how the machine running the _browser_ reaches this one over
 // SSH, for the hand-off links writeOpenButtons emits. The MagicDNS name is
 // only a guess at that — it's wrong as soon as the user's ~/.ssh/config
@@ -1748,13 +1732,6 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	body.WriteString(`<a class="toggle" href="/">home</a>`)
 	fmt.Fprintf(&body, `<a class="%s" id="agent-btn" href="%s" title="%s">%s</a>`,
 		agentClass, template.HTMLEscapeString(agentHref), template.HTMLEscapeString(agentTitle), template.HTMLEscapeString(agentLabel))
-	// The picker only makes sense before a session exists: once one is
-	// running the button just attaches to it, and switching agents is
-	// the restart modal's job. app.js rewrites #agent-btn's href on
-	// change so this stays a plain navigation.
-	if paneID == "" {
-		writeAgentSelect(&body, "agent-select", pageAgent)
-	}
 	writeOpenButtons(&body, ref.abs, "toggle")
 	// "more" is next to home and the agent button, as on the stream page.
 	body.WriteString(`<button class="toggle" type="button" id="diff-more-toggle" aria-expanded="false" aria-controls="diff-more-menu">more &#x25be;</button>`)

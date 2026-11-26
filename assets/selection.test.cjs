@@ -5,7 +5,7 @@ const vm = require('node:vm');
 
 const app = readFileSync(__dirname + '/app.js', 'utf8');
 const start = app.indexOf('  // Store exclusions per checkout.');
-const end = app.indexOf('  // Agent picker', start);
+const end = app.indexOf('  function setupDiffMore()', start);
 const script = '(function(){' + app.slice(start, end) + '})()';
 
 function picker(url, storage = new Map(), values = ['working', 'abc', 'def'], reset = false) {
