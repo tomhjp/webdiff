@@ -2517,6 +2517,9 @@ func main() {
 	onMainFlag := flag.String("develop-on-main", "", "comma-separated repos under the root that are developed directly on main; the home page shows them above the repos section with their branch and diff stats, and shows the other repos with buttons to start a worktree or an agent")
 	sshHostFlag := flag.String("ssh-host", "", "how the browser's machine reaches this one over SSH (e.g. an ~/.ssh/config alias); defaults to this node's MagicDNS name")
 	maintnerFlag := flag.String("maintner", "", "base URL of a maintner server (e.g. http://maintner.corp.ts.net) that supplies the GitHub pull request of each branch")
+	prPollFlag := flag.Duration("pr-poll", 15*time.Minute, "interval of the git ls-remote poll for the pull requests of repos that maintner does not watch, or of all repos with no -maintner, while a branch of the repo has a commit from the last 3 hours; 0 turns the poll off")
+	prPollIdleFlag := flag.Duration("pr-poll-idle", 24*time.Hour, "interval of the git ls-remote poll for a repo with no commit on its branches in the last 3 hours")
+	gitProxyFlag := flag.String("git-proxy", "", "base URL of a read-only git proxy (e.g. git://rogitproxy.corp.ts.net) that the pull request poll uses for private repos; it tries public GitHub first")
 	flag.Parse()
 	args := flag.Args()
 
@@ -2615,7 +2618,10 @@ func main() {
 	}
 	startRepoPuller(context.Background(), filepath.Join(cacheRoot, "pull.json"))
 	if c := (prConfig{
-		Maintner: strings.TrimSpace(*maintnerFlag),
+		Maintner:    strings.TrimSpace(*maintnerFlag),
+		GitPoll:     *prPollFlag,
+		GitPollIdle: *prPollIdleFlag,
+		GitProxy:    strings.TrimSpace(*gitProxyFlag),
 	}); c.enabled() {
 		prs = newPRTracker(c)
 		startPRTracker(prs)

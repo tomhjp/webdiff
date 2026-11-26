@@ -185,8 +185,23 @@ each hour catches changes that the long poll missed. The stream page updates
 its heading when the pull request changes; the other pages show the value when
 they load.
 
-The GitHub repo of a checkout comes from the URL of its default remote. Repos
-that maintner does not watch show no pull requests.
+The GitHub repo of a checkout comes from the URL of its default remote.
+
+For repos that maintner does not watch, or for all repos with no `-maintner`,
+webdiff polls git instead. The poll is adaptive: it asks about a repo each
+`-pr-poll` (default 15m; `0` turns the poll off) while one of its worktree
+branches has a commit from the last 3 hours, and else each `-pr-poll-idle`
+(default 24h). A branch that a page shows for the first time is looked up at
+once. One `git ls-remote` for each repo lists the `refs/pull/<n>/head` and
+`refs/pull/<n>/merge` refs that GitHub keeps for each pull request. The pull
+request of a branch is the one whose head is the commit of the branch on GitHub
+or in the checkout; a branch at the commit of main has none. The poll asks
+public GitHub without credentials first. For a private repo it then asks the
+read-only git proxy at `-git-proxy` (for example
+`-git-proxy=git://rogitproxy.corp.ts.net`). Git does not tell the review state,
+so these pull requests show a grey ring in place of the tick or circle. An open
+pull request has a merge ref; one without it is closed, merged or in conflict,
+so it shows no state.
 
 ## Install
 

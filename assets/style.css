@@ -144,13 +144,15 @@ a { color: var(--accent) }
 .head-meta .stats { flex-shrink: 0 }
 /* The GitHub pull request of the branch, next to the branch on the home
    page and in the page heading. Emitted by prBadgeHTML in pr.go. The
-   mark is a green tick when the pull request is approved, and a yellow
-   circle when it is not. */
+   mark is a green tick when the pull request is approved, a yellow
+   circle when it is not, and a grey ring when the review state is not
+   known (the git poll in pr_git.go). */
 .pr-badge { flex-shrink: 0; font-size: 12px; font-weight: normal; color: var(--muted); text-decoration: none; white-space: nowrap }
 .pr-badge:hover { color: var(--accent) }
 .pr-mark { margin-right: 3px }
 .pr-approved .pr-mark { color: var(--added) }
 .pr-pending .pr-mark { color: var(--color-11) }
+.pr-unknown .pr-mark { color: var(--muted) }
 .pr-state { margin-left: 4px }
 /* Row 2 is the controls strip. Horizontal scroll instead of wrapping
    on narrow viewports — buttons always sit on a single line. */

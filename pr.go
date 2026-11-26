@@ -42,13 +42,23 @@ var prs *prTracker
 // open long poll. A full refresh each hour catches changes that the
 // tail did not see.
 //
-// A repo that maintner does not watch has no pull requests here.
+// For a repo that maintner does not watch, or with no maintner, the
+// tracker polls GitHub with git ls-remote at a slow interval (see
+// pr_git.go). Git does not tell if a pull request is approved.
 type prTracker struct {
-	// apiURL is the URL of the ghapi endpoint of maintner.
+	// apiURL is the URL of the ghapi endpoint of maintner, or "" for
+	// no maintner.
 	apiURL string
 	// logURL is the URL of the mutation log of maintner.
 	logURL string
 	client *http.Client
+	// gitPoll is the interval of the git poll of an active repo, or 0
+	// for no git poll. gitPollIdle is the interval for the other repos
+	// (see gitPollInterval).
+	gitPoll, gitPollIdle time.Duration
+	// gitBases are the base URLs of the git servers to ask about a
+	// repo, in order. The tracker uses the first that answers.
+	gitBases []string
 	// sem limits the number of fetches that run at the same time.
 	sem chan struct{}
 
@@ -60,6 +70,11 @@ type prTracker struct {
 	repos map[string]string
 	// untracked holds the GitHub repos that maintner does not watch.
 	untracked map[string]bool
+	// gitURLs holds the git URL that answered for each repo.
+	gitURLs map[string]string
+	// gitPolled holds the last time that the git poll asked about each
+	// repo.
+	gitPolled map[string]time.Time
 	// pending holds the keys to refresh when debounce fires.
 	pending  map[prKey]bool
 	debounce *time.Timer
@@ -88,6 +103,8 @@ type prEntry struct {
 	again bool
 	// used is the last time a page showed the entry.
 	used time.Time
+	// dir is the checkout of the branch.
+	dir string
 }
 
 // pullRequest is the GitHub pull request of a branch.
@@ -100,6 +117,10 @@ type pullRequest struct {
 	Approved bool
 	// ChangesRequested is true if a reviewer requested changes.
 	ChangesRequested bool
+	// ReviewUnknown is true if the pull request comes from git, which
+	// does not tell the review state. Then Title is empty, and State is
+	// "OPEN" or "" for not known.
+	ReviewUnknown bool
 }
 
 // URL returns the GitHub page of p.
@@ -134,32 +155,59 @@ type prConfig struct {
 	// Maintner is the base URL of a maintner server, for example
 	// "http://maintner.corp.ts.net", or "" for no maintner.
 	Maintner string
+	// GitPoll is the interval of the git poll for a repo with a commit
+	// in the last prActiveWindow, or 0 for no git poll.
+	GitPoll time.Duration
+	// GitPollIdle is the interval of the git poll for the other repos.
+	// If it is less than GitPoll, the tracker uses GitPoll.
+	GitPollIdle time.Duration
+	// GitProxy is the base URL of a read-only git proxy for private
+	// repos, for example "git://rogitproxy.corp.ts.net", or "". The
+	// git poll tries public GitHub first.
+	GitProxy string
 }
 
 // enabled reports whether c has a source of pull requests.
 func (c prConfig) enabled() bool {
-	return c.Maintner != ""
+	return c.Maintner != "" || c.GitPoll > 0
 }
 
+// publicGitBase is the base URL of public GitHub for the git poll.
+const publicGitBase = "https://github.com"
+
 // newPRTracker returns a tracker with the configuration c. Call run to
-// start the tail.
+// start the tail and the polls.
 func newPRTracker(c prConfig) *prTracker {
 	t := &prTracker{
 		client: &http.Client{
 			Timeout: 15 * time.Second,
 		},
-		sem:       make(chan struct{}, prMaxFetches),
-		entries:   make(map[prKey]*prEntry),
-		repos:     make(map[string]string),
-		untracked: make(map[string]bool),
-		pending:   make(map[prKey]bool),
-		changed:   make(chan struct{}),
+		gitPoll:     c.GitPoll,
+		gitPollIdle: max(c.GitPollIdle, c.GitPoll),
+		gitBases:    []string{publicGitBase},
+		sem:         make(chan struct{}, prMaxFetches),
+		entries:     make(map[prKey]*prEntry),
+		repos:       make(map[string]string),
+		untracked:   make(map[string]bool),
+		gitURLs:     make(map[string]string),
+		gitPolled:   make(map[string]time.Time),
+		pending:     make(map[prKey]bool),
+		changed:     make(chan struct{}),
 	}
 	if base := strings.TrimSuffix(c.Maintner, "/"); base != "" {
 		t.apiURL = base + "/api/gh"
 		t.logURL = base + "/logs/ts-v1/"
 	}
+	if p := strings.TrimSuffix(c.GitProxy, "/"); p != "" {
+		t.gitBases = append(t.gitBases, p)
+	}
 	return t
+}
+
+// viaGitLocked reports whether the pull requests of repo come from the
+// git poll and not from maintner.
+func (t *prTracker) viaGitLocked(repo string) bool {
+	return t.apiURL == "" || t.untracked[repo]
 }
 
 // startPRTracker starts t. The tail of the mutation log keeps a copy of
@@ -187,12 +235,17 @@ func startPRTracker(t *prTracker) {
 	}()
 }
 
-// run follows the mutation log and does the full refreshes. It returns
-// when ctx is done.
+// run follows the mutation log, and does the full refreshes and the git
+// polls. It returns when ctx is done.
 func (t *prTracker) run(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Go(func() { t.refreshLoop(ctx) })
-	t.tailLoop(ctx)
+	if t.gitPoll > 0 {
+		wg.Go(func() { t.gitPollLoop(ctx) })
+	}
+	if t.apiURL != "" {
+		t.tailLoop(ctx)
+	}
 	wg.Wait()
 }
 
@@ -230,7 +283,8 @@ func (t *prTracker) tailLoop(ctx context.Context) {
 }
 
 // refreshLoop refreshes the entries from maintner each prFullRefresh,
-// and removes the entries that no page showed for prUnusedTTL.
+// and removes the entries that no page showed for prUnusedTTL. The git
+// poll refreshes the other entries.
 func (t *prTracker) refreshLoop(ctx context.Context) {
 	ticker := time.NewTicker(prFullRefresh)
 	defer ticker.Stop()
@@ -259,7 +313,7 @@ func (t *prTracker) handleMutation(m *maintpb.Mutation) {
 	if t.gap {
 		t.gap = false
 		for k := range t.entries {
-			if !t.untracked[k.Repo] {
+			if !t.viaGitLocked(k.Repo) {
 				t.scheduleLocked(k)
 			}
 		}
@@ -305,7 +359,7 @@ func (t *prTracker) refreshMaintner() {
 	t.mu.Lock()
 	keys := make([]prKey, 0, len(t.entries))
 	for k := range t.entries {
-		if !t.untracked[k.Repo] {
+		if !t.viaGitLocked(k.Repo) {
 			keys = append(keys, k)
 		}
 	}
@@ -336,9 +390,10 @@ func (t *prTracker) startLocked(k prKey, e *prEntry) {
 	go func() {
 		t.mu.Lock()
 		for {
+			dir := e.dir
 			t.mu.Unlock()
 			t.sem <- struct{}{}
-			pr, err := t.fetchEntry(context.Background(), k)
+			pr, err := t.fetchEntry(context.Background(), k, dir)
 			<-t.sem
 			t.mu.Lock()
 			if err == nil {
@@ -415,18 +470,20 @@ func (t *prTracker) lookup(ctx context.Context, queries []prQuery) []*pullReques
 	now := time.Now()
 	waits := make([]chan struct{}, len(queries))
 	for i, k := range keys {
-		if k == (prKey{}) || t.untracked[k.Repo] {
+		if k == (prKey{}) || (t.gitPoll <= 0 && t.viaGitLocked(k.Repo)) {
 			continue
 		}
 		e, ok := t.entries[k]
 		if !ok {
 			e = &prEntry{
 				ready: make(chan struct{}),
+				dir:   queries[i].Dir,
 			}
 			t.entries[k] = e
 			t.startLocked(k, e)
 		}
 		e.used = now
+		e.dir = queries[i].Dir
 		waits[i] = e.ready
 	}
 	t.mu.Unlock()
@@ -517,17 +574,32 @@ func checkoutGitHubRepo(dir string) string {
 	return repo
 }
 
-// fetchEntry gets the pull request of k from maintner. For a repo that
-// maintner does not watch, it marks the repo and returns nil.
-func (t *prTracker) fetchEntry(ctx context.Context, k prKey) (*pullRequest, error) {
-	pr, err := t.fetch(ctx, k)
-	if errors.Is(err, errUntrackedRepo) {
+// fetchEntry gets the pull request of k, from maintner if it watches
+// the repo, or else from git. dir is the checkout of the branch.
+func (t *prTracker) fetchEntry(ctx context.Context, k prKey, dir string) (*pullRequest, error) {
+	t.mu.Lock()
+	viaGit := t.viaGitLocked(k.Repo)
+	t.mu.Unlock()
+	if !viaGit {
+		pr, err := t.fetch(ctx, k)
+		if !errors.Is(err, errUntrackedRepo) {
+			return pr, err
+		}
 		t.mu.Lock()
 		t.untracked[k.Repo] = true
 		t.mu.Unlock()
+	}
+	if t.gitPoll <= 0 {
 		return nil, nil
 	}
-	return pr, err
+	found, err := t.fetchGit(ctx, k.Repo, []gitQuery{{
+		Branch: k.Branch,
+		Dir:    dir,
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return found[0], nil
 }
 
 // fetch gets the pull request of k from maintner. If the branch has a
@@ -626,7 +698,8 @@ func (t *prTracker) call(ctx context.Context, method string, params, dst any) er
 
 // prBadgeHTML returns a link to the GitHub page of pr, or "" if pr is
 // nil. A green tick shows that the pull request is approved, and a
-// yellow circle shows that it is not. withRepo adds the name of the
+// yellow circle shows that it is not. A grey ring shows that the review
+// state is not known. withRepo adds the name of the
 // repo to the label, for a line that shows pull requests of more than
 // one repo.
 func prBadgeHTML(pr *pullRequest, withRepo bool) string {
@@ -637,6 +710,10 @@ func prBadgeHTML(pr *pullRequest, withRepo bool) string {
 	mark := "●"
 	review := "not approved"
 	switch {
+	case pr.ReviewUnknown:
+		cls += " pr-unknown"
+		mark = "○"
+		review = "review state not known"
 	case pr.Approved:
 		cls += " pr-approved"
 		mark = "✓"
