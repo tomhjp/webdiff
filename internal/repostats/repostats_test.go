@@ -2,9 +2,11 @@ package repostats
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -150,6 +152,38 @@ func TestAllChangesSummaryIncludesBranchAndWorkingTree(t *testing.T) {
 	if got.AllChanges != want {
 		t.Fatalf("all changes = %+v, want %+v", got.AllChanges, want)
 	}
+	if got.Commits != 2 || !got.Dirty() {
+		t.Fatalf("commits = %d, dirty = %v; want 2, true", got.Commits, got.Dirty())
+	}
+	wantList := []Commit{
+		{
+			SHA:     got.CommitList[0].SHA,
+			Subject: "earlier",
+			Summary: Summary{
+				Files: 1,
+				Ins:   1,
+			},
+		},
+		{
+			SHA:     got.CommitList[1].SHA,
+			Subject: "latest",
+			Summary: Summary{
+				Files: 1,
+				Ins:   1,
+			},
+		},
+	}
+	if !slices.Equal(got.CommitList, wantList) {
+		t.Fatalf("commit list = %+v, want %+v", got.CommitList, wantList)
+	}
+	// "working" is new, "staged" is new, and "earlier" has one more line.
+	wantUncommitted := Summary{
+		Files: 3,
+		Ins:   4,
+	}
+	if got.Uncommitted != wantUncommitted {
+		t.Fatalf("uncommitted = %+v, want %+v", got.Uncommitted, wantUncommitted)
+	}
 }
 
 // A repo with "master" and no "main" uses "master" as the diff base.
@@ -184,6 +218,53 @@ func TestAllChangesSummaryUsesMaster(t *testing.T) {
 	}
 	if got.AllChanges != want {
 		t.Fatalf("all changes = %+v, want %+v", got.AllChanges, want)
+	}
+	if got.Commits != 1 || got.Dirty() {
+		t.Fatalf("commits = %d, dirty = %v; want 1, false", got.Commits, got.Dirty())
+	}
+}
+
+// An untracked file makes the checkout dirty. An ignored file does not.
+func TestDirtyIncludesUntrackedFiles(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-q", "-b", "main")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("ignored\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".gitignore")
+	runGit(t, repo, "commit", "-qm", "initial")
+	m, err := New(Config{}, gitindex.New(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	target := Target{
+		Kind: Repo,
+		Name: "repo",
+		Path: repo,
+	}
+	for _, step := range []struct {
+		file  string
+		dirty bool
+	}{
+		{"", false},
+		{"ignored", false},
+		{"untracked", true},
+	} {
+		if step.file != "" {
+			if err := os.WriteFile(filepath.Join(repo, step.file), []byte("x\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := m.calculate(context.Background(), target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Dirty() != step.dirty || got.Commits != 0 {
+			t.Errorf("after %q: dirty = %v, commits = %d; want %v, 0", step.file, got.Dirty(), got.Commits, step.dirty)
+		}
 	}
 }
 
@@ -243,5 +324,39 @@ func TestManagerWatch(t *testing.T) {
 	}
 	if target.AllChanges.Ins != 1 {
 		t.Fatalf("updated stats: %+v", target.AllChanges)
+	}
+}
+
+// CommitList has the newest MaxCommitList commits, the oldest first.
+// Commits counts all of them.
+func TestCommitListIsLimited(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-q", "-b", "main")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	runGit(t, repo, "commit", "--allow-empty", "-qm", "initial")
+	runGit(t, repo, "checkout", "-qb", "feature")
+	n := MaxCommitList + 2
+	for i := range n {
+		runGit(t, repo, "commit", "--allow-empty", "-qm", fmt.Sprintf("c%d", i))
+	}
+	m, err := New(Config{}, gitindex.New(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	got, err := m.calculate(context.Background(), Target{
+		Kind: Repo,
+		Name: "repo",
+		Path: repo,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Commits != n || len(got.CommitList) != MaxCommitList {
+		t.Fatalf("commits = %d, list length = %d; want %d, %d", got.Commits, len(got.CommitList), n, MaxCommitList)
+	}
+	if first, last := got.CommitList[0].Subject, got.CommitList[MaxCommitList-1].Subject; first != "c2" || last != fmt.Sprintf("c%d", n-1) {
+		t.Fatalf("list from %q to %q, want c2 to c%d", first, last, n-1)
 	}
 }

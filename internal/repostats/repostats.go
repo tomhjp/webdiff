@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,11 +34,40 @@ type Target struct {
 	Name       string
 	Path       string
 	ParentRepo string
+	// Created is when the worktree was added. It is the modification
+	// time of the .git file of the worktree, because git writes that
+	// file one time, when it adds the worktree. It is zero for a repo
+	// and for a broken worktree.
+	Created    time.Time
 	Broken     bool
 	Error      string
 	Branch     string
 	AllChanges Summary
+	// Commits is the number of first-parent commits on HEAD that are
+	// not on the main branch.
+	Commits int
+	// CommitList is the newest MaxCommitList of those commits, the
+	// oldest first.
+	CommitList []Commit
+	// Uncommitted is the diff from HEAD to the working tree, including
+	// untracked files that are not ignored.
+	Uncommitted Summary
 }
+
+// Dirty reports whether the working tree has changes that are not
+// committed.
+func (t Target) Dirty() bool { return t.Uncommitted.Files > 0 }
+
+// Commit is one commit of a branch. Its stats are the diff from its
+// first parent.
+type Commit struct {
+	SHA     string
+	Subject string
+	Summary
+}
+
+// MaxCommitList is the maximum length of Target.CommitList.
+const MaxCommitList = 50
 
 type Config struct {
 	RootDir, WorktreesRoot string
@@ -325,9 +355,73 @@ func (m *Manager) calculate(ctx context.Context, t Target) (Target, error) {
 	if err != nil {
 		return t, err
 	}
+	commits := 0
+	var list []Commit
+	if base != "HEAD" {
+		out, err := output("rev-list", "--first-parent", "--count", base+"..HEAD")
+		if err != nil {
+			return t, err
+		}
+		if commits, err = strconv.Atoi(out); err != nil {
+			return t, fmt.Errorf("count commits: %w", err)
+		}
+		// git applies -n before --reverse, so this gives the newest
+		// commits, the oldest first.
+		out, err = output("log", "--first-parent", "--diff-merges=first-parent", "--numstat", "--no-ext-diff", "--reverse",
+			"-n", strconv.Itoa(MaxCommitList), "--format=%x00%H %s", base+"..HEAD")
+		if err != nil {
+			return t, err
+		}
+		list = parseCommitLog(out)
+	}
+	// The private index follows the working tree (see gitindex), so its
+	// diff from HEAD is the changes that are not committed.
+	uncommitted, err := stat(ctx, env, t.Path, "--cached", "HEAD")
+	if err != nil {
+		return t, err
+	}
 	t.Branch = branch
 	t.AllChanges = all
+	t.Commits = commits
+	t.CommitList = list
+	t.Uncommitted = uncommitted
 	return t, nil
+}
+
+// parseCommitLog parses the output of git log with
+// --format=%x00%H %s and --numstat. Each commit line starts with NUL,
+// so that it is different from the numstat lines that follow it.
+func parseCommitLog(out string) []Commit {
+	var list []Commit
+	for _, line := range strings.Split(out, "\n") {
+		if header, ok := strings.CutPrefix(line, "\x00"); ok {
+			if sha, subject, ok := strings.Cut(header, " "); ok {
+				list = append(list, Commit{
+					SHA:     sha,
+					Subject: subject,
+				})
+			}
+			continue
+		}
+		if len(list) == 0 || line == "" {
+			continue
+		}
+		// A numstat line is "<ins>\t<del>\t<path>". A binary file has
+		// "-" for both counts.
+		f := strings.SplitN(line, "\t", 3)
+		if len(f) != 3 {
+			continue
+		}
+		c := &list[len(list)-1]
+		c.Files++
+		if n, err := strconv.Atoi(f[0]); err == nil {
+			c.Ins += n
+		}
+		if n, err := strconv.Atoi(f[1]); err == nil {
+			c.Del += n
+		}
+	}
+	return list
 }
 
 func stat(ctx context.Context, env []string, dir string, refs ...string) (Summary, error) {
@@ -517,8 +611,17 @@ func (m *Manager) reconcile() error {
 				continue
 			}
 			path := filepath.Join(m.cfg.WorktreesRoot, p.Name(), l.Name())
-			_, gitErr := os.Stat(filepath.Join(path, ".git"))
-			t := Target{Kind: Worktree, Name: p.Name() + "-" + l.Name(), Path: path, ParentRepo: p.Name(), Broken: gitErr != nil}
+			fi, gitErr := os.Stat(filepath.Join(path, ".git"))
+			t := Target{
+				Kind:       Worktree,
+				Name:       p.Name() + "-" + l.Name(),
+				Path:       path,
+				ParentRepo: p.Name(),
+				Broken:     gitErr != nil,
+			}
+			if gitErr == nil {
+				t.Created = fi.ModTime()
+			}
 			found[key(t.Kind, t.Name)] = t
 		}
 	}
@@ -531,6 +634,7 @@ func (m *Manager) reconcile() error {
 		} else {
 			s.target.Path = t.Path
 			s.target.ParentRepo = t.ParentRepo
+			s.target.Created = t.Created
 			s.target.Broken = t.Broken
 		}
 	}
