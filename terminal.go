@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // The functions in this file choose between Rex and tmux. New sessions
@@ -73,6 +74,54 @@ func killSession(ctx context.Context, name string) error {
 		return fmt.Errorf("tmux kill-session: %w", err)
 	}
 	return nil
+}
+
+// sessionTermSize returns the terminal size of the named session's agent
+// pane. For a tmux session the cell size is not known, so it is 0.
+func sessionTermSize(ctx context.Context, name string) (rexTermSize, error) {
+	if s, ok := rexc.sessionByLabel(name); ok {
+		return rexc.termSize(ctx, s.ID, s.Agent)
+	}
+	out, err := tmuxOut(ctx, "display-message", "-t", name+":0.0", "-p", "#{pane_width}\t#{pane_height}")
+	if err != nil {
+		return rexTermSize{}, err
+	}
+	w, h, _ := strings.Cut(strings.TrimSpace(out), "\t")
+	cols, err1 := strconv.Atoi(w)
+	rows, err2 := strconv.Atoi(h)
+	if err1 != nil || err2 != nil {
+		return rexTermSize{}, fmt.Errorf("bad tmux pane size %q", out)
+	}
+	return rexTermSize{
+		Columns: cols,
+		Rows:    rows,
+	}, nil
+}
+
+// restartSizes holds the terminal size of each session that a restart
+// killed, by session name. The next start of that session uses the size,
+// so the new agent does not get a resize event immediately after it
+// starts.
+var (
+	restartSizesMu sync.Mutex
+	restartSizes   = map[string]rexTermSize{}
+)
+
+// setRestartSize records size for the next start of the named session.
+func setRestartSize(name string, size rexTermSize) {
+	restartSizesMu.Lock()
+	defer restartSizesMu.Unlock()
+	restartSizes[name] = size
+}
+
+// takeRestartSize returns and removes the size that setRestartSize
+// recorded for the named session.
+func takeRestartSize(name string) (rexTermSize, bool) {
+	restartSizesMu.Lock()
+	defer restartSizesMu.Unlock()
+	size, ok := restartSizes[name]
+	delete(restartSizes, name)
+	return size, ok
 }
 
 // renameSession gives a running session a new name.

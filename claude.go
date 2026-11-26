@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -1039,6 +1040,18 @@ func handlePaneKill(w http.ResponseWriter, r *http.Request) {
 	// "restart" and "stop" are a clean slate, so this is the last chance
 	// to keep it.
 	histID := snapshotSessionHistory(ctx, name)
+	// A restart starts the new session at the size of the old one, so
+	// the new agent does not get a resize event immediately after it
+	// starts. If we cannot read the size, the new session gets the
+	// default size.
+	var size rexTermSize
+	if r.URL.Path == "/api/pane/restart" {
+		if s, err := sessionTermSize(ctx, name); err == nil {
+			size = s
+		} else {
+			log.Printf("restart %s: read terminal size: %v", name, err)
+		}
+	}
 	if err := killSession(ctx, name); err != nil {
 		writeJSONError(w, http.StatusBadGateway, "kill session: "+err.Error(), nil)
 		return
@@ -1047,6 +1060,9 @@ func handlePaneKill(w http.ResponseWriter, r *http.Request) {
 	// running, and clearing early would drop it off the home page while
 	// it's still alive.
 	clearSessionLive(name)
+	if size.Columns > 0 && size.Rows > 0 {
+		setRestartSize(name, size)
+	}
 	resp := struct {
 		HistoryURL string `json:"historyURL,omitempty"`
 	}{}
@@ -1409,7 +1425,12 @@ func ensureAgentSession(ctx context.Context, repoPath string, n int, agentID, pi
 		// its agent, so the agent arguments are used only if the session
 		// ends before ensureTmuxSession looks at it.
 		wantName, wantCmd := resolveAgent(agentID)
-		return ensureTmuxSession(ctx, name, repoPath, wantName, wantCmd)
+		return ensureTmuxSession(ctx, name, repoPath, wantName, wantCmd, nil)
+	}
+	// A restart recorded the size of the session it killed.
+	var size *rexTermSize
+	if s, ok := takeRestartSize(name); ok {
+		size = &s
 	}
 	if piSession != "" {
 		agentID = piAgentName
@@ -1425,13 +1446,13 @@ func ensureAgentSession(ctx context.Context, repoPath string, n int, agentID, pi
 	}
 	var pane Pane
 	if rexSpawn {
-		s, err := rexc.createAgentSession(ctx, name, sessionLabel(wantName, repoPath, n), repoPath, wantName, wantName, wantCmd)
+		s, err := rexc.createAgentSession(ctx, name, sessionLabel(wantName, repoPath, n), repoPath, wantName, wantName, wantCmd, size)
 		if err != nil {
 			return Pane{}, err
 		}
 		pane = Pane{ID: rexPaneID(s.ID, s.Agent), Label: name + " (just spawned)"}
 	} else {
-		p, err := ensureTmuxSession(ctx, name, repoPath, wantName, wantCmd)
+		p, err := ensureTmuxSession(ctx, name, repoPath, wantName, wantCmd, size)
 		if err != nil {
 			return Pane{}, err
 		}
@@ -1446,8 +1467,9 @@ func ensureAgentSession(ctx context.Context, repoPath string, n int, agentID, pi
 // ensureTmuxSession is ensureAgentSession for tmux. When the session
 // already exists it looks up its initial pane (window 0, pane 0):
 // webdiff always puts the agent there, and ignoring later splits the
-// user might have made keeps the behaviour predictable.
-func ensureTmuxSession(ctx context.Context, name, repoPath, wantName, wantCmd string) (Pane, error) {
+// user might have made keeps the behaviour predictable. If size is not
+// nil, a new session starts at that size.
+func ensureTmuxSession(ctx context.Context, name, repoPath, wantName, wantCmd string, size *rexTermSize) (Pane, error) {
 	if sessionExists(ctx, name) {
 		out, err := tmuxOut(ctx, "display", "-t", name+":0.0", "-p", "#{pane_id}")
 		if err != nil {
@@ -1469,7 +1491,12 @@ func ensureTmuxSession(ctx context.Context, name, repoPath, wantName, wantCmd st
 	// (which inherits the new limit). kill-window + move-window
 	// relocates the agent back to :0.0 so everything downstream can
 	// keep assuming that target.
-	if _, err := tmuxOut(ctx, "new-session", "-d", "-s", name, "-c", repoPath, "bash"); err != nil {
+	args := []string{"new-session", "-d", "-s", name, "-c", repoPath}
+	if size != nil && size.Columns > 0 && size.Rows > 0 {
+		args = append(args, "-x", strconv.Itoa(size.Columns), "-y", strconv.Itoa(size.Rows))
+	}
+	args = append(args, "bash")
+	if _, err := tmuxOut(ctx, args...); err != nil {
 		return Pane{}, fmt.Errorf("tmux new-session: %w", err)
 	}
 	if _, err := tmuxOut(ctx, "set-option", "-t", name, "history-limit", "100000"); err != nil {

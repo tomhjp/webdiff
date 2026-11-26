@@ -243,13 +243,22 @@ read -r rest
 		t.Fatal(err)
 	}
 	label := fmt.Sprintf("webdiff-test-%d-wd", time.Now().UnixNano())
-	s, err := c.createAgentSession(ctx, label, "fake · test", dir, "fake", "fake", "sh ./fake")
+	startSize := rexTermSize{
+		Columns:      93,
+		Rows:         41,
+		CellWidthPx:  10,
+		CellHeightPx: 20,
+	}
+	s, err := c.createAgentSession(ctx, label, "fake · test", dir, "fake", "fake", "sh ./fake", &startSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.destroy(context.Background(), s.ID)
 	if got, ok := c.sessionByLabel(label); !ok || got.Agent != s.Agent || got.AgentLabel != "fake" || got.Created == 0 {
 		t.Fatalf("sessionByLabel = %+v, %v", got, ok)
+	}
+	if got, err := c.termSize(ctx, s.ID, s.Agent); err != nil || got != startSize {
+		t.Errorf("start termSize = %+v, %v; want %+v", got, err, startSize)
 	}
 
 	want := rexTermSize{

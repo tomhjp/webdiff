@@ -777,9 +777,10 @@ func (c *rexClient) ensureConnected(ctx context.Context) error {
 // createAgentSession starts cmd in a new session named label, in dir.
 // The agent id goes in the block label, so that a later webdiff can tell
 // which agent runs there. windowLabel is the label of the agent window,
-// which the Rex apps show as the row of the session. It waits until the
-// agent can take a paste.
-func (c *rexClient) createAgentSession(ctx context.Context, label, windowLabel, dir, agentID, agentName, cmd string) (rexSession, error) {
+// which the Rex apps show as the row of the session. If size is not nil,
+// the terminal starts at that size. It waits until the agent can take a
+// paste.
+func (c *rexClient) createAgentSession(ctx context.Context, label, windowLabel, dir, agentID, agentName, cmd string, size *rexTermSize) (rexSession, error) {
 	if err := c.ensureConnected(ctx); err != nil {
 		return rexSession{}, err
 	}
@@ -793,22 +794,32 @@ func (c *rexClient) createAgentSession(ctx context.Context, label, windowLabel, 
 	// ~/.local/bin, which the login profile puts on PATH, and an -agent
 	// value can carry flags. Close the terminal on every exit, including
 	// a quick failure, so the session ends with its agent as in tmux.
+	opts := map[string]any{
+		"shell":   "none",
+		"command": []string{"bash", "-lc", cmd},
+		"cwd":     dir,
+		"exit": map[string]any{
+			"on_completion":           true,
+			"quick_exit_threshold_ms": 0,
+		},
+	}
+	// Without a size, Rex starts the terminal at 80x24.
+	if size != nil && size.Columns > 0 && size.Rows > 0 {
+		s := *size
+		// Rex wants both cell dimensions or neither.
+		if s.CellWidthPx <= 0 || s.CellHeightPx <= 0 {
+			s.CellWidthPx, s.CellHeightPx = 0, 0
+		}
+		opts["size"] = s
+	}
 	err := c.call(ctx, "session.create", map[string]any{
 		"label": label,
 		"initial_windows": []any{map[string]any{
 			"window_label": windowLabel,
 			"layout": map[string]any{"block": map[string]any{
-				"flavor": rexTerminalFlavor,
-				"label":  agentID,
-				"options": map[string]any{
-					"shell":   "none",
-					"command": []string{"bash", "-lc", cmd},
-					"cwd":     dir,
-					"exit": map[string]any{
-						"on_completion":           true,
-						"quick_exit_threshold_ms": 0,
-					},
-				},
+				"flavor":  rexTerminalFlavor,
+				"label":   agentID,
+				"options": opts,
 			}},
 		}},
 	}, &res)
