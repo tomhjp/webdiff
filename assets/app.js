@@ -1123,16 +1123,9 @@
     }
     var selectionURL=new URL(location.href);
     if(diffPicker.dataset.commit){
-      // The commit view shows one commit and does not change the saved
-      // selection. The menu shows the saved selection, so that apply
-      // goes back to it.
-      var excludedNow=savedExclusions();
-      var checked=0;
-      choices.forEach(function(c){
-        c.checked=excludedNow.indexOf(c.value)===-1;
-        if(c.checked)checked++;
-      });
-      pickerToggle.textContent='changes ('+checked+')';
+      // The commit view selects only its commit, and the menu shows
+      // that. It does not change the saved selection, so a link to the
+      // diff page without a selection still shows the saved one.
     }else if(diffPicker.dataset.reset){
       // The server could not show the selection in the URL, so it
       // shows all changes. Forget the selection. Do not load the page

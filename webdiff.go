@@ -1761,14 +1761,9 @@ func renderRepo(w http.ResponseWriter, r *http.Request, ref repoRef) {
 	// narrow screens. app.js changes the icon and the title.
 	body.WriteString(`<div class="diff-right">`)
 	body.WriteString(`<div class="header-buttons diff-primary">`)
-	// The commit view does not change the saved selection, so the
-	// menu does not show the one commit of the view as the selection.
-	// app.js sets the choices from the saved selection.
-	pickerSelected := selected
-	if viewCommit != "" {
-		pickerSelected = allChanges(commits)
-	}
-	writeDiffPicker(&body, commits, pickerSelected, working, resetErr != nil, urlPath, sessionN, viewCommit)
+	// The menu shows the selection of the page. In the commit view,
+	// that is only the commit of the view.
+	writeDiffPicker(&body, commits, selected, working, resetErr != nil, urlPath, sessionN, viewCommit)
 	if len(files) > 0 {
 		body.WriteString(`<button class="toggle icon-btn" type="button" id="toggle-all" title="expand all" aria-label="expand all"><svg class="icon" aria-hidden="true"><use href="#icon-expand-all"/></svg></button>`)
 	}

@@ -205,6 +205,15 @@ The body of &lt;a&gt;.</pre>`
 		if !strings.Contains(html, `<label class="diff-picker-current"><input type="checkbox" value="`+first+`" checked>`) {
 			t.Error("picker does not mark the commit of the view")
 		}
+		// The menu shows only the commit of the view as selected.
+		if !strings.Contains(html, `>changes (1)</button>`) {
+			t.Error("picker count is not 1")
+		}
+		for _, value := range []string{second, "working"} {
+			if strings.Contains(html, `<input type="checkbox" value="`+value+`" checked>`) {
+				t.Errorf("picker selects %s in the commit view", value)
+			}
+		}
 		if !strings.Contains(html, firstBody) || strings.Contains(html, secondLink) {
 			t.Error("commit view does not show only its own message")
 		}

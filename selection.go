@@ -363,7 +363,7 @@ func writeDiffPicker(body *strings.Builder, commits []branchCommit, selected map
 		resetAttr = ` data-reset="1"`
 	}
 	// data-commit tells app.js that the page is the commit view. Then
-	// app.js shows the saved selection in the menu, and does not
+	// app.js does not save the selection of the page and does not
 	// change the URL.
 	if current != "" {
 		resetAttr += ` data-commit="1"`
