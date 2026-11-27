@@ -12,8 +12,6 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -96,14 +94,10 @@ func runClient(args []string) error {
 		return errors.New("no addresses to listen on")
 	}
 
-	ucd, err := os.UserCacheDir()
-	if err != nil {
-		ucd = os.TempDir()
-	}
 	sender := &githubSender{
 		upstream:  upstream,
 		urlFormat: *githubURLFlag,
-		cacheDir:  filepath.Join(ucd, "webdiff", "send"),
+		cacheDir:  defaultSendCacheDir(),
 	}
 
 	proxy := &httputil.ReverseProxy{

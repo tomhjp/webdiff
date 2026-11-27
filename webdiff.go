@@ -2534,6 +2534,13 @@ func main() {
 		}
 		return
 	}
+	if len(args) > 0 && args[0] == "github" {
+		if err := runGitHub(args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(args) > 0 && args[0] == "client" {
 		if err := runClient(args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)

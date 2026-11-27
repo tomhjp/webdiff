@@ -1,0 +1,64 @@
+{
+  "name": "webdiff-github",
+  "displayName": "webdiff: GitHub sync",
+  "description": "Send the branch of a Remote-SSH checkout to GitHub, and fetch it back, with the git credentials of this computer.",
+  "version": "0.0.1",
+  "publisher": "tomhjp",
+  "private": true,
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tomhjp/webdiff"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "SCM Providers"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "webdiff.sendToGitHub",
+        "title": "Send Branch to GitHub",
+        "category": "webdiff"
+      },
+      {
+        "command": "webdiff.fetchFromGitHub",
+        "title": "Fetch Branch from GitHub",
+        "category": "webdiff"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "webdiff.sendToGitHub",
+          "when": "remoteName == ssh-remote"
+        },
+        {
+          "command": "webdiff.fetchFromGitHub",
+          "when": "remoteName == ssh-remote"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "webdiff",
+      "properties": {
+        "webdiff.path": {
+          "type": "string",
+          "default": "webdiff",
+          "description": "Path of the webdiff program on this computer."
+        },
+        "webdiff.githubURL": {
+          "type": "string",
+          "default": "",
+          "description": "URL of the GitHub repo to push to and fetch from. {repo} changes to owner/name. Empty means git@github.com:{repo}.git."
+        }
+      }
+    }
+  }
+}
