@@ -677,14 +677,24 @@ func DefaultRemote(repo string) (string, bool) {
 		return "", false
 	}
 	remotes := strings.Fields(strings.TrimSpace(string(out)))
-	for _, r := range remotes {
-		if r == "origin" {
-			return "origin", true
+	return PickRemote(remotes, func(branch string) string {
+		out, err := exec.Command("git", "-C", repo, "config", "--get", "branch."+branch+".remote").Output()
+		if err != nil {
+			return ""
 		}
+		return strings.TrimSpace(string(out))
+	})
+}
+
+// PickRemote does the choice of DefaultRemote from the names of the
+// remotes of a repo. tracked returns the remote that a local branch
+// tracks, or "".
+func PickRemote(remotes []string, tracked func(branch string) string) (string, bool) {
+	if slices.Contains(remotes, "origin") {
+		return "origin", true
 	}
 	for _, name := range MainBranchNames {
-		out, err := exec.Command("git", "-C", repo, "config", "--get", "branch."+name+".remote").Output()
-		if r := strings.TrimSpace(string(out)); err == nil && slices.Contains(remotes, r) {
+		if r := tracked(name); r != "" && slices.Contains(remotes, r) {
 			return r, true
 		}
 	}

@@ -71,7 +71,12 @@ func (s *githubSender) handleSend(w http.ResponseWriter, r *http.Request) {
 	// send must do the same work again.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Minute)
 	defer cancel()
-	res, err := s.send(ctx, req)
+	src := &httpCheckout{
+		upstream: s.upstream,
+		kind:     req.Kind,
+		name:     req.Name,
+	}
+	res, err := s.send(ctx, src, req.Branch, req.Head)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, err.Error(), nil)
 		return
@@ -79,17 +84,27 @@ func (s *githubSender) handleSend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *githubSender) send(ctx context.Context, req gitHubSendRequest) (gitHubSendResponse, error) {
-	branch := strings.TrimSpace(req.Branch)
+// checkout is a checkout on the sandbox that the sender can read.
+type checkout interface {
+	// info returns the gitHubInfo of the checkout.
+	info(ctx context.Context) (gitHubInfo, error)
+	// fetchURL returns the URL that git fetches the checkout from.
+	fetchURL() string
+}
+
+// send pushes HEAD of src to branch on GitHub. If head is not empty,
+// HEAD of src must be head.
+func (s *githubSender) send(ctx context.Context, src checkout, branch, head string) (gitHubSendResponse, error) {
+	branch = strings.TrimSpace(branch)
 	if err := checkBranchName(branch); err != nil {
 		return gitHubSendResponse{}, err
 	}
-	info, err := s.info(ctx, req.Kind, req.Name)
+	info, err := src.info(ctx)
 	if err != nil {
 		return gitHubSendResponse{}, fmt.Errorf("read the checkout on the sandbox: %w", err)
 	}
-	if req.Head != "" && info.Head != req.Head {
-		return gitHubSendResponse{}, errors.New("HEAD changed after the page loaded; reload the page and look at the new commits")
+	if head != "" && info.Head != head {
+		return gitHubSendResponse{}, errors.New("HEAD changed; look at the new commits and try again")
 	}
 	if branch == info.Main {
 		return gitHubSendResponse{}, fmt.Errorf("cannot send to the main branch %q", branch)
@@ -98,54 +113,20 @@ func (s *githubSender) send(ctx context.Context, req gitHubSendRequest) (gitHubS
 	if err != nil {
 		return gitHubSendResponse{}, err
 	}
-	pushURL := strings.ReplaceAll(s.urlFormat, "{repo}", repo)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	dir := filepath.Join(s.cacheDir, filepath.FromSlash(repo)+".git")
-	git := func(args ...string) error {
-		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-		// Fail, and do not wait for a password on the terminal of
-		// the client. Credential helpers continue to work.
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
-	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return gitHubSendResponse{}, err
-		}
-		if err := git("init", "--bare", "-q"); err != nil {
-			return gitHubSendResponse{}, err
-		}
-	}
-
-	// Fetch the main branch too, so that the push can find the
-	// commits that GitHub already has.
-	src := *s.upstream
-	src.Path = "/api/git/" + req.Kind + "/" + req.Name
-	fetch := []string{"fetch", "--no-tags", "--no-write-fetch-head", src.String(), "+HEAD:refs/webdiff/head"}
-	if info.MainRef != "" {
-		fetch = append(fetch, "+"+info.MainRef+":refs/webdiff/main")
-	}
-	if err := git(fetch...); err != nil {
-		return gitHubSendResponse{}, fmt.Errorf("fetch from the sandbox: %w", err)
-	}
-	got, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "refs/webdiff/head").Output()
+	c, err := s.cacheRepo(ctx, repo)
 	if err != nil {
-		return gitHubSendResponse{}, fmt.Errorf("rev-parse: %w", err)
+		return gitHubSendResponse{}, err
 	}
-	if head := strings.TrimSpace(string(got)); head != info.Head {
-		return gitHubSendResponse{}, errors.New("HEAD changed during the send; reload the page")
+	if err := c.fetchCheckout(src, info); err != nil {
+		return gitHubSendResponse{}, err
 	}
 
 	// The branch can contain amended commits, so replace the branch
 	// on GitHub.
-	if err := git("-c", "push.negotiate=true", "push", "--quiet", pushURL, "+"+info.Head+":refs/heads/"+branch); err != nil {
+	if _, err := c.git("-c", "push.negotiate=true", "push", "--quiet", s.gitHubURL(repo), "+"+info.Head+":refs/heads/"+branch); err != nil {
 		return gitHubSendResponse{}, fmt.Errorf("push to GitHub: %w", err)
 	}
 	return gitHubSendResponse{
@@ -156,13 +137,92 @@ func (s *githubSender) send(ctx context.Context, req gitHubSendRequest) (gitHubS
 	}, nil
 }
 
-// info returns the gitHubInfo of a checkout from the sandbox.
-func (s *githubSender) info(ctx context.Context, kind, name string) (gitHubInfo, error) {
-	u := *s.upstream
+// gitHubURL returns the URL of the GitHub repo repo, an owner/name.
+func (s *githubSender) gitHubURL(repo string) string {
+	return strings.ReplaceAll(s.urlFormat, "{repo}", repo)
+}
+
+// cacheRepo is the bare repo of the sender for one GitHub repo.
+type cacheRepo struct {
+	ctx context.Context
+	dir string
+}
+
+// cacheRepo returns the bare repo for the GitHub repo repo, and makes
+// it if it is not there. The caller must hold s.mu.
+func (s *githubSender) cacheRepo(ctx context.Context, repo string) (*cacheRepo, error) {
+	c := &cacheRepo{
+		ctx: ctx,
+		dir: filepath.Join(s.cacheDir, filepath.FromSlash(repo)+".git"),
+	}
+	if _, err := os.Stat(filepath.Join(c.dir, "HEAD")); err != nil {
+		if err := os.MkdirAll(c.dir, 0700); err != nil {
+			return nil, err
+		}
+		if _, err := c.git("init", "--bare", "-q"); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+// git runs git in the cache repo, and returns the output with no
+// trailing space.
+func (c *cacheRepo) git(args ...string) (string, error) {
+	cmd := exec.CommandContext(c.ctx, "git", append([]string{"-C", c.dir}, args...)...)
+	// Fail, and do not wait for a password on the terminal of the
+	// client. Credential helpers continue to work.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// fetchCheckout fetches HEAD of src to refs/webdiff/head, and the main
+// branch to refs/webdiff/main. The main branch lets a push to GitHub
+// find the commits that GitHub already has. It returns an error if
+// HEAD is not info.Head.
+func (c *cacheRepo) fetchCheckout(src checkout, info gitHubInfo) error {
+	fetch := []string{"fetch", "--no-tags", "--no-write-fetch-head", src.fetchURL(), "+HEAD:refs/webdiff/head"}
+	if info.MainRef != "" {
+		fetch = append(fetch, "+"+info.MainRef+":refs/webdiff/main")
+	}
+	if _, err := c.git(fetch...); err != nil {
+		return fmt.Errorf("fetch from the sandbox: %w", err)
+	}
+	head, err := c.git("rev-parse", "refs/webdiff/head")
+	if err != nil {
+		return err
+	}
+	if head != info.Head {
+		return errors.New("HEAD changed during the send; look at the new commits and try again")
+	}
+	return nil
+}
+
+// httpCheckout is a checkout that the sandbox serves at /api/git/ and
+// /api/github/info.
+type httpCheckout struct {
+	upstream   *url.URL
+	kind, name string
+}
+
+func (h *httpCheckout) fetchURL() string {
+	u := *h.upstream
+	u.Path = "/api/git/" + h.kind + "/" + h.name
+	return u.String()
+}
+
+func (h *httpCheckout) info(ctx context.Context) (gitHubInfo, error) {
+	u := *h.upstream
 	u.Path = "/api/github/info"
 	u.RawQuery = url.Values{
-		"kind": {kind},
-		"name": {name},
+		"kind": {h.kind},
+		"name": {h.name},
 	}.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {

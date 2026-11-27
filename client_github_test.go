@@ -124,12 +124,12 @@ func TestSendToGitHub(t *testing.T) {
 		t.Fatal(err)
 	}
 	send := func(branch, head string) (gitHubSendResponse, error) {
-		return s.send(context.Background(), gitHubSendRequest{
-			Kind:   "repos",
-			Name:   "proj",
-			Branch: branch,
-			Head:   head,
-		})
+		src := &httpCheckout{
+			upstream: upstream,
+			kind:     "repos",
+			name:     "proj",
+		}
+		return s.send(context.Background(), src, branch, head)
 	}
 	res, err := send("tomhjp/feature", shas[2])
 	if err != nil {
@@ -175,12 +175,12 @@ func TestSendToGitHub(t *testing.T) {
 	}
 	out, _ = exec.Command("git", "-C", wt, "rev-parse", "HEAD").Output()
 	wtHead := strings.TrimSpace(string(out))
-	if _, err := s.send(context.Background(), gitHubSendRequest{
-		Kind:   "worktrees",
-		Name:   "proj-other",
-		Branch: "tomhjp/other",
-		Head:   wtHead,
-	}); err != nil {
+	wtSrc := &httpCheckout{
+		upstream: upstream,
+		kind:     "worktrees",
+		name:     "proj-other",
+	}
+	if _, err := s.send(context.Background(), wtSrc, "tomhjp/other", wtHead); err != nil {
 		t.Fatal(err)
 	}
 	out, _ = exec.Command("git", "-C", remote, "rev-parse", "refs/heads/tomhjp/other").Output()
